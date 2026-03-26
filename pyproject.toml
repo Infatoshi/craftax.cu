@@ -7,7 +7,14 @@ name = "craftax-cuda"
 version = "0.1.0"
 description = "CUDA implementation of Craftax-Classic for high-throughput RL training"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.0"]
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+render = ["pillow"]
+validate = ["craftax", "jax[cuda12]"]
 
 [tool.setuptools]
 py-modules = []
