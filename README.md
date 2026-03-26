@@ -1,6 +1,6 @@
 # craftax.cu
 
-CUDA reimplementation of [Craftax-Classic](https://github.com/MichaelTMatworthy/Craftax) (Matthews et al. 2024) for high-throughput RL training.
+CUDA reimplementation of [Craftax-Classic](https://github.com/MichaelTMatthews/Craftax) (Matthews et al. 2024) for high-throughput RL training.
 
 The idea: take the fastest PufferLib environment and see how far you can get by keeping everything on GPU and writing the game logic in pure CUDA. Turns out, pretty far.
 
@@ -88,7 +88,7 @@ The PPO training loop is pure PyTorch. The main optimization insight: with a tin
 
 A procedurally generated survival game used as an RL benchmark. The agent spawns on a 64x64 tile map with resources, mobs, and crafting. 17 actions (move, mine, craft, place, sleep), 22 achievements to unlock. Episodes run for 10k timesteps. The observation is a 7x9 local view + inventory + stats = 1345-dim vector.
 
-Originally implemented in JAX by [Matthews et al.](https://github.com/MichaelTMatworthy/Craftax) for fully-GPU training with `jax.lax.scan`. This repo replaces the JAX env kernel with CUDA while keeping PyTorch for the training loop.
+Originally implemented in JAX by [Matthews et al.](https://github.com/MichaelTMatthews/Craftax) for fully-GPU training with `jax.lax.scan`. This repo replaces the JAX env kernel with CUDA while keeping PyTorch for the training loop.
 
 ## File structure
 
