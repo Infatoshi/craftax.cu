@@ -1,4 +1,4 @@
-#include "craftax_cuda.cuh"
+#include "craftax.cuh"
 #include <cmath>
 
 // ============================================================

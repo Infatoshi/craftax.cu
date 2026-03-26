@@ -1,6 +1,6 @@
 // PyTorch C++ extension wrapper for Craftax CUDA kernels
 #include <torch/extension.h>
-#include "craftax_cuda.cuh"
+#include "craftax.cuh"
 
 // Forward declare kernels
 extern "C" __global__ void reset_kernel(EnvState* states, float* obs, int num_envs, uint64_t seed);
@@ -8,7 +8,7 @@ extern "C" __global__ void step_kernel(EnvState* states, const int32_t* actions,
 extern "C" __global__ void step_only_kernel(EnvState* states, const int32_t* actions, float* rewards, int8_t* dones, int num_envs);
 extern "C" __global__ void autoreset_obs_kernel(EnvState* states, const int8_t* dones, float* obs, int num_envs, uint64_t reset_seed);
 
-#include "craftax_cuda.cu"
+#include "craftax.cu"
 
 static_assert(sizeof(EnvState) < 16384, "EnvState too large");
 
