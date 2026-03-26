@@ -112,7 +112,7 @@ If you use this in your work:
 @software{craftax_cuda,
   title={craftax.cu: CUDA Craftax-Classic},
   url={https://github.com/Infatoshi/craftax.cu},
-  year={2025}
+  year={2026}
 }
 ```
 
