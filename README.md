@@ -1,6 +1,6 @@
 # craftax.cu
 
-CUDA reimplementation of [Craftax-Classic](https://github.com/MichaelTMatworthy/Craftax) (Suarez 2024) for high-throughput RL training.
+CUDA reimplementation of [Craftax-Classic](https://github.com/MichaelTMatworthy/Craftax) (Matthews et al. 2024) for high-throughput RL training.
 
 The idea: take the fastest PufferLib environment and see how far you can get by keeping everything on GPU and writing the game logic in pure CUDA. Turns out, pretty far.
 
@@ -24,14 +24,23 @@ Both implementations converge to the same reward, confirming correctness. 33/33 
 
 ## Install
 
-Requires CUDA toolkit and PyTorch with CUDA support.
+Requires an NVIDIA GPU and a CUDA toolkit version that matches your PyTorch install.
 
 ```bash
 git clone https://github.com/Infatoshi/craftax.cu.git
 cd craftax.cu
 uv sync
+```
+
+If you get a CUDA version mismatch during the build, install a PyTorch version matching your system CUDA toolkit:
+
+```bash
+# Example: system has CUDA 12.8
+uv venv && uv pip install torch --index-url https://download.pytorch.org/whl/cu128
 uv pip install --no-build-isolation -e .
 ```
+
+Check your CUDA toolkit version with `nvcc --version` and match it to a [PyTorch wheel](https://pytorch.org/get-started/locally/).
 
 ## Usage
 
@@ -48,15 +57,15 @@ obs, rewards, dones = env.step(actions)
 ### Benchmark
 
 ```bash
-python bench.py                          # env-only + PPO training
-python bench.py --num-envs 32768 --num-steps 32 --update-epochs 1  # max throughput config
-python bench.py --env-only               # env kernel only
+uv run bench.py                          # env-only + PPO training
+uv run bench.py --num-envs 32768 --num-steps 32 --update-epochs 1  # max throughput
+uv run bench.py --env-only               # env kernel only
 ```
 
 ### Validate
 
 ```bash
-python validate.py    # 33 tests against JAX reference
+uv run validate.py    # 33 tests against JAX reference
 ```
 
 ## Architecture
@@ -79,7 +88,7 @@ The PPO training loop is pure PyTorch. The main optimization insight: with a tin
 
 A procedurally generated survival game used as an RL benchmark. The agent spawns on a 64x64 tile map with resources, mobs, and crafting. 17 actions (move, mine, craft, place, sleep), 22 achievements to unlock. Episodes run for 10k timesteps. The observation is a 7x9 local view + inventory + stats = 1345-dim vector.
 
-Originally implemented in JAX by [Michael Suarez](https://github.com/MichaelTMatworthy/Craftax) for fully-GPU training with `jax.lax.scan`. This repo replaces the JAX env kernel with CUDA while keeping PyTorch for the training loop.
+Originally implemented in JAX by [Matthews et al.](https://github.com/MichaelTMatworthy/Craftax) for fully-GPU training with `jax.lax.scan`. This repo replaces the JAX env kernel with CUDA while keeping PyTorch for the training loop.
 
 ## File structure
 
@@ -110,7 +119,7 @@ If you use this in your work:
 The original Craftax environment:
 
 ```bibtex
-@inproceedings{suarez2024craftax,
+@inproceedings{matthews2024craftax,
   title={Craftax: A Lightning-Fast Benchmark for Open-Ended Reinforcement Learning},
   author={Michael Matthews and Michael Beukman and Benjamin Ellis and Mikayel Samvelyan and Matthew Jackson and Samuel Coward and Jakob Foerster},
   booktitle={International Conference on Machine Learning},
