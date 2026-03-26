@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "craftax-cuda"
+version = "0.1.0"
+description = "CUDA implementation of Craftax-Classic for high-throughput RL training"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.0"]
+
+[tool.setuptools]
+py-modules = []
