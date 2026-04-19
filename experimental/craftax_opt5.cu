@@ -548,6 +548,94 @@ extern "C" __global__ void autoreset_obs_kernel(
 }
 
 // ========================================================================
+// MULTI-STEP fused kernel. Runs K game steps per launch, amortizing
+// the warp-cooperative state load/store cost across K steps.
+//
+//   actions_ms[k, env_idx]   (K × NE int32)
+//   rewards_ms[k, env_idx]   (K × NE float)
+//   dones_ms[k, env_idx]     (K × NE int8)
+//   obs_ms[k, env_idx, :]    (K × NE × OBS_DIM float)
+//
+// State is loaded once at entry, stays in shared across all K steps,
+// written back once at exit.
+// ========================================================================
+extern "C" __global__ void step_fused_multistep_kernel(
+    EnvState* __restrict__ states_g,
+    const int32_t* __restrict__ actions_ms,
+    float* __restrict__ rewards_ms,
+    int8_t* __restrict__ dones_ms,
+    float* __restrict__ obs_ms,
+    int num_envs, int K, uint64_t reset_seed_base
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int env_idx = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (env_idx >= num_envs) return;
+
+    __shared__ EnvState s_envs[WARPS_PER_BLOCK];
+    EnvState& s = s_envs[warp];
+
+    // Load once.
+    warp_bulk_copy_i4(reinterpret_cast<int4*>(&s),
+                      reinterpret_cast<int4*>(&states_g[env_idx]), lane);
+    __syncwarp();
+
+    for (int k = 0; k < K; k++) {
+        if (lane == 0) {
+            int action = actions_ms[k * num_envs + env_idx];
+            int old_health = s.health;
+            uint32_t old_ach = s.achievements;
+            if (s.is_sleeping) action = ACT_NOOP;
+
+            do_crafting(s, action);
+            if (action == ACT_DO) do_action(s);
+            if (action >= ACT_PLACE_STONE && action <= ACT_PLACE_PLANT) place_block(s, action);
+            move_player(s, action);
+            update_mobs(s);
+            spawn_mobs(s);
+            update_plants(s);
+            update_intrinsics(s, actions_ms[k * num_envs + env_idx]);
+
+            uint32_t* p = reinterpret_cast<uint32_t*>(&s.inv[0]);
+            p[0] = __vminu4(p[0], 0x09090909u);
+            p[1] = __vminu4(p[1], 0x09090909u);
+            p[2] = __vminu4(p[2], 0x09090909u);
+
+            s.timestep++;
+            float t_frac = fmodf((float)s.timestep / (float)DAY_LENGTH, 1.0f) + 0.3f;
+            float cos_val = __cosf(3.14159265f * t_frac);
+            s.light_level = 1.0f - fabsf(cos_val * cos_val * cos_val);
+
+            uint32_t new_unlocks = s.achievements & ~old_ach;
+            float ach_reward = (float)__popc(new_unlocks);
+            float health_reward = (float)(s.health - old_health) * 0.1f;
+            rewards_ms[k * num_envs + env_idx] = ach_reward + health_reward;
+
+            bool done = (s.timestep >= MAX_TIMESTEPS) || (s.health <= 0);
+            if (in_bounds(s.player_r, s.player_c) && map_get(s, s.player_r, s.player_c) == BLK_LAVA)
+                done = true;
+            dones_ms[k * num_envs + env_idx] = done ? 1 : 0;
+
+            // Autoreset for this step's output; seed must match single-step kernel:
+            //   single kernel uses reset_seed = seed + step_count*1e6
+            //   here we mimic by reset_seed_base + k*1e6 (caller sets base = seed + step_count*1e6)
+            if (done) {
+                uint64_t rs = reset_seed_base + (uint64_t)k * 1000000ULL;
+                generate_world(s, rs, env_idx + num_envs);
+            }
+        }
+        __syncwarp();
+
+        // Obs build for step k.
+        build_observation_warp(s, obs_ms + ((size_t)k * num_envs + env_idx) * OBS_DIM, lane);
+    }
+
+    // Store once.
+    warp_bulk_copy_i4(reinterpret_cast<int4*>(&states_g[env_idx]),
+                      reinterpret_cast<int4*>(&s), lane);
+}
+
+// ========================================================================
 // FUSED step + autoreset + obs kernel.
 // Single kernel, single state load, single state store. Amortizes the
 // warp-cooperative bulk copies across all three old kernel phases.
