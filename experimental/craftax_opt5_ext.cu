@@ -5,6 +5,7 @@
 extern "C" __global__ void reset_kernel(EnvState* states, float* obs, int num_envs, uint64_t seed);
 extern "C" __global__ void step_only_kernel(EnvState* states, const int32_t* actions, float* rewards, int8_t* dones, int num_envs);
 extern "C" __global__ void autoreset_obs_kernel(EnvState* states, const int8_t* dones, float* obs, int num_envs, uint64_t reset_seed);
+extern "C" __global__ void step_fused_kernel(EnvState* states, const int32_t* actions, float* rewards, int8_t* dones, float* obs, int num_envs, uint64_t reset_seed);
 
 #include "craftax_opt5.cu"
 
@@ -40,11 +41,9 @@ public:
         step_count++;
         int grid = (num_envs + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
         uint64_t reset_seed = seed + step_count * 1000000ULL;
-        step_only_kernel<<<grid, BLOCK_SIZE>>>(
+        step_fused_kernel<<<grid, BLOCK_SIZE>>>(
             (EnvState*)states.data_ptr(), actions.data_ptr<int32_t>(),
-            rewards.data_ptr<float>(), dones.data_ptr<int8_t>(), num_envs);
-        autoreset_obs_kernel<<<grid, BLOCK_SIZE>>>(
-            (EnvState*)states.data_ptr(), dones.data_ptr<int8_t>(),
+            rewards.data_ptr<float>(), dones.data_ptr<int8_t>(),
             obs.data_ptr<float>(), num_envs, reset_seed);
         return {obs, rewards, dones};
     }

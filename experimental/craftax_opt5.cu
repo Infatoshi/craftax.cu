@@ -548,3 +548,77 @@ extern "C" __global__ void autoreset_obs_kernel(
         for (int i = lane; i < ENVSTATE_U32; i += 32) src[i] = dst[i];
     }
 }
+
+// ========================================================================
+// FUSED step + autoreset + obs kernel.
+// Single kernel, single state load, single state store. Amortizes the
+// warp-cooperative bulk copies across all three old kernel phases.
+// ========================================================================
+extern "C" __global__ void step_fused_kernel(
+    EnvState* __restrict__ states_g, const int32_t* __restrict__ actions_g,
+    float* __restrict__ rewards_g, int8_t* __restrict__ dones_g,
+    float* __restrict__ obs_g, int num_envs, uint64_t reset_seed
+) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int env_idx = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (env_idx >= num_envs) return;
+
+    __shared__ EnvState s_envs[WARPS_PER_BLOCK];
+    EnvState& s = s_envs[warp];
+
+    // Phase 1: warp bulk load.
+    uint32_t* src = reinterpret_cast<uint32_t*>(&states_g[env_idx]);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(&s);
+    #pragma unroll 4
+    for (int i = lane; i < ENVSTATE_U32; i += 32) dst[i] = src[i];
+    __syncwarp();
+
+    // Phase 2: game step (lane 0).
+    if (lane == 0) {
+        int action = actions_g[env_idx];
+        int old_health = s.health;
+        uint32_t old_ach = s.achievements;
+        if (s.is_sleeping) action = ACT_NOOP;
+
+        do_crafting(s, action);
+        if (action == ACT_DO) do_action(s);
+        if (action >= ACT_PLACE_STONE && action <= ACT_PLACE_PLANT) place_block(s, action);
+        move_player(s, action);
+        update_mobs(s);
+        spawn_mobs(s);
+        update_plants(s);
+        update_intrinsics(s, actions_g[env_idx]);
+
+        uint32_t* p = reinterpret_cast<uint32_t*>(&s.inv[0]);
+        p[0] = __vminu4(p[0], 0x09090909u);
+        p[1] = __vminu4(p[1], 0x09090909u);
+        p[2] = __vminu4(p[2], 0x09090909u);
+
+        s.timestep++;
+        float t_frac = fmodf((float)s.timestep / (float)DAY_LENGTH, 1.0f) + 0.3f;
+        float cos_val = __cosf(3.14159265f * t_frac);
+        s.light_level = 1.0f - fabsf(cos_val * cos_val * cos_val);
+
+        uint32_t new_unlocks = s.achievements & ~old_ach;
+        float ach_reward = (float)__popc(new_unlocks);
+        float health_reward = (float)(s.health - old_health) * 0.1f;
+        rewards_g[env_idx] = ach_reward + health_reward;
+
+        bool done = (s.timestep >= MAX_TIMESTEPS) || (s.health <= 0);
+        if (in_bounds(s.player_r, s.player_c) && map_get(s, s.player_r, s.player_c) == BLK_LAVA)
+            done = true;
+        dones_g[env_idx] = done ? 1 : 0;
+
+        // Phase 3: autoreset if done (still lane 0, still on shared).
+        if (done) generate_world(s, reset_seed, env_idx + num_envs);
+    }
+    __syncwarp();
+
+    // Phase 4: obs build (warp-parallel from shared).
+    build_observation_warp(s, obs_g + env_idx * OBS_DIM, lane);
+
+    // Phase 5: bulk store state back. One write per env, regardless of done.
+    #pragma unroll 4
+    for (int i = lane; i < ENVSTATE_U32; i += 32) src[i] = dst[i];
+}
