@@ -9,11 +9,26 @@
 #include "craftax_opt5.cuh"
 #include <cmath>
 
-static_assert(sizeof(EnvState) % 4 == 0, "EnvState size must be multiple of 4");
+static_assert(sizeof(EnvState) % 16 == 0, "EnvState must be 16B-aligned for int4 I/O");
+static_assert(offsetof(EnvState, map_packed) == 0, "map_packed must be at offset 0");
+static_assert(MAP_PACKED_SIZE % 16 == 0, "map_packed must be int4-sized");
 
 constexpr int WARPS_PER_BLOCK = 4;
 constexpr int BLOCK_SIZE = WARPS_PER_BLOCK * 32;
 constexpr int ENVSTATE_U32 = sizeof(EnvState) / 4;
+constexpr int ENVSTATE_I4  = sizeof(EnvState) / 16;
+constexpr int MAP_I4       = MAP_PACKED_SIZE / 16;  // int4s in the map region
+
+__device__ __forceinline__ void warp_bulk_copy_i4(int4* __restrict__ dst, const int4* __restrict__ src, int lane) {
+    #pragma unroll 2
+    for (int i = lane; i < ENVSTATE_I4; i += 32) dst[i] = src[i];
+}
+
+// Write only the non-map portion of the state (offset MAP_PACKED_SIZE onward).
+__device__ __forceinline__ void warp_bulk_copy_nonmap_i4(int4* __restrict__ dst, const int4* __restrict__ src, int lane) {
+    #pragma unroll 2
+    for (int i = lane + MAP_I4; i < ENVSTATE_I4; i += 32) dst[i] = src[i];
+}
 
 // --- Helpers copied from opt; operate on any EnvState& (shared or global) ---
 
@@ -441,11 +456,9 @@ extern "C" __global__ void reset_kernel(
     // Parallel obs build (direct to global).
     build_observation_warp(s, obs_g + env_idx * OBS_DIM, lane);
 
-    // Warp-cooperative store state back to global.
-    uint32_t* src = reinterpret_cast<uint32_t*>(&s);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(&states_g[env_idx]);
-    #pragma unroll 4
-    for (int i = lane; i < ENVSTATE_U32; i += 32) dst[i] = src[i];
+    // Warp-cooperative 128-bit store state back to global.
+    warp_bulk_copy_i4(reinterpret_cast<int4*>(&states_g[env_idx]),
+                      reinterpret_cast<int4*>(&s), lane);
 }
 
 extern "C" __global__ void step_only_kernel(
@@ -461,19 +474,14 @@ extern "C" __global__ void step_only_kernel(
     __shared__ EnvState s_envs[WARPS_PER_BLOCK];
     EnvState& s = s_envs[warp];
 
-    // Phase 1: warp-cooperative bulk load from global AoS to shared.
-    uint32_t* src = reinterpret_cast<uint32_t*>(&states_g[env_idx]);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(&s);
-    #pragma unroll 4
-    for (int i = lane; i < ENVSTATE_U32; i += 32) dst[i] = src[i];
+    warp_bulk_copy_i4(reinterpret_cast<int4*>(&s),
+                      reinterpret_cast<int4*>(&states_g[env_idx]), lane);
     __syncwarp();
 
-    // Phase 2: game logic, lane 0 only (serial per env).
     if (lane == 0) {
         int action = actions_g[env_idx];
         int old_health = s.health;
         uint32_t old_ach = s.achievements;
-
         if (s.is_sleeping) action = ACT_NOOP;
 
         do_crafting(s, action);
@@ -485,7 +493,6 @@ extern "C" __global__ void step_only_kernel(
         update_plants(s);
         update_intrinsics(s, actions_g[env_idx]);
 
-        // inventory clamp (in shared; cheap)
         uint32_t* p = reinterpret_cast<uint32_t*>(&s.inv[0]);
         p[0] = __vminu4(p[0], 0x09090909u);
         p[1] = __vminu4(p[1], 0x09090909u);
@@ -508,9 +515,8 @@ extern "C" __global__ void step_only_kernel(
     }
     __syncwarp();
 
-    // Phase 3: warp-cooperative bulk store back to global.
-    #pragma unroll 4
-    for (int i = lane; i < ENVSTATE_U32; i += 32) src[i] = dst[i];
+    warp_bulk_copy_i4(reinterpret_cast<int4*>(&states_g[env_idx]),
+                      reinterpret_cast<int4*>(&s), lane);
 }
 
 extern "C" __global__ void autoreset_obs_kernel(
@@ -525,27 +531,19 @@ extern "C" __global__ void autoreset_obs_kernel(
     __shared__ EnvState s_envs[WARPS_PER_BLOCK];
     EnvState& s = s_envs[warp];
 
-    // Load current state into shared.
-    uint32_t* src = reinterpret_cast<uint32_t*>(&states_g[env_idx]);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(&s);
-    #pragma unroll 4
-    for (int i = lane; i < ENVSTATE_U32; i += 32) dst[i] = src[i];
+    warp_bulk_copy_i4(reinterpret_cast<int4*>(&s),
+                      reinterpret_cast<int4*>(&states_g[env_idx]), lane);
     __syncwarp();
 
-    // If done, lane 0 regenerates.
     int8_t d = dones_g[env_idx];
-    if (d && lane == 0) {
-        generate_world(s, reset_seed, env_idx + num_envs);
-    }
+    if (d && lane == 0) generate_world(s, reset_seed, env_idx + num_envs);
     __syncwarp();
 
-    // Parallel obs build.
     build_observation_warp(s, obs_g + env_idx * OBS_DIM, lane);
 
-    // Write updated state back (regeneration may have mutated it).
     if (d) {
-        #pragma unroll 4
-        for (int i = lane; i < ENVSTATE_U32; i += 32) src[i] = dst[i];
+        warp_bulk_copy_i4(reinterpret_cast<int4*>(&states_g[env_idx]),
+                          reinterpret_cast<int4*>(&s), lane);
     }
 }
 
@@ -565,13 +563,12 @@ extern "C" __global__ void step_fused_kernel(
     if (env_idx >= num_envs) return;
 
     __shared__ EnvState s_envs[WARPS_PER_BLOCK];
+    __shared__ int map_dirty[WARPS_PER_BLOCK];
     EnvState& s = s_envs[warp];
 
-    // Phase 1: warp bulk load.
-    uint32_t* src = reinterpret_cast<uint32_t*>(&states_g[env_idx]);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(&s);
-    #pragma unroll 4
-    for (int i = lane; i < ENVSTATE_U32; i += 32) dst[i] = src[i];
+    // Phase 1: warp bulk load (int4).
+    warp_bulk_copy_i4(reinterpret_cast<int4*>(&s),
+                      reinterpret_cast<int4*>(&states_g[env_idx]), lane);
     __syncwarp();
 
     // Phase 2: game step (lane 0).
@@ -580,6 +577,16 @@ extern "C" __global__ void step_fused_kernel(
         int old_health = s.health;
         uint32_t old_ach = s.achievements;
         if (s.is_sleeping) action = ACT_NOOP;
+
+        // Pre-compute conservative map-dirty predicate before mutating state.
+        // Dirty if: ACT_DO (can mine/harvest), PLACE_* (places), done (regen),
+        //          any arrow alive (may hit furnace/table), or any plant about
+        //          to ripen (age >= 599 this tick).
+        bool had_arrow = false;
+        for (int i = 0; i < MAX_ARROWS; i++) had_arrow |= s.arrow_mask[i];
+        bool had_ripening = false;
+        for (int i = 0; i < MAX_PLANTS; i++)
+            if (s.plant_mask[i] && s.plant_age[i] >= 599) { had_ripening = true; break; }
 
         do_crafting(s, action);
         if (action == ACT_DO) do_action(s);
@@ -612,13 +619,23 @@ extern "C" __global__ void step_fused_kernel(
 
         // Phase 3: autoreset if done (still lane 0, still on shared).
         if (done) generate_world(s, reset_seed, env_idx + num_envs);
+
+        bool dirty = (action == ACT_DO)
+                  || (action >= ACT_PLACE_STONE && action <= ACT_PLACE_PLANT)
+                  || done || had_arrow || had_ripening;
+        map_dirty[warp] = dirty ? 1 : 0;
     }
     __syncwarp();
 
     // Phase 4: obs build (warp-parallel from shared).
     build_observation_warp(s, obs_g + env_idx * OBS_DIM, lane);
 
-    // Phase 5: bulk store state back. One write per env, regardless of done.
-    #pragma unroll 4
-    for (int i = lane; i < ENVSTATE_U32; i += 32) src[i] = dst[i];
+    // Phase 5: bulk store state back. Skip the 2 KB map region when clean.
+    if (map_dirty[warp]) {
+        warp_bulk_copy_i4(reinterpret_cast<int4*>(&states_g[env_idx]),
+                          reinterpret_cast<int4*>(&s), lane);
+    } else {
+        warp_bulk_copy_nonmap_i4(reinterpret_cast<int4*>(&states_g[env_idx]),
+                                 reinterpret_cast<int4*>(&s), lane);
+    }
 }
