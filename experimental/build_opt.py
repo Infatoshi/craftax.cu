@@ -18,6 +18,15 @@ def load_opt():
         verbose=False,
     )
 
+def load_opt5():
+    return load(
+        name='craftax_cuda_opt5',
+        sources=[os.path.join(_here, 'craftax_opt5_ext.cu')],
+        extra_cuda_cflags=['-O3', _arch(), '--expt-relaxed-constexpr', '-lineinfo', '--use_fast_math'],
+        extra_include_paths=[_here],
+        verbose=False,
+    )
+
 def load_opt4():
     return load(
         name='craftax_cuda_opt4',
