@@ -4,6 +4,12 @@
 #include <curand_kernel.h>
 
 // ============================================================
+// This is Craftax-CLASSIC, not Craftax-Full.
+// Classic: 17 actions, 22 achievements, single 64x64 map, no
+// dungeon floors / potions / enchantments / bosses.
+// ============================================================
+
+// ============================================================
 // Constants
 // ============================================================
 #define MAP_SIZE 64

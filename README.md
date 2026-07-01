@@ -2,6 +2,8 @@
 
 CUDA reimplementation of [Craftax-Classic](https://github.com/MichaelTMatthews/Craftax) (Matthews et al. 2024) for high-throughput RL training.
 
+> **This is Craftax-Classic, not Craftax-Full.** 17 actions, 22 achievements, a single 64x64 map. No dungeon floors, potions, enchantments, or bosses. If you want the full game, see the native C port in [PufferLib's `ocean/craftax`](https://github.com/PufferAI/PufferLib/tree/4.0/ocean/craftax).
+
 The idea: take the fastest PufferLib environment and see how far you can get by keeping everything on GPU and writing the game logic in pure CUDA. Turns out, pretty far.
 
 <p align="center">

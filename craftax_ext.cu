@@ -93,7 +93,11 @@ public:
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    pybind11::class_<CraftaxEnv>(m, "CraftaxEnv")
+    m.doc() = "craftax.cu: CUDA Craftax-Classic (17 actions, 22 achievements, "
+              "single 64x64 map). This is Craftax-Classic, NOT Craftax-Full.";
+    pybind11::class_<CraftaxEnv>(m, "CraftaxEnv",
+        "Batched CUDA Craftax-Classic environment. Classic, not Full: 17 actions, "
+        "22 achievements, single 64x64 map, no dungeon floors/potions/enchant/bosses.")
         .def(pybind11::init<int, uint64_t>(), pybind11::arg("num_envs") = 4096, pybind11::arg("seed") = 42)
         .def("reset", &CraftaxEnv::reset)
         .def("step", &CraftaxEnv::step)

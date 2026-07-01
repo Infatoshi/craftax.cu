@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "craftax.cu: a CUDA reimplementation of the Craftax benchmark environment"
+title: "craftax.cu: a CUDA reimplementation of the Craftax-Classic benchmark environment"
 authors:
   - family-names: Arledge
     given-names: Elliot
