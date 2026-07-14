@@ -1,3 +1,5 @@
 craftax_classic
 craftax_full
+craftax_full_cuda
+craftax_full_cuda_compact
 *.o

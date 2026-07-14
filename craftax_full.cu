@@ -247,8 +247,9 @@ static __device__ inline void craftax_noise_gradient(
 
 #ifndef CRAFTAX_NOISE_MAX_GRAD
 // Largest gradient grid used by worldgen: res (6,24) at 48x48 -> 7x25 = 175.
-// Sized with headroom; a grid larger than this falls back to per-cell lookups.
-#define CRAFTAX_NOISE_MAX_GRAD 1024
+// Sized tightly ([cuda port]: was 1024 = 8KB of per-thread stack); a grid
+// larger than this falls back to per-cell lookups, which never triggers.
+#define CRAFTAX_NOISE_MAX_GRAD 176
 #endif
 
 static __device__ inline void craftax_generate_perlin_noise_2d_scalar(
@@ -498,39 +499,34 @@ static __device__ inline void craftax_generate_fractal_noise_2d(
     float* out
 ) {
     size_t size = (size_t)rows * (size_t)cols;
-    for (size_t i = 0; i < size; i++) {
-        out[i] = 0.0f;
-    }
+    // [cuda port] every worldgen call site uses octaves == 1, so the perlin
+    // field is generated straight into `out` instead of staging it in a 9KB
+    // per-thread buffer. The accumulation ops (out = 0.0f, out += 1.0f * v)
+    // are kept verbatim so the result stays bit-identical (incl. -0 -> +0).
+    if (octaves != 1) { __trap(); }
+    (void)persistence;
+    (void)lacunarity;
 
-    int frequency = 1;
+    CraftaxThreefryKey next_rng;
+    CraftaxThreefryKey noise_key;
+    craftax_threefry_split(rng, &next_rng, &noise_key);
+    rng = next_rng;
+
+    craftax_generate_perlin_noise_2d(
+        noise_key,
+        rows,
+        cols,
+        res_rows,
+        res_cols,
+        override_angles,
+        out
+    );
+
     float amplitude = 1.0f;
-    // [cuda port] was a C VLA `float perlin[size]`; worldgen only ever
-    // calls this with rows*cols <= 48*48.
-    if (size > 2304) { __trap(); }
-    float perlin[2304];
-
-    for (int octave = 0; octave < octaves; octave++) {
-        CraftaxThreefryKey next_rng;
-        CraftaxThreefryKey noise_key;
-        craftax_threefry_split(rng, &next_rng, &noise_key);
-        rng = next_rng;
-
-        craftax_generate_perlin_noise_2d(
-            noise_key,
-            rows,
-            cols,
-            frequency * res_rows,
-            frequency * res_cols,
-            override_angles,
-            perlin
-        );
-
-        for (size_t i = 0; i < size; i++) {
-            out[i] += amplitude * perlin[i];
-        }
-
-        frequency *= lacunarity;
-        amplitude *= persistence;
+    for (size_t i = 0; i < size; i++) {
+        float perlin_value = out[i];
+        out[i] = 0.0f;
+        out[i] += amplitude * perlin_value;
     }
 
     float min_value = out[0];
@@ -1295,6 +1291,41 @@ static __device__ inline int craftax_dungeon_config_index_for_floor(int floor_id
 // ============================================================
 static __device__ int g_craftax_wg_force_scalar = 0;
 
+// ============================================================
+// [cuda port] Per-thread worldgen scratch arena. The scalar generators used
+// to keep their noise fields / padded maps in ~60KB of thread-local stack,
+// which forces a huge cudaLimitStackSize and throttles k_step residency.
+// Instead each generator grabs a global-memory slot indexed by the calling
+// thread's flat id (every kernel that reaches these generators launches at
+// most one thread per env, so num_envs slots suffice). The warp-cooperative
+// reset path has its own shared-memory scratch and never touches this.
+// ============================================================
+typedef struct CraftaxWorldgenScratch {
+    union {
+        struct {
+            float water[CRAFTAX_WG_MAP_CELLS];
+            float mountain[CRAFTAX_WG_MAP_CELLS];
+            float path_x[CRAFTAX_WG_MAP_CELLS];
+            float tree_noise[CRAFTAX_WG_MAP_CELLS];
+            bool lava_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE];
+            bool valid[CRAFTAX_WG_MAP_CELLS];
+        } smooth;
+        struct {
+            uint8_t padded_map[68][68];
+            uint8_t padded_item_map[68][68];
+            bool adjacent_path[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE];
+            bool valid[CRAFTAX_WG_MAP_CELLS];
+        } dungeon;
+    } u;
+} CraftaxWorldgenScratch;
+
+__device__ CraftaxWorldgenScratch* g_craftax_wg_scratch = NULL;
+
+static __device__ inline CraftaxWorldgenScratch* craftax_wg_scratch_slot(void) {
+    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    return &g_craftax_wg_scratch[tid];
+}
+
 static __device__ inline void craftax_smoothworld_classify_scalar(
     const CraftaxSmoothGenConfig* config,
     CraftaxThreefryKey tree_uniform_key,
@@ -1640,11 +1671,12 @@ static __device__ inline void craftax_generate_smoothworld_config(
     const size_t cells = CRAFTAX_WG_MAP_CELLS;
 
     CraftaxThreefryKey subkey;
-    float water[CRAFTAX_WG_MAP_CELLS];
-    float mountain[CRAFTAX_WG_MAP_CELLS];
-    float path_x[CRAFTAX_WG_MAP_CELLS];
-    float tree_noise[CRAFTAX_WG_MAP_CELLS];
-    bool lava_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE];
+    CraftaxWorldgenScratch* scratch = craftax_wg_scratch_slot();
+    float* water = scratch->u.smooth.water;
+    float* mountain = scratch->u.smooth.mountain;
+    float* path_x = scratch->u.smooth.path_x;
+    float* tree_noise = scratch->u.smooth.tree_noise;
+    bool (*lava_map)[CRAFTAX_WG_MAP_SIZE] = scratch->u.smooth.lava_map;
 
     craftax_threefry_split(rng, &rng, &subkey);
     craftax_generate_fractal_noise_2d(subkey, size, size, 3, 3, 1, 0.5f, 2, NULL, water);
@@ -1710,7 +1742,7 @@ static __device__ inline void craftax_generate_smoothworld_config(
     }
 
     craftax_threefry_split(rng, &rng, &subkey);
-    bool valid_diamond[CRAFTAX_WG_MAP_CELLS];
+    bool* valid_diamond = scratch->u.smooth.valid;
     for (int row = 0; row < size; row++) {
         for (int col = 0; col < size; col++) {
             valid_diamond[craftax_wg_index(row, col)] = map[row][col] == CRAFTAX_WG_BLOCK_STONE;
@@ -1721,7 +1753,7 @@ static __device__ inline void craftax_generate_smoothworld_config(
 
     map[player_row][player_col] = (uint8_t)config->player_spawn;
 
-    bool valid_ladder[CRAFTAX_WG_MAP_CELLS];
+    bool* valid_ladder = scratch->u.smooth.valid;
     for (int row = 0; row < size; row++) {
         for (int col = 0; col < size; col++) {
             valid_ladder[craftax_wg_index(row, col)] = map[row][col] == config->valid_ladder;
@@ -1797,8 +1829,9 @@ static __device__ inline void craftax_generate_dungeon_config(
     const int max_room_size = 10;
     const int padded_size = CRAFTAX_WG_MAP_SIZE + 2 * max_room_size;
 
-    uint8_t padded_map[68][68];
-    uint8_t padded_item_map[68][68];
+    CraftaxWorldgenScratch* scratch = craftax_wg_scratch_slot();
+    uint8_t (*padded_map)[68] = scratch->u.dungeon.padded_map;
+    uint8_t (*padded_item_map)[68] = scratch->u.dungeon.padded_item_map;
     bool room_occupancy_chunks[9];
     int32_t room_sizes[8][2];
     int32_t room_positions[8][2];
@@ -1936,7 +1969,7 @@ static __device__ inline void craftax_generate_dungeon_config(
         }
     }
 
-    bool adjacent_path[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE];
+    bool (*adjacent_path)[CRAFTAX_WG_MAP_SIZE] = scratch->u.dungeon.adjacent_path;
     for (int row = 0; row < CRAFTAX_WG_MAP_SIZE; row++) {
         for (int col = 0; col < CRAFTAX_WG_MAP_SIZE; col++) {
             bool adjacent = map[row][col] != CRAFTAX_WG_BLOCK_WALL;
@@ -1971,7 +2004,7 @@ static __device__ inline void craftax_generate_dungeon_config(
         }
     }
 
-    bool valid_ladder[CRAFTAX_WG_MAP_CELLS];
+    bool* valid_ladder = scratch->u.dungeon.valid;
     for (int row = 0; row < CRAFTAX_WG_MAP_SIZE; row++) {
         for (int col = 0; col < CRAFTAX_WG_MAP_SIZE; col++) {
             valid_ladder[craftax_wg_index(row, col)] = map[row][col] == CRAFTAX_WG_BLOCK_PATH;
@@ -2981,6 +3014,25 @@ static __device__ inline void craftax_profile_report(void) {
 #define CRAFTAX_PROFILE_END(n) craftax_profile_record((n), _prof_zone_start)
 #define CRAFTAX_PROFILE_FINAL(n) craftax_profile_record((n), _prof_start)
 
+#elif defined(CRAFTAX_CU_PROFILE)
+
+// Device-side zone profiler: clock64 deltas accumulated with atomics. Only
+// for perf investigation builds (-DCRAFTAX_CU_PROFILE); off by default.
+#define CRAFTAX_NUM_PROFILE_ZONES 18
+__device__ unsigned long long g_cu_prof_cycles[CRAFTAX_NUM_PROFILE_ZONES];
+__device__ unsigned long long g_cu_prof_count[CRAFTAX_NUM_PROFILE_ZONES];
+
+#define CRAFTAX_PROFILE_START() \
+    unsigned long long _prof_zone_start = 0; (void)_prof_zone_start
+#define CRAFTAX_PROFILE_ZONE(n) do { _prof_zone_start = clock64(); } while (0)
+#define CRAFTAX_PROFILE_END(n) do { \
+    atomicAdd(&g_cu_prof_cycles[n], \
+              (unsigned long long)(clock64() - _prof_zone_start)); \
+    atomicAdd(&g_cu_prof_count[n], 1ULL); \
+} while (0)
+#define CRAFTAX_PROFILE_FINAL(n) ((void)0)
+#define craftax_profile_report() ((void)0)
+
 #else
 
 #define CRAFTAX_PROFILE_START() ((void)0)
@@ -3657,6 +3709,526 @@ static __device__ inline void craftax_reset_state_on_done(
     craftax_reset_state_from_reset_key(out, reset_key);
 }
 
+// ============================================================
+// Warp-cooperative world regeneration (lazy mode).
+//
+// All worldgen randomness is either (a) key-chain derivation — a serial but
+// tiny sequence of 64-bit LCG advances, replicated identically on every lane
+// — or (b) counter-based draws craftax_threefry_uniform_*_at(key, cell_index)
+// that are pure functions of (key, cell). Every per-cell arithmetic
+// expression below is copied verbatim from the scalar generators, and
+// -fmad=false forbids contraction differences, so a warp generating cells in
+// parallel produces bit-identical maps to the single-thread path. min/max
+// reductions commute bitwise (no NaNs); the weighted-choice scan is chunked
+// so each lane reproduces the scalar cumulative sums exactly.
+//
+// Scratch (the noise fields the scalar code kept in 46KB of thread-local
+// stack) lives in shared memory: one warp per block, ~41KB static shared.
+// ============================================================
+typedef struct CraftaxWarpScratch {
+    float water[CRAFTAX_WG_MAP_CELLS];
+    float mountain[CRAFTAX_WG_MAP_CELLS];
+    float path_x[CRAFTAX_WG_MAP_CELLS];
+    float tree_noise[CRAFTAX_WG_MAP_CELLS];
+    float grad_x[176];  // largest gradient grid: res (6,24) -> 7x25 = 175
+    float grad_y[176];
+    bool lava_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE];
+} CraftaxWarpScratch;
+
+#define CRAFTAX_WARP_ALL 0xffffffffu
+
+// Fractal noise with octaves=1 (every smoothworld call), warp-parallel over
+// cells. Reproduces craftax_generate_fractal_noise_2d + perlin_2d_scalar
+// bitwise: same key chain, same per-cell expressions, order-free min/max.
+static __device__ inline void craftax_fractal_noise_warp(
+    CraftaxThreefryKey rng,
+    int res_rows,
+    int res_cols,
+    float* grad_x,
+    float* grad_y,
+    float* out,
+    unsigned lane
+) {
+    const int rows = CRAFTAX_WG_MAP_SIZE;
+    const int cols = CRAFTAX_WG_MAP_SIZE;
+    // fractal: single octave -> one perlin field, then min/max normalize.
+    CraftaxThreefryKey next_rng;
+    CraftaxThreefryKey noise_key;
+    craftax_threefry_split(rng, &next_rng, &noise_key);
+    // perlin: derive the angle key exactly as the scalar path.
+    CraftaxThreefryKey unused;
+    CraftaxThreefryKey angle_key;
+    craftax_threefry_split(noise_key, &unused, &angle_key);
+
+    int cell_rows = rows / res_rows;
+    int cell_cols = cols / res_cols;
+    int grad_w = res_cols + 1;
+    int grad_h = res_rows + 1;
+    for (int g = (int)lane; g < grad_h * grad_w; g += 32) {
+        // craftax_noise_gradient_angle with width == grad_w: index == g.
+        float angle = CRAFTAX_NOISE_PI2
+            * craftax_threefry_uniform_f32_at(angle_key, (uint64_t)g);
+        grad_x[g] = cosf(angle);
+        grad_y[g] = sinf(angle);
+    }
+    __syncwarp();
+
+    float local_min = INFINITY;
+    float local_max = -INFINITY;
+    for (int i = (int)lane; i < rows * cols; i += 32) {
+        int row = i / cols;
+        int col = i % cols;
+        int grad_row = row / cell_rows;
+        float local_row = (float)(row - grad_row * cell_rows) / (float)cell_rows;
+        float interp_row = craftax_noise_interpolant(local_row);
+        int grad_col = col / cell_cols;
+        float local_col = (float)(col - grad_col * cell_cols) / (float)cell_cols;
+        float interp_col = craftax_noise_interpolant(local_col);
+
+        int i00 = grad_row * grad_w + grad_col;
+        int i10 = i00 + grad_w;
+        float g00x = grad_x[i00];     float g00y = grad_y[i00];
+        float g10x = grad_x[i10];     float g10y = grad_y[i10];
+        float g01x = grad_x[i00 + 1]; float g01y = grad_y[i00 + 1];
+        float g11x = grad_x[i10 + 1]; float g11y = grad_y[i10 + 1];
+
+        float n00 = local_row * g00x;
+        n00 += local_col * g00y;
+        float n10 = (local_row - 1.0f) * g10x;
+        n10 += local_col * g10y;
+        float n01 = local_row * g01x;
+        n01 += (local_col - 1.0f) * g01y;
+        float n11 = (local_row - 1.0f) * g11x;
+        n11 += (local_col - 1.0f) * g11y;
+
+        float n0 = n00 * (1.0f - interp_row) + interp_row * n10;
+        float n1 = n01 * (1.0f - interp_row) + interp_row * n11;
+        float perlin =
+            CRAFTAX_NOISE_SQRT2 * ((1.0f - interp_col) * n0 + interp_col * n1);
+        // fractal accumulate, octave 0: out = 0 + 1.0f * perlin (kept as the
+        // same ops so -0.0f flushes to +0.0f exactly like the scalar code).
+        float acc = 0.0f;
+        acc += 1.0f * perlin;
+        out[i] = acc;
+        if (acc < local_min) local_min = acc;
+        if (acc > local_max) local_max = acc;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        float other_min = __shfl_xor_sync(CRAFTAX_WARP_ALL, local_min, off);
+        float other_max = __shfl_xor_sync(CRAFTAX_WARP_ALL, local_max, off);
+        if (other_min < local_min) local_min = other_min;
+        if (other_max > local_max) local_max = other_max;
+    }
+    float scale = local_max - local_min;
+    __syncwarp();
+    for (int i = (int)lane; i < rows * cols; i += 32) {
+        out[i] = (out[i] - local_min) / scale;
+    }
+    __syncwarp();
+}
+
+// Warp version of craftax_choice_bool_flat over the predicate
+// map[cell] == target. Chunked so lane L owns cells [72L, 72L+72): the lane
+// whose chunk straddles the draw replays the scalar cumulative loop with the
+// exact float sums the serial code would have at its chunk boundary.
+static __device__ inline int craftax_warp_choice_map_eq(
+    CraftaxThreefryKey key,
+    const uint8_t* map_flat,
+    uint8_t target,
+    unsigned lane
+) {
+    const int chunk = CRAFTAX_WG_MAP_CELLS / 32;
+    int base = (int)lane * chunk;
+    int count = 0;
+    int last_valid_local = -1;
+    for (int k = 0; k < chunk; k++) {
+        if (map_flat[base + k] == target) {
+            count++;
+            last_valid_local = base + k;
+        }
+    }
+    int incl = count;
+    for (int off = 1; off < 32; off <<= 1) {
+        int n = __shfl_up_sync(CRAFTAX_WARP_ALL, incl, off);
+        if (lane >= (unsigned)off) incl += n;
+    }
+    int total = __shfl_sync(CRAFTAX_WARP_ALL, incl, 31);
+    if (total == 0) return 0;
+
+    float draw = (float)total * (1.0f - craftax_threefry_uniform_f32(key));
+    int excl = incl - count;
+    int result = INT_MAX;
+    if ((float)excl < draw && draw <= (float)incl) {
+        float cumulative = (float)excl;
+        for (int k = 0; k < chunk; k++) {
+            if (map_flat[base + k] == target) cumulative += 1.0f;
+            if (cumulative >= draw) { result = base + k; break; }
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        int other = __shfl_xor_sync(CRAFTAX_WARP_ALL, result, off);
+        if (other < result) result = other;
+    }
+    if (result != INT_MAX) return result;
+    // Scalar fallback: cumulative never reached draw -> last valid cell.
+    int last_valid = last_valid_local;
+    for (int off = 16; off > 0; off >>= 1) {
+        int other = __shfl_xor_sync(CRAFTAX_WARP_ALL, last_valid, off);
+        if (other > last_valid) last_valid = other;
+    }
+    return last_valid < 0 ? 0 : last_valid;
+}
+
+// Warp version of craftax_generate_smoothworld_config: identical key chain
+// (replicated on all lanes), per-cell passes strided across the warp.
+static __device__ inline void craftax_smoothworld_config_warp(
+    CraftaxThreefryKey rng,
+    int config_idx,
+    uint8_t map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
+    uint8_t item_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
+    uint8_t light_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
+    int32_t ladder_down[2],
+    int32_t ladder_up[2],
+    CraftaxWarpScratch* s,
+    unsigned lane
+) {
+    const CraftaxSmoothGenConfig* config = &CRAFTAX_SMOOTHGEN_CONFIGS[config_idx];
+    const int size = CRAFTAX_WG_MAP_SIZE;
+    const int player_row = CRAFTAX_WG_MAP_SIZE / 2;
+    const int player_col = CRAFTAX_WG_MAP_SIZE / 2;
+
+    CraftaxThreefryKey subkey;
+    craftax_threefry_split(rng, &rng, &subkey);
+    craftax_fractal_noise_warp(subkey, 3, 3, s->grad_x, s->grad_y, s->water, lane);
+
+    craftax_threefry_split(rng, &rng, &subkey);
+    (void)subkey;
+
+    craftax_threefry_split(rng, &rng, &subkey);
+    craftax_fractal_noise_warp(subkey, 3, 3, s->grad_x, s->grad_y, s->mountain, lane);
+
+    craftax_threefry_split(rng, &rng, &subkey);
+    craftax_fractal_noise_warp(subkey, 6, 24, s->grad_x, s->grad_y, s->path_x, lane);
+
+    craftax_threefry_split(rng, &rng, &subkey);
+    (void)subkey;
+
+    craftax_threefry_split(rng, &rng, &subkey);
+    CraftaxThreefryKey tree_uniform_key = rng;
+    craftax_fractal_noise_warp(subkey, 12, 12, s->grad_x, s->grad_y, s->tree_noise, lane);
+
+    // classify (verbatim per-cell body from craftax_smoothworld_classify_scalar)
+    for (int i = (int)lane; i < size * size; i += 32) {
+        int row = i / size;
+        int col = i % size;
+        int dr = row > player_row ? row - player_row : player_row - row;
+        int dc = col > player_col ? col - player_col : player_col - col;
+        float distance = sqrtf((float)(dr * dr + dc * dc));
+        float proximity_water = craftax_wg_clampf(
+            distance / config->player_proximity_map_water_strength,
+            0.0f,
+            config->player_proximity_map_water_max
+        );
+        float proximity_mountain = craftax_wg_clampf(
+            distance / config->player_proximity_map_mountain_strength,
+            0.0f,
+            config->player_proximity_map_mountain_max
+        );
+        size_t idx = craftax_wg_index(row, col);
+
+        s->water[idx] = s->water[idx] + proximity_water - 1.0f;
+        int32_t block = s->water[idx] > config->water_threshold
+            ? config->sea_block
+            : config->default_block;
+        bool sand = s->water[idx] > config->sand_threshold && block != config->sea_block;
+        if (sand) {
+            block = config->coast_block;
+        }
+
+        s->mountain[idx] = s->mountain[idx] + 0.05f + proximity_mountain - 1.0f;
+        if (s->mountain[idx] > 0.7f) {
+            block = config->mountain_block;
+        }
+
+        bool path = s->mountain[idx] > 0.7f && s->path_x[idx] > 0.8f;
+        if (path) {
+            block = config->path_block;
+        }
+
+        float path_y = s->path_x[craftax_wg_index(col, row)];
+        path = s->mountain[idx] > 0.7f && path_y > 0.8f;
+        if (path) {
+            block = config->path_block;
+        }
+
+        bool cave = s->mountain[idx] > 0.85f && s->water[idx] > 0.4f;
+        if (cave) {
+            block = config->inner_mountain_block;
+        }
+
+        float tree_draw = craftax_threefry_uniform_f32_at(tree_uniform_key, idx);
+        bool tree = s->tree_noise[idx] > config->tree_threshold_perlin
+            && tree_draw > config->tree_threshold_uniform;
+        if (tree && block == config->tree_requirement_block) {
+            block = config->tree;
+        }
+
+        map[row][col] = (uint8_t)block;
+        item_map[row][col] = CRAFTAX_WG_ITEM_NONE;
+        light_map[row][col] = (uint8_t)(config->default_light * 255.0f);
+    }
+    __syncwarp();
+
+    // ores
+    CraftaxThreefryKey ore_rng;
+    craftax_threefry_split(rng, &rng, &ore_rng);
+    for (int ore_index = 0; ore_index < 5; ore_index++) {
+        CraftaxThreefryKey ore_key;
+        craftax_threefry_split(ore_rng, &ore_rng, &ore_key);
+        for (int i = (int)lane; i < size * size; i += 32) {
+            int row = i / size;
+            int col = i % size;
+            size_t idx = craftax_wg_index(row, col);
+            bool is_ore = map[row][col] == config->ore_requirement_blocks[ore_index]
+                && craftax_threefry_uniform_f32_at(ore_key, idx) < config->ore_chances[ore_index];
+            if (is_ore) {
+                map[row][col] = (uint8_t)config->ores[ore_index];
+            }
+        }
+        __syncwarp();
+    }
+
+    // lava
+    for (int i = (int)lane; i < size * size; i += 32) {
+        int row = i / size;
+        int col = i % size;
+        size_t idx = craftax_wg_index(row, col);
+        s->lava_map[row][col] = s->mountain[idx] > 0.85f && s->tree_noise[idx] > 0.7f;
+        if (s->lava_map[row][col]) {
+            map[row][col] = (uint8_t)config->lava;
+        }
+    }
+    __syncwarp();
+
+    // diamond placement (choice over stone cells; the write is a no-op value
+    // change but kept for parity with the scalar code)
+    craftax_threefry_split(rng, &rng, &subkey);
+    int diamond_index = craftax_warp_choice_map_eq(
+        subkey, &map[0][0], (uint8_t)CRAFTAX_WG_BLOCK_STONE, lane);
+    if (lane == 0) {
+        map[diamond_index / size][diamond_index % size] =
+            (uint8_t)CRAFTAX_WG_BLOCK_STONE;
+        map[player_row][player_col] = (uint8_t)config->player_spawn;
+    }
+    __syncwarp();
+
+    // ladders (both draws read the same map state, like the scalar code)
+    craftax_threefry_split(rng, &rng, &subkey);
+    int ladder_down_index = craftax_warp_choice_map_eq(
+        subkey, &map[0][0], (uint8_t)config->valid_ladder, lane);
+    if (lane == 0) {
+        ladder_down[0] = ladder_down_index / size;
+        ladder_down[1] = ladder_down_index % size;
+        if (config->ladder_down) {
+            item_map[ladder_down_index / size][ladder_down_index % size] =
+                CRAFTAX_WG_ITEM_LADDER_DOWN;
+        }
+    }
+
+    craftax_threefry_split(rng, &rng, &subkey);
+    int ladder_up_index = craftax_warp_choice_map_eq(
+        subkey, &map[0][0], (uint8_t)config->valid_ladder, lane);
+    int lu_row = ladder_up_index / size;
+    int lu_col = ladder_up_index % size;
+    if (lane == 0) {
+        ladder_up[0] = lu_row;
+        ladder_up[1] = lu_col;
+    }
+    __syncwarp();
+
+    // craftax_apply_ladder_light, 9x9 patch strided across the warp
+    {
+        int start_row = lu_row - 4;
+        int start_col = lu_col - 4;
+        if (start_row < 0) start_row += CRAFTAX_WG_MAP_SIZE;
+        if (start_col < 0) start_col += CRAFTAX_WG_MAP_SIZE;
+        start_row = craftax_wg_clampi(start_row, 0, CRAFTAX_WG_MAP_SIZE - 9);
+        start_col = craftax_wg_clampi(start_col, 0, CRAFTAX_WG_MAP_SIZE - 9);
+        for (int p = (int)lane; p < 81; p += 32) {
+            int row = p / 9;
+            int col = p % 9;
+            light_map[start_row + row][start_col + col] = (uint8_t)(
+                craftax_torch_light_value(row, col, config->default_light) * 255.0f);
+        }
+    }
+    __syncwarp();
+
+    // craftax_add_lava_light, per-cell over the shared lava map
+    if (config->lava == CRAFTAX_WG_BLOCK_LAVA) {
+        static const float kernel[3][3] = {
+            {0.2f, 0.7f, 0.2f},
+            {0.7f, 1.0f, 0.7f},
+            {0.2f, 0.7f, 0.2f},
+        };
+        for (int i = (int)lane; i < size * size; i += 32) {
+            int row = i / size;
+            int col = i % size;
+            float add = 0.0f;
+            for (int kr = 0; kr < 3; kr++) {
+                int src_row = row + kr - 1;
+                if (src_row < 0 || src_row >= CRAFTAX_WG_MAP_SIZE) continue;
+                for (int kc = 0; kc < 3; kc++) {
+                    int src_col = col + kc - 1;
+                    if (src_col < 0 || src_col >= CRAFTAX_WG_MAP_SIZE) continue;
+                    add += s->lava_map[src_row][src_col] ? kernel[kr][kc] : 0.0f;
+                }
+            }
+            float new_light = craftax_wg_clampf(
+                light_map[row][col] * (1.0f / 255.0f) + add, 0.0f, 1.0f);
+            light_map[row][col] = (uint8_t)(new_light * 255.0f);
+        }
+    }
+    __syncwarp();
+
+    if (config->ladder_up && lane == 0) {
+        item_map[lu_row][lu_col] = CRAFTAX_WG_ITEM_LADDER_UP;
+    }
+    __syncwarp();
+}
+
+// Warp version of craftax_generate_world_from_key_lazy(lazy=true) plus the
+// spawn-bit refresh from craftax_generate_state_from_world_key.
+static __device__ inline void craftax_generate_state_from_world_key_warp(
+    CraftaxThreefryKey rng,
+    CraftaxState* state,
+    CraftaxWarpScratch* s,
+    unsigned lane
+) {
+    CraftaxWorldState* out = (CraftaxWorldState*)(void*)state;
+
+    // cooperative memset(out, 0, sizeof(*out))
+    {
+        uint32_t* words = (uint32_t*)(void*)out;
+        const size_t nwords = sizeof(*out) / sizeof(uint32_t);
+        for (size_t i = lane; i < nwords; i += 32) words[i] = 0u;
+        if (lane == 0) {
+            uint8_t* bytes = (uint8_t*)(void*)out;
+            for (size_t b = nwords * sizeof(uint32_t); b < sizeof(*out); b++) {
+                bytes[b] = 0;
+            }
+        }
+    }
+    __syncwarp();
+
+    CraftaxThreefryKey smooth_split[7];
+    craftax_threefry_split_n(rng, smooth_split, 7);
+    rng = smooth_split[0];
+
+    static const int smooth_floor_order[6] = {0, 2, 5, 6, 7, 8};
+    if (lane == 0) {
+        for (int i = 0; i < 6; i++) {
+            int level = smooth_floor_order[i];
+            out->lazy_floor_keys[level][0] = smooth_split[i + 1].word[0];
+            out->lazy_floor_keys[level][1] = smooth_split[i + 1].word[1];
+        }
+    }
+    // floor 0 (smooth config 0), warp-cooperative; floors 1..8 stay deferred
+    craftax_smoothworld_config_warp(
+        smooth_split[1], 0,
+        out->map[0], out->item_map[0], out->light_map[0],
+        out->down_ladders[0], out->up_ladders[0], s, lane);
+
+    CraftaxThreefryKey dungeon_split[4];
+    craftax_threefry_split_n(rng, dungeon_split, 4);
+    rng = dungeon_split[0];
+
+    static const int dungeon_floor_order[3] = {1, 3, 4};
+    if (lane == 0) {
+        for (int i = 0; i < 3; i++) {
+            int level = dungeon_floor_order[i];
+            out->lazy_floor_keys[level][0] = dungeon_split[i + 1].word[0];
+            out->lazy_floor_keys[level][1] = dungeon_split[i + 1].word[1];
+        }
+        out->lazy_floors_pending = 0x1FEu;  // floors 1..8 deferred
+
+        craftax_init_empty_mobs3(&out->melee_mobs);
+        craftax_init_empty_mobs3(&out->passive_mobs);
+        craftax_init_empty_mobs2(&out->ranged_mobs);
+        craftax_init_empty_mobs3(&out->mob_projectiles);
+        craftax_init_empty_mobs3(&out->player_projectiles);
+        for (int level = 0; level < CRAFTAX_WG_NUM_LEVELS; level++) {
+            for (int projectile = 0; projectile < CRAFTAX_WG_MAX_MOB_PROJECTILES; projectile++) {
+                out->mob_projectile_directions[level][projectile][0] = 1;
+                out->mob_projectile_directions[level][projectile][1] = 1;
+            }
+            for (int projectile = 0; projectile < CRAFTAX_WG_MAX_PLAYER_PROJECTILES; projectile++) {
+                out->player_projectile_directions[level][projectile][0] = 1;
+                out->player_projectile_directions[level][projectile][1] = 1;
+            }
+        }
+    }
+
+    CraftaxThreefryKey potion_key;
+    craftax_threefry_split(rng, &rng, &potion_key);
+    CraftaxThreefryKey state_key;
+    craftax_threefry_split(rng, &rng, &state_key);
+    (void)rng;
+    if (lane == 0) {
+        craftax_permutation_6(potion_key, out->potion_mapping);
+        out->state_rng[0] = state_key.word[0];
+        out->state_rng[1] = state_key.word[1];
+
+        out->monsters_killed[0] = 10;
+        out->player_position[0] = CRAFTAX_WG_MAP_SIZE / 2;
+        out->player_position[1] = CRAFTAX_WG_MAP_SIZE / 2;
+        out->player_level = 0;
+        out->player_direction = CRAFTAX_WG_ACTION_UP;
+        out->player_health = 9.0f;
+        out->player_food = 9;
+        out->player_drink = 9;
+        out->player_energy = 9;
+        out->player_mana = 9;
+        out->player_dexterity = 1;
+        out->player_strength = 1;
+        out->player_intelligence = 1;
+        out->boss_timesteps_to_spawn_this_round = CRAFTAX_WG_BOSS_FIGHT_SPAWN_TURNS;
+        out->light_level = craftax_calculate_initial_light_level();
+    }
+    __syncwarp();
+
+    // spawn bits for the one generated floor, one row per lane
+    for (int row = (int)lane; row < CRAFTAX_MAP_SIZE; row += 32) {
+        uint64_t all_bits = 0;
+        uint64_t grave_bits = 0;
+        uint64_t water_bits = 0;
+        for (int32_t col = 0; col < CRAFTAX_MAP_SIZE; col++) {
+            uint8_t block = state->map[0][row][col];
+            uint64_t bit = 1ULL << col;
+            all_bits |= (0ULL - craftax_spawn_all_bit(block)) & bit;
+            grave_bits |= (0ULL - craftax_spawn_grave_bit(block)) & bit;
+            water_bits |= (0ULL - craftax_spawn_water_bit(block)) & bit;
+        }
+        state->spawn_all_bits[0][row] = all_bits;
+        state->spawn_grave_bits[0][row] = grave_bits;
+        state->spawn_water_bits[0][row] = water_bits;
+    }
+    __syncwarp();
+}
+
+// Full on-done reset, warp-cooperative: mirrors craftax_reset_state_on_done
+// -> craftax_reset_state_from_reset_key (lazy path).
+static __device__ inline void craftax_reset_state_on_done_warp(
+    CraftaxState* state,
+    CraftaxThreefryKey reset_key,
+    CraftaxWarpScratch* s,
+    unsigned lane
+) {
+    CraftaxThreefryKey unused;
+    CraftaxThreefryKey world_key;
+    craftax_threefry_split(reset_key, &unused, &world_key);
+    craftax_generate_state_from_world_key_warp(world_key, state, s, lane);
+}
+
 static __device__ inline void craftax_encode_native_observation(
     const CraftaxState* state,
     CraftaxObs* obs
@@ -3890,7 +4462,15 @@ static __device__ void c_step_native(Craftax* env) {
 
 #endif
 
-static __device__ void c_step_gameplay(Craftax* env) {
+// Gameplay step with the on-done world regeneration factored out: performs
+// everything c_step_gameplay does (including the done-side log/accumulator
+// bookkeeping) EXCEPT craftax_reset_state_on_done. Returns whether the env
+// finished and the reset key it must be regenerated with — identical key
+// derivation, so running the regeneration later (in a dedicated kernel) is
+// bit-exact vs the inline version.
+static __device__ bool c_step_gameplay_core(
+    Craftax* env, CraftaxThreefryKey* reset_key_out
+) {
     env->rewards[0] = 0.0f;
     env->terminals[0] = 0.0f;
 
@@ -3918,6 +4498,14 @@ static __device__ void c_step_gameplay(Craftax* env) {
         env->episode_return_accum = 0.0f;
         env->episode_length_accum = 0;
         memset(env->achievements, 0, sizeof(env->achievements));
+    }
+    *reset_key_out = reset_key;
+    return done;
+}
+
+static __device__ void c_step_gameplay(Craftax* env) {
+    CraftaxThreefryKey reset_key;
+    if (c_step_gameplay_core(env, &reset_key)) {
         craftax_reset_state_on_done(env->state, reset_key);
     }
 }
@@ -7670,15 +8258,61 @@ static __device__ inline bool craftax_spawn_scan_spans(
     int32_t* out_row,
     int32_t* out_col
 ) {
-    CraftaxSpawnCoord coords[CRAFTAX_SPAWN_BBOX_MAX_CELLS];
-    int32_t n = craftax_spawn_collect_spans(
-        state, level, spans, span_count, terrain_mask, coords
-    );
+    // [cuda port] Two-pass count+select instead of materialising the
+    // candidate list (which cost hundreds of local-memory writes per scan).
+    // Pass 1 counts candidates with popcounts; the k-th pick reproduces
+    // craftax_spawn_pick_kth bitwise (cum goes 1.0f, 2.0f, ... exactly, so
+    // the first k with (float)(k+1) >= draw is ceilf(draw) - 1); pass 2
+    // walks the same span order to the k-th set bit.
+    int32_t pr = state->player_position[0];
+    int32_t pc = state->player_position[1];
+    int32_t n = 0;
+    for (int32_t i = 0; i < span_count; i++) {
+        int32_t row = pr + spans[i].dr;
+        if ((uint32_t)row >= CRAFTAX_MAP_SIZE) continue;
+        int32_t col0 = pc + spans[i].dc0;
+        int32_t col1 = pc + spans[i].dc1;
+        if (col0 < 0) col0 = 0;
+        if (col1 >= CRAFTAX_MAP_SIZE) col1 = CRAFTAX_MAP_SIZE - 1;
+        if (col0 > col1) continue;
+        uint64_t candidates =
+            craftax_spawn_row_bits_for_mask(state, level, row, terrain_mask)
+            & ~state->mob_bits[level][row]
+            & craftax_spawn_col_mask(col0, col1);
+        n += __popcll(candidates);
+    }
     if (n == 0) return false;
-    int32_t k = craftax_spawn_pick_kth(n, pos_key);
-    *out_row = coords[k].row;
-    *out_col = coords[k].col;
-    return true;
+
+    float draw = (float)n * (1.0f - craftax_threefry_uniform_f32(pos_key));
+    int32_t k = (int32_t)ceilf(draw) - 1;
+    if (k < 0) k = 0;
+    if (k > n - 1) k = n - 1;
+
+    int32_t seen = 0;
+    for (int32_t i = 0; i < span_count; i++) {
+        int32_t row = pr + spans[i].dr;
+        if ((uint32_t)row >= CRAFTAX_MAP_SIZE) continue;
+        int32_t col0 = pc + spans[i].dc0;
+        int32_t col1 = pc + spans[i].dc1;
+        if (col0 < 0) col0 = 0;
+        if (col1 >= CRAFTAX_MAP_SIZE) col1 = CRAFTAX_MAP_SIZE - 1;
+        if (col0 > col1) continue;
+        uint64_t candidates =
+            craftax_spawn_row_bits_for_mask(state, level, row, terrain_mask)
+            & ~state->mob_bits[level][row]
+            & craftax_spawn_col_mask(col0, col1);
+        int32_t c = __popcll(candidates);
+        if (seen + c <= k) {
+            seen += c;
+            continue;
+        }
+        int32_t need = k - seen;
+        while (need-- > 0) candidates &= candidates - 1;
+        *out_row = row;
+        *out_col = __builtin_ctzll(candidates);
+        return true;
+    }
+    return false;
 }
 
 static __device__ inline bool craftax_spawn_coord_matches(
@@ -8042,57 +8676,19 @@ static __device__ inline void craftax_spawn_mobs_native(
 
     if (!try_passive && !try_melee && !try_ranged) return;
 
-    int32_t try_count = (int32_t)try_passive
-        + (int32_t)try_melee
-        + (int32_t)try_ranged;
-    if (try_count == 1) {
-        int32_t row, col;
-        if (try_passive && craftax_spawn_scan_passive(
-                state, level, passive_pos_key, &row, &col
-        )) {
-            state->passive_mobs.position[level][passive_slot][0] = row;
-            state->passive_mobs.position[level][passive_slot][1] = col;
-            state->passive_mobs.health[level][passive_slot] =
-                craftax_spawn_mob_type_health(
-                    passive_type, CRAFTAX_MOB_PASSIVE
-                );
-            state->passive_mobs.mask[level][passive_slot] = true;
-            state->mob_bits[level][row] |= (1ULL << col);
-        } else if (try_melee && craftax_spawn_scan_melee(
-                state, level, fighting_boss, melee_pos_key, &row, &col
-        )) {
-            state->melee_mobs.position[level][melee_slot][0] = row;
-            state->melee_mobs.position[level][melee_slot][1] = col;
-            state->melee_mobs.health[level][melee_slot] =
-                craftax_spawn_mob_type_health(melee_type, CRAFTAX_MOB_MELEE);
-            state->melee_mobs.mask[level][melee_slot] = true;
-            state->mob_bits[level][row] |= (1ULL << col);
-        } else if (try_ranged && craftax_spawn_scan_ranged(
-                state, level, ranged_type, fighting_boss, ranged_pos_key,
-                &row, &col
-        )) {
-            state->ranged_mobs.position[level][ranged_slot][0] = row;
-            state->ranged_mobs.position[level][ranged_slot][1] = col;
-            state->ranged_mobs.health[level][ranged_slot] =
-                craftax_spawn_mob_type_health(ranged_type, CRAFTAX_MOB_RANGED);
-            state->ranged_mobs.mask[level][ranged_slot] = true;
-            state->mob_bits[level][row] |= (1ULL << col);
-        }
-        return;
-    }
-
-    CraftaxSpawnLists lists;
-    craftax_spawn_scan_all(
-        state, level, ranged_type, fighting_boss,
-        try_passive, try_melee, try_ranged, &lists
-    );
+    // [cuda port] The list-building multi-spawn path (scan_all into 8KB of
+    // per-thread CraftaxSpawnLists + pick_excluding) is replaced by three
+    // sequential span scans. Each successful spawn sets its mob_bits bit
+    // before the next scan runs, which removes exactly the coordinates that
+    // pick_excluding excluded; iteration order and the k-th pick arithmetic
+    // are unchanged, so the chosen cells are bit-identical.
+    craftax_spawn_init_offsets_once();
 
     bool passive_spawned = false;
     int32_t passive_row = 0;
     int32_t passive_col = 0;
-    if (try_passive && craftax_spawn_pick_excluding(
-            lists.passive, lists.passive_count, passive_pos_key,
-            false, 0, 0, false, 0, 0, &passive_row, &passive_col
+    if (try_passive && craftax_spawn_scan_passive(
+            state, level, passive_pos_key, &passive_row, &passive_col
         )) {
         state->passive_mobs.position[level][passive_slot][0] = passive_row;
         state->passive_mobs.position[level][passive_slot][1] = passive_col;
@@ -8106,10 +8702,10 @@ static __device__ inline void craftax_spawn_mobs_native(
     bool melee_spawned = false;
     int32_t melee_row = 0;
     int32_t melee_col = 0;
-    if (try_melee && craftax_spawn_pick_excluding(
-            lists.melee, lists.melee_count, melee_pos_key,
-            passive_spawned, passive_row, passive_col,
-            false, 0, 0, &melee_row, &melee_col
+    (void)passive_spawned;
+    if (try_melee && craftax_spawn_scan_melee(
+            state, level, fighting_boss, melee_pos_key,
+            &melee_row, &melee_col
         )) {
         state->melee_mobs.position[level][melee_slot][0] = melee_row;
         state->melee_mobs.position[level][melee_slot][1] = melee_col;
@@ -8122,10 +8718,10 @@ static __device__ inline void craftax_spawn_mobs_native(
 
     int32_t ranged_row = 0;
     int32_t ranged_col = 0;
-    if (try_ranged && craftax_spawn_pick_excluding(
-            lists.ranged, lists.ranged_count, ranged_pos_key,
-            passive_spawned, passive_row, passive_col,
-            melee_spawned, melee_row, melee_col, &ranged_row, &ranged_col
+    (void)melee_spawned;
+    if (try_ranged && craftax_spawn_scan_ranged(
+            state, level, ranged_type, fighting_boss, ranged_pos_key,
+            &ranged_row, &ranged_col
         )) {
         state->ranged_mobs.position[level][ranged_slot][0] = ranged_row;
         state->ranged_mobs.position[level][ranged_slot][1] = ranged_col;
@@ -8212,13 +8808,206 @@ __global__ void k_env_init(
     action_rng[i] = (uint32_t)(seed ^ ((uint64_t)i * 2654435761ULL)) | 1u;
 }
 
-__global__ void k_step(Craftax* envs, uint32_t* action_rng, int num_envs) {
+// Done-list compaction: k_step runs gameplay only and appends finished envs
+// (with their reset keys) to a compacted list; k_reset_list then regenerates
+// those worlds and writes their post-reset observations. The combination is
+// bit-exact vs the inline-reset c_step: same keys, same values, same obs.
+typedef struct CraftaxResetRec {
+    int32_t env;
+    uint32_t key0;
+    uint32_t key1;
+} CraftaxResetRec;
+
+__device__ int g_reset_count = 0;
+
+__global__ void k_step(
+    Craftax* envs, uint32_t* action_rng, int num_envs, CraftaxResetRec* resets
+) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_envs) return;
     Craftax* env = &envs[i];
     env->actions[0] =
         (float)(cf_xorshift32(&action_rng[i]) % CRAFTAX_NUM_ACTIONS);
-    c_step(env);
+    CraftaxThreefryKey reset_key;
+    CRAFTAX_PROFILE_START();
+    bool done = c_step_gameplay_core(env, &reset_key);
+    if (done) {
+        int slot = atomicAdd(&g_reset_count, 1);
+        resets[slot].env = i;
+        resets[slot].key0 = reset_key.word[0];
+        resets[slot].key1 = reset_key.word[1];
+    }
+}
+
+// Warp-transposed observation encode: one warp per env, lane L writing obs
+// channels L, L+32, ... so stores coalesce across the warp (the per-thread
+// encode issued ~1150 scalar stores per env into non-contiguous sectors and
+// dominated k_step). Values are computed with the exact expressions of
+// craftax_encode_reset_observation / craftax_encode_compact_observation, so
+// the buffer is bit-identical; it runs after the reset kernel and therefore
+// also covers post-reset observations.
+#define CRAFTAX_ENC_WARPS_PER_BLOCK 4
+
+__global__ void k_encode(Craftax* envs, int num_envs) {
+    int env_idx = blockIdx.x * CRAFTAX_ENC_WARPS_PER_BLOCK + threadIdx.y;
+    if (env_idx >= num_envs) return;
+    const Craftax* env = &envs[env_idx];
+    const CraftaxWorldState* state =
+        (const CraftaxWorldState*)(const void*)env->state;
+    CraftaxObs* obs = env->observations;
+    unsigned lane = threadIdx.x;
+
+    const int level = state->player_level;
+    const int mob_level =
+        craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    const int top = state->player_position[0] - CRAFTAX_WG_OBS_ROWS / 2;
+    const int left = state->player_position[1] - CRAFTAX_WG_OBS_COLS / 2;
+
+    // Warp-uniform per-class liveness (masks are tiny and L1-broadcast), so
+    // lanes handling mob channels of an empty class skip their scan loops.
+    bool class_active[5];
+    {
+        const bool* m3;
+        m3 = state->melee_mobs.mask[mob_level];
+        class_active[0] = m3[0] | m3[1] | m3[2];
+        m3 = state->passive_mobs.mask[mob_level];
+        class_active[1] = m3[0] | m3[1] | m3[2];
+        const bool* m2 = state->ranged_mobs.mask[mob_level];
+        class_active[2] = m2[0] | m2[1];
+        m3 = state->mob_projectiles.mask[mob_level];
+        class_active[3] = m3[0] | m3[1] | m3[2];
+        m3 = state->player_projectiles.mask[mob_level];
+        class_active[4] = m3[0] | m3[1] | m3[2];
+    }
+
+    for (int k = (int)lane; k < CRAFTAX_WG_PACKED_MAP_OBS_SIZE; k += 32) {
+        int cell = k / CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
+        int ch = k % CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
+        int row = cell / CRAFTAX_WG_OBS_COLS;
+        int col = cell % CRAFTAX_WG_OBS_COLS;
+        int world_row = top + row;
+        int world_col = left + col;
+        bool in_bounds = world_row >= 0 && world_row < CRAFTAX_WG_MAP_SIZE
+            && world_col >= 0 && world_col < CRAFTAX_WG_MAP_SIZE;
+        bool visible =
+            in_bounds && state->light_map[level][world_row][world_col] > 12;
+
+        CraftaxObs value = 0;
+        if (ch == 0) {
+            if (visible) {
+                value = (CraftaxObs)state->map[level][world_row][world_col];
+            }
+        } else if (ch == 1) {
+            if (visible) {
+#ifdef CRAFTAX_COMPACT_OBS
+                value = (uint8_t)(
+                    state->item_map[level][world_row][world_col] + 1);
+#else
+                value =
+                    (float)state->item_map[level][world_row][world_col] + 1.0f;
+#endif
+            }
+        } else if (ch == 2) {
+            value = visible ? (CraftaxObs)1 : (CraftaxObs)0;
+        } else {
+            // Mob channels: last mob (highest slot index) of this class in
+            // this cell that passes the scalar encoder's checks wins,
+            // matching its write order.
+            int mob_class = ch - 3;
+            if (!class_active[mob_class]) {
+                obs[k] = 0;
+                continue;
+            }
+            const int32_t (*positions)[2] = NULL;
+            const int32_t* type_ids = NULL;
+            const bool* masks = NULL;
+            int count = 3;
+            switch (mob_class) {
+                case 0:
+                    positions = state->melee_mobs.position[mob_level];
+                    type_ids = state->melee_mobs.type_id[mob_level];
+                    masks = state->melee_mobs.mask[mob_level];
+                    break;
+                case 1:
+                    positions = state->passive_mobs.position[mob_level];
+                    type_ids = state->passive_mobs.type_id[mob_level];
+                    masks = state->passive_mobs.mask[mob_level];
+                    break;
+                case 2:
+                    positions = state->ranged_mobs.position[mob_level];
+                    type_ids = state->ranged_mobs.type_id[mob_level];
+                    masks = state->ranged_mobs.mask[mob_level];
+                    count = 2;
+                    break;
+                case 3:
+                    positions = state->mob_projectiles.position[mob_level];
+                    type_ids = state->mob_projectiles.type_id[mob_level];
+                    masks = state->mob_projectiles.mask[mob_level];
+                    break;
+                default:
+                    positions = state->player_projectiles.position[mob_level];
+                    type_ids = state->player_projectiles.type_id[mob_level];
+                    masks = state->player_projectiles.mask[mob_level];
+                    break;
+            }
+            for (int i = 0; i < count; i++) {
+                int type_id = type_ids[i];
+                if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
+                    || !masks[i]) {
+                    continue;
+                }
+                int mob_row = positions[i][0];
+                int mob_col = positions[i][1];
+                if (mob_row != world_row || mob_col != world_col) continue;
+                // cell equality implies the encoder's local-window bounds;
+                // in_bounds covers its world-bounds check.
+                if (!in_bounds
+                    || state->light_map[mob_level][mob_row][mob_col] <= 12) {
+                    continue;
+                }
+                value = (CraftaxObs)(type_id + 1);
+            }
+        }
+        obs[k] = value;
+    }
+
+    if (lane == 0) {
+#ifdef CRAFTAX_COMPACT_OBS
+        float tail[CRAFTAX_WG_INVENTORY_OBS_SIZE];
+        craftax_encode_scalar_observation_tail_at(state, tail, 0);
+        memcpy(obs + CRAFTAX_WG_PACKED_MAP_OBS_SIZE, tail, sizeof(tail));
+#else
+        craftax_encode_scalar_observation_tail_at(
+            state, obs, CRAFTAX_WG_PACKED_MAP_OBS_SIZE);
+#endif
+    }
+}
+
+__global__ void k_reset_list(Craftax* envs, const CraftaxResetRec* resets) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= g_reset_count) return;
+    Craftax* env = &envs[resets[idx].env];
+    CraftaxThreefryKey reset_key;
+    reset_key.word[0] = resets[idx].key0;
+    reset_key.word[1] = resets[idx].key1;
+    craftax_reset_state_on_done(env->state, reset_key);
+}
+
+// Warp-cooperative reset: one warp (= one block) per finished env, noise
+// scratch in shared memory instead of 46KB of per-thread stack. Only valid
+// in lazy-floors mode (floor 0 regenerated here, floors 1-8 on descent).
+__global__ void __launch_bounds__(32) k_reset_list_warp(
+    Craftax* envs, const CraftaxResetRec* resets
+) {
+    __shared__ CraftaxWarpScratch s;
+    int idx = blockIdx.x;
+    if (idx >= g_reset_count) return;
+    unsigned lane = threadIdx.x;
+    Craftax* env = &envs[resets[idx].env];
+    CraftaxThreefryKey reset_key;
+    reset_key.word[0] = resets[idx].key0;
+    reset_key.word[1] = resets[idx].key1;
+    craftax_reset_state_on_done_warp(env->state, reset_key, &s, lane);
 }
 
 __device__ int g_nan_flag = 0;
@@ -8250,6 +9039,10 @@ typedef struct {
     float* d_rewards;
     float* d_terminals;
     uint32_t* d_action_rng;
+    CraftaxResetRec* d_resets;
+    int* d_reset_count;  // symbol address of g_reset_count
+    CraftaxWorldgenScratch* d_wg_scratch;
+    int lazy;
     CraftaxObs* h_obs;
     float* h_rewards;
     float* h_terminals;
@@ -8275,7 +9068,9 @@ static void cu_fill_light_table(void) {
 
 static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
     v->num_envs = num_envs;
-    size_t stack_bytes = 132 << 10;  // k_step worst case (reset worldgen) ~120KB per ptxas -v
+    // Worldgen scratch lives in a per-thread global arena (g_craftax_wg_scratch),
+    // so the residual stack is small (~13KB gameplay/encode locals per ptxas -v).
+    size_t stack_bytes = 16 << 10;
     const char* stack_env = getenv("CRAFTAX_CU_STACK");
     if (stack_env != NULL) stack_bytes = (size_t)atol(stack_env);
     CU_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, stack_bytes));
@@ -8288,6 +9083,13 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
     CU_CHECK(cudaMalloc(&v->d_rewards, (size_t)num_envs * sizeof(float)));
     CU_CHECK(cudaMalloc(&v->d_terminals, (size_t)num_envs * sizeof(float)));
     CU_CHECK(cudaMalloc(&v->d_action_rng, (size_t)num_envs * sizeof(uint32_t)));
+    CU_CHECK(cudaMalloc(&v->d_resets,
+                        (size_t)num_envs * sizeof(CraftaxResetRec)));
+    CU_CHECK(cudaGetSymbolAddress((void**)&v->d_reset_count, g_reset_count));
+    CU_CHECK(cudaMalloc(&v->d_wg_scratch,
+                        (size_t)num_envs * sizeof(CraftaxWorldgenScratch)));
+    CU_CHECK(cudaMemcpyToSymbol(g_craftax_wg_scratch, &v->d_wg_scratch,
+                                sizeof(v->d_wg_scratch)));
     // calloc semantics of the C harness
     CU_CHECK(cudaMemset(v->d_envs, 0, (size_t)num_envs * sizeof(Craftax)));
     CU_CHECK(cudaMemset(v->d_states, 0, (size_t)num_envs * sizeof(CraftaxState)));
@@ -8303,6 +9105,13 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
     v->h_terminals = (float*)malloc((size_t)num_envs * sizeof(float));
 
     cu_fill_light_table();
+    // Lazy floor generation (floor 0 on reset, floors 1-8 on first descent)
+    // produces bit-identical maps with ~9x less reset work; verified against
+    // both hash anchors. CRAFTAX_CU_LAZY=0 restores eager worldgen.
+    const char* lazy_env = getenv("CRAFTAX_CU_LAZY");
+    int lazy = lazy_env == NULL ? 1 : atoi(lazy_env);
+    CU_CHECK(cudaMemcpyToSymbol(g_craftax_lazy_floors, &lazy, sizeof(int)));
+    v->lazy = lazy;
     k_global_init<<<1, 1>>>();
     CU_CHECK(cudaDeviceSynchronize());
 
@@ -8320,7 +9129,8 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
 static void cu_vec_free(CuVec* v) {
     cudaFree(v->d_envs); cudaFree(v->d_states); cudaFree(v->d_obs);
     cudaFree(v->d_actions); cudaFree(v->d_rewards); cudaFree(v->d_terminals);
-    cudaFree(v->d_action_rng);
+    cudaFree(v->d_action_rng); cudaFree(v->d_resets);
+    cudaFree(v->d_wg_scratch);
     free(v->h_obs); free(v->h_rewards); free(v->h_terminals);
 }
 
@@ -8371,8 +9181,19 @@ static void cu_print_logs(CuVec* v, bool histogram) {
 }
 
 static void cu_step_launch(CuVec* v) {
+    CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int)));
     k_step<<<(v->num_envs + 63) / 64, 64>>>(
-        v->d_envs, v->d_action_rng, v->num_envs);
+        v->d_envs, v->d_action_rng, v->num_envs, v->d_resets);
+    // Worst-case grid; threads/blocks beyond g_reset_count exit immediately.
+    if (v->lazy) {
+        k_reset_list_warp<<<v->num_envs, 32>>>(v->d_envs, v->d_resets);
+    } else {
+        k_reset_list<<<(v->num_envs + 63) / 64, 64>>>(v->d_envs, v->d_resets);
+    }
+    dim3 enc_block(32, CRAFTAX_ENC_WARPS_PER_BLOCK);
+    int enc_grid = (v->num_envs + CRAFTAX_ENC_WARPS_PER_BLOCK - 1)
+        / CRAFTAX_ENC_WARPS_PER_BLOCK;
+    k_encode<<<enc_grid, enc_block>>>(v->d_envs, v->num_envs);
 }
 
 // ------------------------------------------------------------
@@ -8582,6 +9403,29 @@ static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
     CU_CHECK(cudaDeviceSynchronize());
     double dt = cf_now_s() - t0;
     double sps = (double)num_envs * (double)iters / dt;
+#ifdef CRAFTAX_CU_PROFILE
+    {
+        unsigned long long cyc[CRAFTAX_NUM_PROFILE_ZONES];
+        unsigned long long cnt[CRAFTAX_NUM_PROFILE_ZONES];
+        CU_CHECK(cudaMemcpyFromSymbol(cyc, g_cu_prof_cycles, sizeof(cyc)));
+        CU_CHECK(cudaMemcpyFromSymbol(cnt, g_cu_prof_count, sizeof(cnt)));
+        static const char* names[CRAFTAX_NUM_PROFILE_ZONES] = {
+            "change_floor", "crafting", "do_action", "place+shoot+spell+potion",
+            "read_book", "enchant", "boss+attr+move", "update_mobs",
+            "spawn_mobs", "plants+intrinsics+achieve", "reward+bookkeeping",
+            "encode_obs", "rng_split", "is_game_over", "reset_on_done",
+            "copy_achievements", "reward_bookkeeping", "unprofiled"};
+        double total = 0.0;
+        for (int z = 0; z < CRAFTAX_NUM_PROFILE_ZONES; z++) total += (double)cyc[z];
+        fprintf(stderr, "\n=== device zone cycles (thread-summed) ===\n");
+        for (int z = 0; z < CRAFTAX_NUM_PROFILE_ZONES; z++) {
+            if (cnt[z] == 0) continue;
+            fprintf(stderr, "%-28s %7.2f%%  %8.1f cyc/call  (%llu calls)\n",
+                    names[z], 100.0 * (double)cyc[z] / total,
+                    (double)cyc[z] / (double)cnt[z], cnt[z]);
+        }
+    }
+#endif
     printf("envs=%d iters=%d\n", num_envs, iters);
     printf("init %.3fs  bench %.3fs  SPS=%12.0f  (%.2f us/step/env)\n",
            t_init, dt, sps, dt / (double)iters / (double)num_envs * 1e6);

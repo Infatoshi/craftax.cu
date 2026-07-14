@@ -19,14 +19,22 @@ craftax_classic: main_classic.cu craftax_classic.cu craftax_classic_cpu.o
 craftax_classic_cpu.o: craftax_classic.c
 	$(CC) $(CPUFLAGS) -c craftax_classic.c -o $@
 
-# Full-game CUDA port (M1: correctness, one thread per env). -fmad=false is
-# required: exact IEEE per-op float semantics make the GPU trajectory hash
-# bit-identical to the gcc -ffast-math C build (verified 64x2000 and 4x20000
-# seed 42 anchors).
+# Full-game CUDA port (M2: split step/reset/encode kernels, lazy floors,
+# warp-cooperative worldgen, coalesced obs encode). -fmad=false is required:
+# exact IEEE per-op float semantics make the GPU trajectory hash bit-identical
+# to the gcc -ffast-math C build (verified 64x2000 and 4x20000 seed 42
+# anchors). fmad-on measured no faster, so the exact build is the only one.
 NVCCFLAGS_FULL ?= -O3 -arch=native --expt-relaxed-constexpr -fmad=false
 full: craftax_full_cuda
 craftax_full_cuda: craftax_full.cu
 	$(NVCC) $(NVCCFLAGS_FULL) craftax_full.cu -o $@
+
+# Compact byte observations (996B vs 3372B per env): same trajectories, its
+# own hash universe -- matches the C -DCRAFTAX_COMPACT_OBS build bit-exactly
+# (64x2000 seed 42 => 0x4fb32c98731b75e8, 4x20000 => 0x7d6c02f20a72e8f9).
+full-compact: craftax_full_cuda_compact
+craftax_full_cuda_compact: craftax_full.cu
+	$(NVCC) $(NVCCFLAGS_FULL) -DCRAFTAX_COMPACT_OBS craftax_full.cu -o $@
 else
 craftax_classic: craftax_classic.c
 	$(CC) $(CPUFLAGS) -DCRAFTAX_STANDALONE craftax_classic.c -o $@ -lpthread -lm

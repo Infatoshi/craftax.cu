@@ -33,16 +33,32 @@ Full game (env only, random actions, auto-reset included):
 |---|---|---:|
 | C, 8192 envs, 32T | Ryzen 9 9950X3D | 5.6M |
 | C, 1024 envs, 1T | Ryzen 9 9950X3D | 750K |
-| CUDA (naive port), 65k envs | RTX PRO 6000 Blackwell | 1.7M |
+| CUDA, 65k envs, compact obs | RTX 3090 | 18.8M |
+| CUDA, 65k envs | RTX 3090 | 18.3M |
+| CUDA (naive port, milestone 1), 65k envs | RTX 3090 | 454K |
 
-The full-game CUDA port is milestone 1 (correctness): one thread per
-env, AoS state, inline resets, and it is **bit-identical to the C
-build** -- the trajectory hash matches the CPU reference exactly at
-64x2000 and 4x20000 steps (gcc's -ffast-math float semantics are
-emulated: reciprocal division at literal-divisor sites, a
-host-computed glibc-cosf light table, and -fmad=false). Optimization
-(SoA state, warp resets, compact obs -- the classic playbook) comes
-next; classic went 14.4M -> 312M on the same ladder.
+The full-game CUDA port is **bit-identical to the C build** -- the
+trajectory hash matches the CPU reference exactly at 64x2000 and
+4x20000 steps (gcc's -ffast-math float semantics are emulated:
+reciprocal division at literal-divisor sites, a host-computed
+glibc-cosf light table, and -fmad=false; fmad-on measured no faster,
+so the exact build is the only one). Every optimization rung
+re-verified the same anchors, so the 40x over the naive port changed
+no trajectory bit:
+
+- Split step/reset/encode kernels with done-list compaction, so the
+  9-floor worldgen tail no longer stalls every stepping env
+- Lazy floor generation: only floor 0 at reset, deeper floors on
+  first descent (matching upstream Craftax semantics)
+- Warp-cooperative floor-0 worldgen: per-floor RNG keys derive
+  up-front (the "threefry" chain is a splittable 64-bit LCG) and
+  per-cell draws are pure functions of (key, cell), so one warp
+  generates a map in shared memory with order-free reductions and a
+  chunked scan that reproduces the scalar FP cumsum bit-exactly
+- Worldgen scratch moved to a global arena (per-thread stack 132KB ->
+  16KB), warp-transposed coalesced obs encode, list-free two-pass
+  mob-spawn scans, and optional compact byte obs (996B vs 3372B,
+  its own hash universe, matched against the C compact build)
 
 "Env + policy" is a rollout megakernel: the PufferLib default craftax policy
 (Linear 1345->32 encoder, MinGRU, actor/critic heads), categorical sampling,
@@ -72,6 +88,7 @@ The classic CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 ./craftax_full bench --envs 8192 --iters 2048 --threads 32   # full game, random actions
 ./craftax_full hash --envs 64 --steps 2000           # full-game determinism anchor
 ./craftax_full_cuda hash --envs 64 --steps 2000      # CUDA port, same hash bit-exactly
+./craftax_full_cuda bench --envs 65536 --iters 512   # full-game CUDA throughput
 ```
 
 ## Verification
