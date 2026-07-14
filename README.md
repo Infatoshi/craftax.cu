@@ -96,9 +96,15 @@ an all-reduce) that the Adam kernel reduces. `./craftax gradcheck` verifies
 every parameter segment against central finite differences of the actual
 PPO loss.
 
-Current training throughput is ~15M SPS at 262k envs on the RTX PRO 6000
-(vs 306.9M rollout-only): the backward's gradient scatter-add atomics
-dominate and are the next optimization target.
+Training runs at ~81M SPS at 262k envs on the RTX PRO 6000 (vs 306.9M
+rollout-only). Two backward-pass restructures got it there from an
+initial 15M: dense grads (GRU + heads) are shuffle-reduced across the
+warp so one lane issues one atomic per element instead of 32, and the
+sparse encoder scatter is warp-cooperative -- the warp stages its 32
+dh_enc vectors in shared memory and walks its samples together, so
+every feature update is one coalesced line-atomic instead of 32
+scattered ones. The remaining gap to rollout speed is the ~70
+irreducible encoder column atomics per sample.
 
 ## Citation
 

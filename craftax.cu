@@ -2123,10 +2123,20 @@ extern "C" __global__ void ppo_loss_kernel(
 // scatter-add into the ~70 active feature columns per sample; the
 // dense 1345-float obs never exists.
 //
-// Gradients accumulate via atomicAdd into per-block copies
-// (grads + (blockIdx.x % grad_copies) * PARAM_COUNT); adam_kernel
-// reduces the copies. loss_acc[0..2] accumulates pg/v/ent sums (fp32,
-// logging only).
+// Dense grads (b_enc, W_gru, heads) are shuffle-reduced across the
+// warp so only lane 0 issues one atomicAdd per element (32x fewer
+// atomics); the sparse W_enc scatter stays per-lane. Both go into a
+// per-block global copy (grads + (blockIdx.x % grad_copies) *
+// PARAM_COUNT); adam_kernel reduces the copies. Out-of-range threads
+// run the whole loop with e clamped and zeroed gradients so warps
+// stay converged at the shuffles. loss_acc[0..2] accumulates
+// pg/v/ent sums (fp32, logging only).
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+
 extern "C" __global__ void ppo_backward_kernel(
     Weights w,
     const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
@@ -2140,17 +2150,19 @@ extern "C" __global__ void ppo_backward_kernel(
     float clip_eps, float vf_coef, float ent_coef
 ) {
     __shared__ NNShared snn;
+    __shared__ float sdh_all[256 / 32][32][HIDDEN + 1];  // +1 pad: bank-conflict-free
     load_nn_shared(snn, w);
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_envs) return;
+    int lane = threadIdx.x & 31;
+    int et = blockIdx.x * blockDim.x + threadIdx.x;
+    bool active = et < num_envs;
+    int e = active ? et : num_envs - 1;  // clamp: inactive lanes run zeroed
+    float* gr = grads + (size_t)(blockIdx.x % grad_copies) * PARAM_COUNT;
 
     double inv_count = 1.0 / ((double)num_envs * T);
     float inv_batch = (float)inv_count;
     float adv_mean = (float)(adv_stats[0] * inv_count);
     double var = adv_stats[1] * inv_count - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
     float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
-
-    float* gr = grads + (size_t)(blockIdx.x % grad_copies) * PARAM_COUNT;
 
     float dstate[HIDDEN];  // dL/d(state output of step t), carried backward
     #pragma unroll
@@ -2169,7 +2181,7 @@ extern "C" __global__ void ppo_backward_kernel(
         for (int i = 0; i < HIDDEN; i++)
             s_in[i] = r_state[((size_t)t * HIDDEN + i) * num_envs + e];
 
-        float zh[HIDDEN], zg[HIDDEN], zp[HIDDEN], out[HIDDEN], hout[HIDDEN];
+        float hout[HIDDEN];
         #pragma unroll
         for (int k = 0; k < HIDDEN; k++) {
             float ah = 0.0f, ag = 0.0f, ap = 0.0f;
@@ -2179,11 +2191,9 @@ extern "C" __global__ void ppo_backward_kernel(
                 ag = fmaf(snn.W_gru[(HIDDEN + k) * HIDDEN + j], h_enc[j], ag);
                 ap = fmaf(snn.W_gru[(2 * HIDDEN + k) * HIDDEN + j], h_enc[j], ap);
             }
-            zh[k] = ah; zg[k] = ag; zp[k] = ap;
             float sg = sigmoidf_(ag);
             float o_k = s_in[k] + sg * (mingru_g(ah) - s_in[k]);
             float p = sigmoidf_(ap);
-            out[k] = o_k;
             hout[k] = p * o_k + (1.0f - p) * h_enc[k];
         }
 
@@ -2234,10 +2244,16 @@ extern "C" __global__ void ppo_backward_kernel(
             d += ent_coef * pi[a] * ((logits[a] - lse) + H);         // d(-ent_coef*H)
             dlogits[a] = d * inv_batch;
         }
+        if (!active) {
+            dvalue = 0.0f;
+            for (int a = 0; a < NUM_ACTIONS; a++) dlogits[a] = 0.0f;
+        }
 
-        pg_sum += -fminf(u1, u2);
-        v_sum += 0.5f * (value - ret[o]) * (value - ret[o]);
-        ent_sum += H;
+        if (active) {
+            pg_sum += -fminf(u1, u2);
+            v_sum += 0.5f * (value - ret[o]) * (value - ret[o]);
+            ent_sum += H;
+        }
 
         // ---- Heads backward ----
         float dhout[HIDDEN];
@@ -2248,14 +2264,21 @@ extern "C" __global__ void ppo_backward_kernel(
             #pragma unroll
             for (int j = 0; j < HIDDEN; j++) {
                 dhout[j] = fmaf(da, snn.W_a[a * HIDDEN + j], dhout[j]);
-                atomicAdd(&gr[PARAM_W_A + a * HIDDEN + j], da * hout[j]);
+                float g = warp_sum(da * hout[j]);
+                if (lane == 0) atomicAdd(&gr[PARAM_W_A + a * HIDDEN + j], g);
             }
-            atomicAdd(&gr[PARAM_B_A + a], da);
+            float gb = warp_sum(da);
+            if (lane == 0) atomicAdd(&gr[PARAM_B_A + a], gb);
         }
         #pragma unroll
-        for (int j = 0; j < HIDDEN; j++)
-            atomicAdd(&gr[PARAM_W_V + j], dvalue * hout[j]);
-        atomicAdd(&gr[PARAM_B_V], dvalue);
+        for (int j = 0; j < HIDDEN; j++) {
+            float g = warp_sum(dvalue * hout[j]);
+            if (lane == 0) atomicAdd(&gr[PARAM_W_V + j], g);
+        }
+        {
+            float g = warp_sum(dvalue);
+            if (lane == 0) atomicAdd(&gr[PARAM_B_V], g);
+        }
 
         // ---- MinGRU backward ----
         bool done_t = r_done[o] != 0;  // done at t: step t+1's state input was zeroed
@@ -2263,93 +2286,101 @@ extern "C" __global__ void ppo_backward_kernel(
         #pragma unroll
         for (int i = 0; i < HIDDEN; i++) dh_enc[i] = 0.0f;
 
-        float ds_prev[HIDDEN];
         #pragma unroll
         for (int k = 0; k < HIDDEN; k++) {
-            float p = sigmoidf_(zp[k]);
-            float sg = sigmoidf_(zg[k]);
-            float gh = mingru_g(zh[k]);
+            // Recompute this unit's pre-activations (cheaper than
+            // carrying zh/zg/zp/out across the heads backward).
+            float ah = 0.0f, ag = 0.0f, ap = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < HIDDEN; j++) {
+                ah = fmaf(snn.W_gru[k * HIDDEN + j], h_enc[j], ah);
+                ag = fmaf(snn.W_gru[(HIDDEN + k) * HIDDEN + j], h_enc[j], ag);
+                ap = fmaf(snn.W_gru[(2 * HIDDEN + k) * HIDDEN + j], h_enc[j], ap);
+            }
+            float p = sigmoidf_(ap);
+            float sg = sigmoidf_(ag);
+            float gh = mingru_g(ah);
+            float out_k = s_in[k] + sg * (gh - s_in[k]);
 
             float dout = dhout[k] * p + (done_t ? 0.0f : dstate[k]);
-            float dp = dhout[k] * (out[k] - h_enc[k]);
+            float dp = dhout[k] * (out_k - h_enc[k]);
             float dzp_k = dp * p * (1.0f - p);
             dh_enc[k] += dhout[k] * (1.0f - p);
 
-            ds_prev[k] = dout * (1.0f - sg);
+            dstate[k] = dout * (1.0f - sg);  // ds_prev, safe in place
             float dsg = dout * (gh - s_in[k]);
             float dzg_k = dsg * sg * (1.0f - sg);
-            float dzh_k = dout * sg * dg_mingru(zh[k]);
+            float dzh_k = dout * sg * dg_mingru(ah);
 
             #pragma unroll
             for (int j = 0; j < HIDDEN; j++) {
                 dh_enc[j] = fmaf(dzh_k, snn.W_gru[k * HIDDEN + j], dh_enc[j]);
                 dh_enc[j] = fmaf(dzg_k, snn.W_gru[(HIDDEN + k) * HIDDEN + j], dh_enc[j]);
                 dh_enc[j] = fmaf(dzp_k, snn.W_gru[(2 * HIDDEN + k) * HIDDEN + j], dh_enc[j]);
-                atomicAdd(&gr[PARAM_W_GRU + k * HIDDEN + j], dzh_k * h_enc[j]);
-                atomicAdd(&gr[PARAM_W_GRU + (HIDDEN + k) * HIDDEN + j], dzg_k * h_enc[j]);
-                atomicAdd(&gr[PARAM_W_GRU + (2 * HIDDEN + k) * HIDDEN + j], dzp_k * h_enc[j]);
+                float gh_ = warp_sum(dzh_k * h_enc[j]);
+                float gg_ = warp_sum(dzg_k * h_enc[j]);
+                float gp_ = warp_sum(dzp_k * h_enc[j]);
+                if (lane == 0) {
+                    atomicAdd(&gr[PARAM_W_GRU + k * HIDDEN + j], gh_);
+                    atomicAdd(&gr[PARAM_W_GRU + (HIDDEN + k) * HIDDEN + j], gg_);
+                    atomicAdd(&gr[PARAM_W_GRU + (2 * HIDDEN + k) * HIDDEN + j], gp_);
+                }
             }
         }
-        #pragma unroll
-        for (int k = 0; k < HIDDEN; k++) dstate[k] = ds_prev[k];
 
         // ---- Encoder backward: scatter dh_enc into active columns ----
         #pragma unroll
-        for (int i = 0; i < HIDDEN; i++)
-            atomicAdd(&gr[PARAM_B_ENC + i], dh_enc[i]);
-
-        for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
-            int f = cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obs[cell];
-            #pragma unroll
-            for (int i = 0; i < HIDDEN; i++)
-                atomicAdd(&gr[PARAM_W_ENC + f * HIDDEN + i], dh_enc[i]);
-            uint8_t m = obs[OBS_MAP_CELLS + cell];
-            int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
-            for (int k = 0; k < 4; k++) {
-                if (m & (1 << k)) {
-                    #pragma unroll
-                    for (int i = 0; i < HIDDEN; i++)
-                        atomicAdd(&gr[PARAM_W_ENC + (fm + k) * HIDDEN + i], dh_enc[i]);
-                }
-            }
+        for (int i = 0; i < HIDDEN; i++) {
+            float g = warp_sum(dh_enc[i]);
+            if (lane == 0) atomicAdd(&gr[PARAM_B_ENC + i], g);
         }
+
+        // Warp-cooperative W_enc scatter: stage each lane's dh_enc in
+        // shared memory, then walk the warp's 32 samples together.
+        // For each active feature of sample m, all 32 lanes add
+        // sdh[m][lane] to the contiguous column gr[f*HIDDEN + lane]:
+        // one coalesced line-atomic per feature instead of 32
+        // scattered ones. Feature decode is uniform across the warp
+        // (every lane reads sample m's obs, broadcast through L1).
         {
-            int idx = 2 * OBS_MAP_CELLS;
-            int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
-            for (int j = 0; j < NUM_INVENTORY + 4; j++, f++) {
-                float x = (float)(int8_t)obs[idx++] / 10.0f;
-                if (x != 0.0f) {
-                    #pragma unroll
-                    for (int i = 0; i < HIDDEN; i++)
-                        atomicAdd(&gr[PARAM_W_ENC + f * HIDDEN + i], x * dh_enc[i]);
+            float (*sdh)[HIDDEN + 1] = sdh_all[threadIdx.x >> 5];
+            #pragma unroll
+            for (int i = 0; i < HIDDEN; i++) sdh[lane][i] = dh_enc[i];
+            __syncwarp();
+            int ebase = et - lane;
+            for (int m = 0; m < 32 && ebase + m < num_envs; m++) {
+                const uint8_t* obm = r_obs + ((size_t)t * num_envs + ebase + m) * OBS_DIM_COMPACT;
+                float dv = sdh[m][lane];
+                float* gcol = gr + PARAM_W_ENC + lane;
+                for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
+                    int f = cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obm[cell];
+                    atomicAdd(gcol + f * HIDDEN, dv);
+                    uint8_t mm = obm[OBS_MAP_CELLS + cell];
+                    int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+                    for (int k = 0; k < 4; k++)
+                        if (mm & (1 << k)) atomicAdd(gcol + (fm + k) * HIDDEN, dv);
                 }
+                int idx = 2 * OBS_MAP_CELLS;
+                int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
+                for (int j = 0; j < NUM_INVENTORY + 4; j++, f++) {
+                    float x = (float)(int8_t)obm[idx++] / 10.0f;
+                    if (x != 0.0f) atomicAdd(gcol + f * HIDDEN, x * dv);
+                }
+                int8_t dir = (int8_t)obm[idx++];
+                if (dir >= 1 && dir <= 4) atomicAdd(gcol + (f + dir - 1) * HIDDEN, dv);
+                f += 4;
+                uint8_t sleeping = obm[idx++];
+                float light;
+                memcpy(&light, obm + idx, sizeof(float));
+                if (light != 0.0f) atomicAdd(gcol + f * HIDDEN, light * dv);
+                f++;
+                if (sleeping) atomicAdd(gcol + f * HIDDEN, dv);
             }
-            int8_t dir = (int8_t)obs[idx++];
-            if (dir >= 1 && dir <= 4) {
-                int fd = f + dir - 1;
-                #pragma unroll
-                for (int i = 0; i < HIDDEN; i++)
-                    atomicAdd(&gr[PARAM_W_ENC + fd * HIDDEN + i], dh_enc[i]);
-            }
-            f += 4;
-            uint8_t sleeping = obs[idx++];
-            float light;
-            memcpy(&light, obs + idx, sizeof(float));
-            if (light != 0.0f) {
-                #pragma unroll
-                for (int i = 0; i < HIDDEN; i++)
-                    atomicAdd(&gr[PARAM_W_ENC + f * HIDDEN + i], light * dh_enc[i]);
-            }
-            f++;
-            if (sleeping) {
-                #pragma unroll
-                for (int i = 0; i < HIDDEN; i++)
-                    atomicAdd(&gr[PARAM_W_ENC + f * HIDDEN + i], dh_enc[i]);
-            }
+            __syncwarp();  // sdh reused next t
         }
     }
 
-    if (loss_acc) {
+    if (active && loss_acc) {
         atomicAdd(&loss_acc[0], pg_sum);
         atomicAdd(&loss_acc[1], v_sum);
         atomicAdd(&loss_acc[2], ent_sum);
