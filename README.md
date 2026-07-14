@@ -36,8 +36,8 @@ CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 ./craftax bench --envs 1048576 --iters 1000 --obs-mode 1 --reset-mode 1
 ./craftax bench --backend cpu --envs 32768 --iters 5000
 ./craftax sweep                    # env SPS sweep: env counts x obs x reset modes
-./craftax mega --envs 262144 --horizon 128   # fused env+policy rollouts
-./craftax megasweep                # rollout sweep, megakernel vs per-step kernels
+./craftax run --envs 262144 --horizon 128    # fused env+policy rollouts
+./craftax runsweep                 # rollout sweep, fused vs per-step kernels
 ./craftax hash --envs 2048 --steps 500       # env validation suite
 ./craftax verify --envs 2048 --steps 300     # NN fusion + rollout validation suite
 ```

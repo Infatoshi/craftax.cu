@@ -500,9 +500,9 @@ static void usage(const char* prog) {
         "  bench      env-only SPS            (--envs --iters --obs-mode --reset-mode)\n"
         "  sweep      env-only sweep over env counts x obs x reset modes\n"
         "  hash       env validation suite    (--envs --steps)\n"
-        "  mega       fused env+policy rollout SPS   (--envs --horizon --iters)\n"
+        "  run        fused env+policy rollout SPS   (--envs --horizon --iters)\n"
         "  split      same rollout via per-step kernels\n"
-        "  megasweep  rollout sweep, mega vs split   (--horizon)\n"
+        "  runsweep   rollout sweep, run vs split    (--horizon)\n"
         "  verify     NN fusion + rollout validation (--envs --steps)\n"
         "flags:\n"
         "  --backend cuda|cpu   (default cuda; cpu supports bench only)\n"
@@ -554,15 +554,15 @@ int main(int argc, char** argv) {
                     run_bench(sizes[i], iters < 0 ? 1000 : iters, om, rm);
         return 0;
     }
-    if (strcmp(mode, "megasweep") == 0) {
+    if (strcmp(mode, "runsweep") == 0) {
         int sizes[] = {4096, 16384, 65536, 262144, 1048576};
         for (int i = 0; i < 5; i++) run_bench_rollout(sizes[i], horizon, iters < 0 ? 10 : iters, false);
         for (int i = 0; i < 5; i++) run_bench_rollout(sizes[i], horizon, iters < 0 ? 10 : iters, true);
         return 0;
     }
-    if (strcmp(mode, "mega") == 0 || strcmp(mode, "split") == 0) {
+    if (strcmp(mode, "run") == 0 || strcmp(mode, "split") == 0) {
         run_bench_rollout(envs < 0 ? 262144 : envs, horizon,
-                          iters < 0 ? 10 : iters, strcmp(mode, "mega") == 0);
+                          iters < 0 ? 10 : iters, strcmp(mode, "run") == 0);
         return 0;
     }
     if (strcmp(mode, "bench") == 0) {
