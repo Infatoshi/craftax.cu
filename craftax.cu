@@ -1030,8 +1030,106 @@ __device__ void update_intrinsics(EnvSoA& g, int e, int action) {
 // Observation
 // ============================================================
 // Gather the 63-tile view: block ids plus a 4-bit mob mask per cell.
-// Mobs are scanned once each and stamped into their view cell (instead
-// of scanning every mob for every cell); emitted values are identical.
+// Two arch-gated layouts; emitted values are identical. Consumers gate
+// their view loops on VIEW_PACKED_LAYOUT. Mobs are scanned once each
+// and stamped into their view cell (instead of scanning every mob for
+// every cell).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000
+// Blackwell+: packed into registers. blk[r] holds row r's 9 block ids
+// at 6 bits per cell, mob[r] its 9 mob masks at 4 bits per cell. Each
+// view row spans <= 5 packed map bytes, loaded as two aligned words
+// instead of 9 per-nibble byte loads (63 -> 14 loads per view, no
+// local-memory view arrays); consumers fully unroll the row loop so
+// the row words stay in registers. Measured +3% env / +1% rollout on
+// sm_120; on sm_86 the extra packing ALU and unrolled consumers cost
+// more than the saved loads (-8 to -15% env), hence the gate.
+#define VIEW_PACKED_LAYOUT 1
+struct ViewPacked {
+    uint64_t blk[OBS_MAP_ROWS];
+    uint64_t mob[OBS_MAP_ROWS];
+};
+
+// r must be a compile-time constant at every call site (unrolled loops)
+// so the row words stay in registers.
+__device__ __forceinline__ int vp_blk(const ViewPacked& v, int r, int c) {
+    return (int)((v.blk[r] >> (c * 6)) & 63);
+}
+__device__ __forceinline__ int vp_mob(const ViewPacked& v, int r, int c) {
+    return (int)((v.mob[r] >> (c * 4)) & 0xF);
+}
+
+__device__ __forceinline__ void gather_view(
+    const EnvSoA& g, int e, ViewPacked& v
+) {
+    const int n = g.n;
+    const uint8_t* __restrict__ map = env_map(g, e);
+    int pr = g.player_r[e], pc = g.player_c[e];
+
+    // Aligned base byte of the 8-byte window covering cols pc-4..pc+4;
+    // s0 = bit offset of column pc-4 within that window.
+    int a = ((pc - 4) >> 1) & ~3;
+    a = max(0, min(a, MAP_PACKED_ROW - 8));
+    int s0 = ((pc - 4) - 2 * a) * 4;
+
+    uint64_t oob_row = 0;
+    #pragma unroll
+    for (int c = 0; c < OBS_MAP_COLS; c++)
+        oob_row |= (uint64_t)BLK_OUT_OF_BOUNDS << (c * 6);
+
+    #pragma unroll
+    for (int r = 0; r < OBS_MAP_ROWS; r++) {
+        int mr = pr - 3 + r;
+        if (mr < 0 || mr >= MAP_SIZE) { v.blk[r] = oob_row; v.mob[r] = 0; continue; }
+        const uint8_t* p = map + mr * MAP_PACKED_ROW + a;
+        uint64_t bits = (uint64_t)*(const uint32_t*)p
+                      | ((uint64_t)*(const uint32_t*)(p + 4) << 32);
+        uint64_t row = 0;
+        #pragma unroll
+        for (int c = 0; c < OBS_MAP_COLS; c++) {
+            int mc = pc - 4 + c;
+            // In-bounds cells always have shift in [0,60]; the mask
+            // just keeps the out-of-bounds lanes' shift defined.
+            uint64_t nib = (bits >> ((s0 + c * 4) & 63)) & 0xF;
+            row |= ((mc >= 0 && mc < MAP_SIZE) ? nib : (uint64_t)BLK_OUT_OF_BOUNDS)
+                   << (c * 6);
+        }
+        v.blk[r] = row;
+        v.mob[r] = 0;
+    }
+
+    auto stamp = [&](int r, int c, uint32_t bit) {
+        int dr = r - pr, dc = c - pc;
+        if (dr < -3 || dr > 3 || dc < -4 || dc > 4) return;
+        uint64_t b = (uint64_t)bit << ((dc + 4) * 4);
+        switch (dr + 3) {
+            case 0: v.mob[0] |= b; break;
+            case 1: v.mob[1] |= b; break;
+            case 2: v.mob[2] |= b; break;
+            case 3: v.mob[3] |= b; break;
+            case 4: v.mob[4] |= b; break;
+            case 5: v.mob[5] |= b; break;
+            default: v.mob[6] |= b; break;
+        }
+    };
+
+    for (int i = 0; i < MAX_ZOMBIES; i++)
+        if (g.zombie_mask[i*n+e]) stamp(g.zombie_r[i*n+e], g.zombie_c[i*n+e], 1);
+    for (int i = 0; i < MAX_COWS; i++)
+        if (g.cow_mask[i*n+e]) stamp(g.cow_r[i*n+e], g.cow_c[i*n+e], 2);
+    for (int i = 0; i < MAX_SKELETONS; i++)
+        if (g.skel_mask[i*n+e]) stamp(g.skel_r[i*n+e], g.skel_c[i*n+e], 4);
+    for (int i = 0; i < MAX_ARROWS; i++)
+        if (g.arrow_mask[i*n+e]) stamp(g.arrow_r[i*n+e], g.arrow_c[i*n+e], 8);
+}
+
+#else
+// Pre-Blackwell: per-nibble gather into two local byte arrays, flat
+// cell loops in consumers. Kept token-identical to the pre-packed code
+// (two bare arrays, not a struct): wrapping the arrays in a struct
+// makes ptxas keep it in local memory instead of promoting to
+// registers (obs_kernel 96 -> 48 regs, +72% LDL, -8% env SPS).
+#define VIEW_PACKED_LAYOUT 0
+
 __device__ __forceinline__ void gather_view(
     const EnvSoA& g, int e, int8_t* view_blk, uint8_t* view_mob
 ) {
@@ -1063,14 +1161,42 @@ __device__ __forceinline__ void gather_view(
     for (int i = 0; i < MAX_ARROWS; i++)
         if (g.arrow_mask[i*n+e]) stamp(g.arrow_r[i*n+e], g.arrow_c[i*n+e], 8);
 }
+#endif
+
+// Per-layout view declaration / parameter / argument spelling so the
+// consumers below stay single-source where the bodies don't differ.
+#if VIEW_PACKED_LAYOUT
+#define VIEW_DECL_GATHER(g_, e_) ViewPacked view; gather_view(g_, e_, view)
+#define VIEW_PARAMS const ViewPacked& v
+#define VIEW_ARGS view
+#else
+#define VIEW_DECL_GATHER(g_, e_) \
+    int8_t view_blk[OBS_MAP_CELLS]; uint8_t view_mob[OBS_MAP_CELLS]; \
+    gather_view(g_, e_, view_blk, view_mob)
+#define VIEW_PARAMS const int8_t* view_blk, const uint8_t* view_mob
+#define VIEW_ARGS view_blk, view_mob
+#endif
 
 __device__ void build_observation(const EnvSoA& g, int e, float* obs) {
     const int n = g.n;
-    int8_t view_blk[OBS_MAP_CELLS];
-    uint8_t view_mob[OBS_MAP_CELLS];
-    gather_view(g, e, view_blk, view_mob);
+    VIEW_DECL_GATHER(g, e);
 
     int obs_idx = 0;
+#if VIEW_PACKED_LAYOUT
+    #pragma unroll
+    for (int r = 0; r < OBS_MAP_ROWS; r++) {
+        for (int c = 0; c < OBS_MAP_COLS; c++) {
+            int blk = vp_blk(view, r, c);
+            for (int b = 0; b < NUM_BLOCK_TYPES; b++)
+                obs[obs_idx++] = (blk == b) ? 1.0f : 0.0f;
+            int m = vp_mob(view, r, c);
+            obs[obs_idx++] = (m & 1) ? 1.0f : 0.0f;
+            obs[obs_idx++] = (m & 2) ? 1.0f : 0.0f;
+            obs[obs_idx++] = (m & 4) ? 1.0f : 0.0f;
+            obs[obs_idx++] = (m & 8) ? 1.0f : 0.0f;
+        }
+    }
+#else
     for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
         int8_t blk = view_blk[cell];
         for (int b = 0; b < NUM_BLOCK_TYPES; b++)
@@ -1081,6 +1207,7 @@ __device__ void build_observation(const EnvSoA& g, int e, float* obs) {
         obs[obs_idx++] = (m & 4) ? 1.0f : 0.0f;
         obs[obs_idx++] = (m & 8) ? 1.0f : 0.0f;
     }
+#endif
 
     for (int i = 0; i < NUM_INVENTORY; i++)
         obs[obs_idx++] = (float)g.inv[i*n+e] / 10.0f;
@@ -1100,11 +1227,19 @@ __device__ void build_observation(const EnvSoA& g, int e, float* obs) {
 // Compact uint8 observation (see OBS_DIM_COMPACT layout in craftax.cuh).
 // 148 bytes vs 5380 -- 36x less obs traffic. expand_obs_kernel reproduces
 // the float observation bit-for-bit.
+__device__ void write_compact_obs(
+    const EnvSoA& g, int e, VIEW_PARAMS, uint8_t* obs
+);
+
 __device__ void build_observation_compact(const EnvSoA& g, int e, uint8_t* obs) {
+#if VIEW_PACKED_LAYOUT
+    VIEW_DECL_GATHER(g, e);
+    write_compact_obs(g, e, VIEW_ARGS, obs);
+#else
+    // Inline body, token-identical to the pre-packed code (nvcc's
+    // inlining shape is sensitive here; see the layout comment above).
     const int n = g.n;
-    int8_t view_blk[OBS_MAP_CELLS];
-    uint8_t view_mob[OBS_MAP_CELLS];
-    gather_view(g, e, view_blk, view_mob);
+    VIEW_DECL_GATHER(g, e);
 
     for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
         obs[cell] = (uint8_t)view_blk[cell];
@@ -1122,6 +1257,7 @@ __device__ void build_observation_compact(const EnvSoA& g, int e, uint8_t* obs) 
     obs[idx++] = g.is_sleeping[e] ? 1 : 0;
     float light = g.light_level[e];
     memcpy(obs + idx, &light, sizeof(float));
+#endif
 }
 
 // Expand compact obs back to the exact 1345-float observation.
@@ -1420,14 +1556,34 @@ __device__ void load_nn_shared(NNShared& s, const Weights& w) {
 // as the dense loop, skipping only exact-zero terms.
 // ============================================================
 __device__ void fused_encoder(
-    const EnvSoA& g, int e,
-    const int8_t* view_blk, const uint8_t* view_mob,
+    const EnvSoA& g, int e, VIEW_PARAMS,
     const Weights& w, const NNShared& s, float* h  // h[HIDDEN]
 ) {
     const int n = g.n;
     #pragma unroll
     for (int i = 0; i < HIDDEN; i++) h[i] = s.b_enc[i];
 
+#if VIEW_PACKED_LAYOUT
+    #pragma unroll
+    for (int r = 0; r < OBS_MAP_ROWS; r++) {
+        for (int c = 0; c < OBS_MAP_COLS; c++) {
+            int cell = r * OBS_MAP_COLS + c;
+            int f = cell * (NUM_BLOCK_TYPES + 4) + vp_blk(v, r, c);
+            const float* col = w.W_enc + (size_t)f * HIDDEN;
+            #pragma unroll
+            for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, col[i], h[i]);
+            int m = vp_mob(v, r, c);
+            int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+            for (int k = 0; k < 4; k++) {
+                if (m & (1 << k)) {
+                    const float* mc = w.W_enc + (size_t)(fm + k) * HIDDEN;
+                    #pragma unroll
+                    for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, mc[i], h[i]);
+                }
+            }
+        }
+    }
+#else
     for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
         int f = cell * (NUM_BLOCK_TYPES + 4) + view_blk[cell];
         const float* col = w.W_enc + (size_t)f * HIDDEN;
@@ -1443,6 +1599,7 @@ __device__ void fused_encoder(
             }
         }
     }
+#endif
 
     int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
     for (int j = 0; j < NUM_INVENTORY; j++, f++) {
@@ -1538,17 +1695,26 @@ __device__ int sample_action(const float* logits, float u, float* logprob) {
     return action;
 }
 
-// Write compact obs from an already-gathered view (same bytes as
-// build_observation_compact).
+// Write compact obs from an already-gathered view.
 __device__ void write_compact_obs(
-    const EnvSoA& g, int e,
-    const int8_t* view_blk, const uint8_t* view_mob, uint8_t* obs
+    const EnvSoA& g, int e, VIEW_PARAMS, uint8_t* obs
 ) {
     const int n = g.n;
+#if VIEW_PACKED_LAYOUT
+    #pragma unroll
+    for (int r = 0; r < OBS_MAP_ROWS; r++) {
+        for (int c = 0; c < OBS_MAP_COLS; c++) {
+            int cell = r * OBS_MAP_COLS + c;
+            obs[cell] = (uint8_t)vp_blk(v, r, c);
+            obs[OBS_MAP_CELLS + cell] = (uint8_t)vp_mob(v, r, c);
+        }
+    }
+#else
     for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
         obs[cell] = (uint8_t)view_blk[cell];
         obs[OBS_MAP_CELLS + cell] = view_mob[cell];
     }
+#endif
     int idx = 2 * OBS_MAP_CELLS;
     for (int i = 0; i < NUM_INVENTORY; i++)
         obs[idx++] = (uint8_t)g.inv[i*n+e];
@@ -1595,10 +1761,8 @@ extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rol
     bool was_done = false;
 
     for (int t = 0; t < T; t++) {
-        int8_t view_blk[OBS_MAP_CELLS];
-        uint8_t view_mob[OBS_MAP_CELLS];
-        gather_view(g, e, view_blk, view_mob);
-        write_compact_obs(g, e, view_blk, view_mob,
+        VIEW_DECL_GATHER(g, e);
+        write_compact_obs(g, e, VIEW_ARGS,
                           r_obs + ((size_t)t * num_envs + e) * OBS_DIM_COMPACT);
 
         if (was_done) {
@@ -1606,7 +1770,7 @@ extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rol
             for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
         }
         float h_enc[HIDDEN], logits[NUM_ACTIONS], value, logprob;
-        fused_encoder(g, e, view_blk, view_mob, w, snn, h_enc);
+        fused_encoder(g, e, VIEW_ARGS, w, snn, h_enc);
         nn_head(h_enc, state, snn, logits, value);
         int action = sample_action(logits, curand_uniform(&sampler), &logprob);
 
@@ -1649,10 +1813,8 @@ extern "C" __global__ void fused_forward_kernel(
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_envs) return;
 
-    int8_t view_blk[OBS_MAP_CELLS];
-    uint8_t view_mob[OBS_MAP_CELLS];
-    gather_view(g, e, view_blk, view_mob);
-    write_compact_obs(g, e, view_blk, view_mob, r_obs + (size_t)e * OBS_DIM_COMPACT);
+    VIEW_DECL_GATHER(g, e);
+    write_compact_obs(g, e, VIEW_ARGS, r_obs + (size_t)e * OBS_DIM_COMPACT);
 
     float state[HIDDEN];
     if (prev_dones && prev_dones[e]) {
@@ -1664,7 +1826,7 @@ extern "C" __global__ void fused_forward_kernel(
     }
 
     float h_enc[HIDDEN], logits[NUM_ACTIONS], value, logprob;
-    fused_encoder(g, e, view_blk, view_mob, w, snn, h_enc);
+    fused_encoder(g, e, VIEW_ARGS, w, snn, h_enc);
     nn_head(h_enc, state, snn, logits, value);
 
     curandStatePhilox4_32_10_t sampler;

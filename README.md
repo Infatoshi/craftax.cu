@@ -14,15 +14,15 @@ Env steps per second:
 
 | Backend | Hardware | Env only | Env + policy rollout |
 |---|---|---:|---:|
-| CUDA, 1M envs | RTX PRO 6000 Blackwell | 301.2M | 306.2M |
-| CUDA, 1M envs | RTX 3090 | 124.5M | 114.3M @ 262k |
+| CUDA, 1M envs | RTX PRO 6000 Blackwell | 312.4M | 306.9M |
+| CUDA, 1M envs | RTX 3090 | 127.9M | 116.2M @ 262k |
 | C, 32k envs | Ryzen 9 9950X3D | 47.8M | - |
 
 "Env + policy" is a rollout megakernel: the PufferLib default craftax policy
 (Linear 1345->32 encoder, MinGRU, actor/critic heads), categorical sampling,
 and PPO rollout storage fused into one persistent kernel, one thread per env,
-no grid sync. It outruns the env-only per-step path because fusing away
-launch/sync overhead more than pays for a hidden-32 policy.
+no grid sync. It runs within 2% of the env-only per-step path: fusing away
+launch/sync overhead roughly pays for a hidden-32 policy.
 
 ## Build
 
@@ -63,6 +63,9 @@ CUDA (`craftax.cu` device code, `main.cu` launcher):
 - SoA state: one thread steps one env; per-field arrays make warp lanes
   coalesce (store efficiency 11% -> 47%)
 - Compact uint8 obs: 148 bytes vs 5380 (36x less traffic), exact GPU expansion
+- Packed view gather (Blackwell+): each 9-tile view row loads as two aligned
+  words instead of 9 nibble reads, view lives in registers, not local memory
+  (arch-gated: the extra 64-bit ALU is a net loss on Ampere)
 - Offset-Philox worldgen: every draw at a fixed counter offset, so one warp
   generates a map cooperatively, bit-identical to the serial generator;
   resets drop ~2.5ms -> ~4us per step at 65k envs
