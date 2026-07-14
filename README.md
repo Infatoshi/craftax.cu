@@ -33,8 +33,10 @@ Full game (env only, random actions, auto-reset included):
 |---|---|---:|
 | C, 8192 envs, 32T | Ryzen 9 9950X3D | 5.6M |
 | C, 1024 envs, 1T | Ryzen 9 9950X3D | 750K |
-| CUDA, 262k envs, compact obs | RTX PRO 6000 Blackwell | 68.2M |
-| CUDA, 65k envs | RTX PRO 6000 Blackwell | 61.9M |
+| CUDA, 262k envs, compact obs | RTX PRO 6000 Blackwell | 104.5M |
+| CUDA, 262k envs | RTX PRO 6000 Blackwell | 94.3M |
+| CUDA, 65k envs, compact obs | RTX PRO 6000 Blackwell | 89.5M |
+| CUDA, 65k envs | RTX PRO 6000 Blackwell | 85.6M |
 | CUDA, 65k envs, compact obs | RTX 3090 | 18.8M |
 | CUDA, 65k envs | RTX 3090 | 18.3M |
 | CUDA (naive port, milestone 1), 65k envs | RTX 3090 | 454K |
@@ -61,6 +63,20 @@ no trajectory bit:
   16KB), warp-transposed coalesced obs encode, list-free two-pass
   mob-spawn scans, and optional compact byte obs (996B vs 3372B,
   its own hash universe, matched against the C compact build)
+- SoA split of the hot scalar state (52 fields via one X-macro
+  registry: player scalars, inventory, unified 5-class mob pool,
+  spawn bitsets), so per-thread loads coalesce across envs; the env
+  index is recovered from pointer arithmetic so game logic is
+  untouched
+- Obs encode writes each cell's 8 channels as one contiguous run
+  (one lane per cell, light map loaded once instead of per channel);
+  visible mobs scatter directly instead of 130 per-cell scans. The
+  encode kernel now runs at ~71% of peak memory throughput, close to
+  the write-bandwidth floor of the float obs tensor
+- Lazy reset zeroing: on auto-reset a warp clears only the SoA slices
+  of floors actually generated during the dying episode (tracked in
+  the pending-floor bitmask); never-visited floors provably still
+  hold post-reset values
 
 "Env + policy" is a rollout megakernel: the PufferLib default craftax policy
 (Linear 1345->32 encoder, MinGRU, actor/critic heads), categorical sampling,

@@ -738,6 +738,110 @@ static __device__ inline void craftax_wg_init_cell_templates(void) {
 // [cuda port] table indexed by timestep 0..100000 inclusive
 #define CRAFTAX_DEFAULT_MAX_TIMESTEPS_TABLE 100001
 
+
+// ============================================================
+// [cuda port M3] SoA split of hot scalar state. Each field listed here is
+// removed from CraftaxState/CraftaxWorldState and stored in a per-field
+// global array laid out [sub_index][env] (stride g_cf_n), so a warp of
+// adjacent envs coalesces its accesses. Pure layout change: values, types
+// and every arithmetic op are identical, so trajectories are bit-exact.
+// X(name, ctype, per_env_count)
+// ============================================================
+// Flat (non-level-indexed) fields: always cleared on reset.
+#define CF_SOA_FIELDS_FLAT(X) \
+    X(player_position, int32_t, 2) \
+    X(player_level, int32_t, 1) \
+    X(player_direction, int32_t, 1) \
+    X(player_health, float, 1) \
+    X(player_food, int32_t, 1) \
+    X(player_drink, int32_t, 1) \
+    X(player_energy, int32_t, 1) \
+    X(player_mana, int32_t, 1) \
+    X(is_sleeping, bool, 1) \
+    X(is_resting, bool, 1) \
+    X(player_recover, float, 1) \
+    X(player_hunger, float, 1) \
+    X(player_thirst, float, 1) \
+    X(player_fatigue, float, 1) \
+    X(player_recover_mana, float, 1) \
+    X(player_xp, int32_t, 1) \
+    X(player_dexterity, int32_t, 1) \
+    X(player_strength, int32_t, 1) \
+    X(player_intelligence, int32_t, 1) \
+    X(inv_wood, int32_t, 1) \
+    X(inv_stone, int32_t, 1) \
+    X(inv_coal, int32_t, 1) \
+    X(inv_iron, int32_t, 1) \
+    X(inv_diamond, int32_t, 1) \
+    X(inv_sapling, int32_t, 1) \
+    X(inv_pickaxe, int32_t, 1) \
+    X(inv_sword, int32_t, 1) \
+    X(inv_bow, int32_t, 1) \
+    X(inv_arrows, int32_t, 1) \
+    X(inv_torches, int32_t, 1) \
+    X(inv_ruby, int32_t, 1) \
+    X(inv_sapphire, int32_t, 1) \
+    X(inv_books, int32_t, 1) \
+    X(inv_armour, int32_t, 4) \
+    X(inv_potions, int32_t, 6) \
+    X(learned_spells, bool, 2) \
+    X(sword_enchantment, int32_t, 1) \
+    X(bow_enchantment, int32_t, 1) \
+    X(armour_enchantments, int32_t, 4) \
+    X(boss_progress, int32_t, 1) \
+    X(boss_timesteps_to_spawn_this_round, int32_t, 1) \
+    X(light_level, float, 1) \
+    X(achievements, bool, 67) \
+    X(state_rng, uint32_t, 2) \
+    X(timestep, int32_t, 1) \
+    X(growing_plants_positions, int32_t, 20) \
+    X(growing_plants_age, int32_t, 10) \
+    X(growing_plants_mask, bool, 10) \
+    X(lazy_floors_pending, uint32_t, 1)
+
+// Level-indexed fields: on the lazy warp reset only levels that were
+// actually generated during the dying episode need re-clearing; the
+// per-entry level is recovered from the flat index _j below.
+#define CF_SOA_FIELDS_LEVEL(X) \
+    X(monsters_killed, int32_t, 9) \
+    X(mob_position, int32_t, 270) \
+    X(mob_health, float, 135) \
+    X(mob_mask, bool, 135) \
+    X(mob_attack_cooldown, int32_t, 135) \
+    X(mob_type_id, int32_t, 135) \
+    X(mob_bits, uint64_t, 432) \
+    X(spawn_all_bits, uint64_t, 432) \
+    X(spawn_grave_bits, uint64_t, 432) \
+    X(spawn_water_bits, uint64_t, 432) \
+    X(mob_projectile_directions, int32_t, 54) \
+    X(player_projectile_directions, int32_t, 54) \
+    X(chests_opened, bool, 9)
+
+#define CF_SOA_FIELDS(X) CF_SOA_FIELDS_FLAT(X) CF_SOA_FIELDS_LEVEL(X)
+
+#define CF_SOA_DECL(f, t, k) __device__ t* g_cf_##f = NULL;
+CF_SOA_FIELDS(CF_SOA_DECL)
+#undef CF_SOA_DECL
+__device__ char* g_cf_state_base = NULL;
+__device__ int g_cf_n = 0;
+
+// cf_slot is defined after CraftaxWorldState (needs its sizeof); any pointer
+// into an env's state block (including interior pointers) maps to that env.
+#define CF(f, s) (g_cf_##f[(size_t)cf_slot(s)])
+#define CF2(f, i, s) \
+    (g_cf_##f[(size_t)(i) * (size_t)g_cf_n + (size_t)cf_slot(s)])
+
+// Mob SoA: class c (0 melee, 1 passive, 2 ranged, 3 mob proj, 4 player
+// proj), level l (0..8), slot i (0..2; ranged pads slot 2, never accessed).
+#define CFM(c, l, i) ((((c) * 9) + (l)) * 3 + (i))
+#define MOB_POS(c, l, i, a, s) CF2(mob_position, CFM(c, l, i) * 2 + (a), s)
+#define MOB_HP(c, l, i, s) CF2(mob_health, CFM(c, l, i), s)
+#define MOB_MASK(c, l, i, s) CF2(mob_mask, CFM(c, l, i), s)
+#define MOB_CD(c, l, i, s) CF2(mob_attack_cooldown, CFM(c, l, i), s)
+#define MOB_TYPE(c, l, i, s) CF2(mob_type_id, CFM(c, l, i), s)
+// Row bitmaps: 9 levels x 48 rows of 48-bit column masks.
+#define CF_BITS(f, l, r, s) CF2(f, (l) * CRAFTAX_MAP_SIZE + (r), s)
+
 typedef struct CraftaxOverworldFloor {
     uint8_t map[CRAFTAX_OVERWORLD_SIZE][CRAFTAX_OVERWORLD_SIZE];
     uint8_t item_map[CRAFTAX_OVERWORLD_SIZE][CRAFTAX_OVERWORLD_SIZE];
@@ -783,65 +887,21 @@ typedef struct CraftaxWGMobs2 {
 
 typedef struct CraftaxWorldState {
     // === Hot data (accessed every step) ===
-    int32_t player_position[2];
-    int32_t player_level;
-    int32_t player_direction;
 
-    float player_health;
-    int32_t player_food;
-    int32_t player_drink;
-    int32_t player_energy;
-    int32_t player_mana;
-    bool is_sleeping;
-    bool is_resting;
 
-    float player_recover;
-    float player_hunger;
-    float player_thirst;
-    float player_fatigue;
-    float player_recover_mana;
 
-    int32_t player_xp;
-    int32_t player_dexterity;
-    int32_t player_strength;
-    int32_t player_intelligence;
 
-    CraftaxWGInventory inventory;
 
-    CraftaxWGMobs3 melee_mobs;
-    CraftaxWGMobs3 passive_mobs;
-    CraftaxWGMobs2 ranged_mobs;
 
-    CraftaxWGMobs3 mob_projectiles;
-    int32_t mob_projectile_directions[CRAFTAX_WG_NUM_LEVELS][CRAFTAX_WG_MAX_MOB_PROJECTILES][2];
-    CraftaxWGMobs3 player_projectiles;
-    int32_t player_projectile_directions[CRAFTAX_WG_NUM_LEVELS][CRAFTAX_WG_MAX_PLAYER_PROJECTILES][2];
 
-    int32_t growing_plants_positions[CRAFTAX_WG_MAX_GROWING_PLANTS][2];
-    int32_t growing_plants_age[CRAFTAX_WG_MAX_GROWING_PLANTS];
-    bool growing_plants_mask[CRAFTAX_WG_MAX_GROWING_PLANTS];
 
     int32_t potion_mapping[6];
-    bool learned_spells[2];
 
-    int32_t sword_enchantment;
-    int32_t bow_enchantment;
-    int32_t armour_enchantments[4];
 
-    int32_t boss_progress;
-    int32_t boss_timesteps_to_spawn_this_round;
 
-    float light_level;
-    bool achievements[CRAFTAX_WG_NUM_ACHIEVEMENTS];
-    uint32_t state_rng[2];
-    int32_t timestep;
     int32_t fractal_noise_angles[4];
 
     // === Medium-hot bitmaps ===
-    uint64_t mob_bits[CRAFTAX_WG_NUM_LEVELS][CRAFTAX_WG_MAP_SIZE];
-    uint64_t spawn_all_bits[CRAFTAX_WG_NUM_LEVELS][CRAFTAX_WG_MAP_SIZE];
-    uint64_t spawn_grave_bits[CRAFTAX_WG_NUM_LEVELS][CRAFTAX_WG_MAP_SIZE];
-    uint64_t spawn_water_bits[CRAFTAX_WG_NUM_LEVELS][CRAFTAX_WG_MAP_SIZE];
 
     // === Cold data (large maps) ===
     uint8_t map[CRAFTAX_WG_NUM_LEVELS][CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE];
@@ -850,16 +910,87 @@ typedef struct CraftaxWorldState {
 
     int32_t down_ladders[CRAFTAX_WG_NUM_LEVELS][2];
     int32_t up_ladders[CRAFTAX_WG_NUM_LEVELS][2];
-    bool chests_opened[CRAFTAX_WG_NUM_LEVELS];
-    int32_t monsters_killed[CRAFTAX_WG_NUM_LEVELS];
 
     // Lazy floor generation. Bit L of lazy_floors_pending set means floor L
     // has not been generated yet; its worldgen key is in lazy_floor_keys[L].
     // Zero-initialized states (test fixtures, JAX mirrors) read as
     // "all floors generated", so laziness is opt-in per state.
     uint32_t lazy_floor_keys[CRAFTAX_WG_NUM_LEVELS][2];
-    uint32_t lazy_floors_pending;
 } CraftaxWorldState;
+
+static __device__ inline int cf_slot(const void* p) {
+    return (int)(((const char*)p - g_cf_state_base)
+                 / (ptrdiff_t)sizeof(CraftaxWorldState));
+}
+
+// Reset-path equivalent of the old memset(state, 0, ...) for the SoA fields.
+static __device__ inline void cf_soa_zero_env(const void* s) {
+#define CF_SOA_ZERO(f, t, k) \
+    for (int _i = 0; _i < (k); _i++) CF2(f, _i, s) = (t)0;
+    CF_SOA_FIELDS(CF_SOA_ZERO)
+#undef CF_SOA_ZERO
+}
+
+// Warp-distributed variant for the warp-cooperative reset: entry j of every
+// field is always written by lane j % 32, so later same-stride writes from
+// the same warp (mob health init, projectile directions) need no sync.
+static __device__ inline void cf_soa_zero_env_warp(const void* s, unsigned lane) {
+#define CF_SOA_ZERO_W(f, t, k) \
+    for (int _i = (int)lane; _i < (k); _i += 32) CF2(f, _i, s) = (t)0;
+    CF_SOA_FIELDS(CF_SOA_ZERO_W)
+#undef CF_SOA_ZERO_W
+}
+
+// Per-entry level for each level-indexed SoA field (flat index j).
+#define CF_LVL_mob_position(j) (((j) / 6) % 9)
+#define CF_LVL_mob_health(j) (((j) / 3) % 9)
+#define CF_LVL_mob_mask(j) (((j) / 3) % 9)
+#define CF_LVL_mob_attack_cooldown(j) (((j) / 3) % 9)
+#define CF_LVL_mob_type_id(j) (((j) / 3) % 9)
+#define CF_LVL_mob_bits(j) ((j) / 48)
+#define CF_LVL_spawn_all_bits(j) ((j) / 48)
+#define CF_LVL_spawn_grave_bits(j) ((j) / 48)
+#define CF_LVL_spawn_water_bits(j) ((j) / 48)
+#define CF_LVL_mob_projectile_directions(j) ((j) / 6)
+#define CF_LVL_player_projectile_directions(j) ((j) / 6)
+#define CF_LVL_chests_opened(j) (j)
+#define CF_LVL_monsters_killed(j) (j)
+
+// Lazy variant: clears flat fields fully but level-indexed fields only for
+// levels in gen_mask (bit L = level L was generated and must be re-cleared).
+// Never-generated levels provably still hold their post-reset values.
+static __device__ inline void cf_soa_zero_env_warp_lazy(
+    const void* s, unsigned lane, uint32_t gen_mask
+) {
+#define CF_SOA_ZERO_WF(f, t, k) \
+    for (int _j = (int)lane; _j < (k); _j += 32) CF2(f, _j, s) = (t)0;
+#define CF_SOA_ZERO_WL(f, t, k) \
+    for (int _j = (int)lane; _j < (k); _j += 32) { \
+        if (((gen_mask >> CF_LVL_##f(_j)) & 1u) == 0u) continue; \
+        CF2(f, _j, s) = (t)0; \
+    }
+    CF_SOA_FIELDS_FLAT(CF_SOA_ZERO_WF)
+    CF_SOA_FIELDS_LEVEL(CF_SOA_ZERO_WL)
+#undef CF_SOA_ZERO_WF
+#undef CF_SOA_ZERO_WL
+}
+
+// Warp-distributed mirror of the five craftax_init_empty_mobs* calls:
+// health = 1.0f for every (class, level, slot) except the padded ranged
+// slot 2, which the scalar path never writes (stays 0 from the zero pass).
+// Same gen_mask predicate: skipped levels already hold health = 1.0f.
+static __device__ inline void cf_init_empty_mobs_warp(
+    void* s, unsigned lane, uint32_t gen_mask
+) {
+    for (int j = (int)lane; j < 135; j += 32) {
+        int c = j / 27;
+        int r = j % 27;
+        if (c == 2 && r % 3 == 2) continue;
+        if (((gen_mask >> (r / 3)) & 1u) == 0u) continue;
+        CF2(mob_health, j, s) = 1.0f;
+    }
+}
+
 
 typedef struct CraftaxSmoothGenConfig {
     int32_t default_block;
@@ -2094,18 +2225,18 @@ static __device__ inline float craftax_calculate_initial_light_level(void) {
     return g_craftax_light_table[0];
 }
 
-static __device__ inline void craftax_init_empty_mobs3(CraftaxWGMobs3* mobs) {
+static __device__ inline void craftax_init_empty_mobs3(void* mobs, int mc) {
     for (int level = 0; level < CRAFTAX_WG_NUM_LEVELS; level++) {
         for (int mob = 0; mob < 3; mob++) {
-            mobs->health[level][mob] = 1.0f;
+            MOB_HP(mc, level, mob, mobs) = 1.0f;
         }
     }
 }
 
-static __device__ inline void craftax_init_empty_mobs2(CraftaxWGMobs2* mobs) {
+static __device__ inline void craftax_init_empty_mobs2(void* mobs, int mc) {
     for (int level = 0; level < CRAFTAX_WG_NUM_LEVELS; level++) {
         for (int mob = 0; mob < 2; mob++) {
-            mobs->health[level][mob] = 1.0f;
+            MOB_HP(mc, level, mob, mobs) = 1.0f;
         }
     }
 }
@@ -2141,6 +2272,7 @@ static __device__ inline void craftax_generate_world_from_key_lazy(
     bool lazy
 ) {
     memset(out, 0, sizeof(*out));
+    cf_soa_zero_env(out);
 
     CraftaxThreefryKey smooth_split[7];
     craftax_threefry_split_n(rng, smooth_split, 7);
@@ -2184,21 +2316,21 @@ static __device__ inline void craftax_generate_world_from_key_lazy(
         );
     }
 
-    out->lazy_floors_pending = lazy ? 0x1FEu : 0u;  // floors 1..8 deferred
+    CF(lazy_floors_pending, out) = lazy ? 0x1FEu : 0u;  // floors 1..8 deferred
 
-    craftax_init_empty_mobs3(&out->melee_mobs);
-    craftax_init_empty_mobs3(&out->passive_mobs);
-    craftax_init_empty_mobs2(&out->ranged_mobs);
-    craftax_init_empty_mobs3(&out->mob_projectiles);
-    craftax_init_empty_mobs3(&out->player_projectiles);
+    craftax_init_empty_mobs3(out, 0);
+    craftax_init_empty_mobs3(out, 1);
+    craftax_init_empty_mobs2(out, 2);
+    craftax_init_empty_mobs3(out, 3);
+    craftax_init_empty_mobs3(out, 4);
     for (int level = 0; level < CRAFTAX_WG_NUM_LEVELS; level++) {
         for (int projectile = 0; projectile < CRAFTAX_WG_MAX_MOB_PROJECTILES; projectile++) {
-            out->mob_projectile_directions[level][projectile][0] = 1;
-            out->mob_projectile_directions[level][projectile][1] = 1;
+            CF2(mob_projectile_directions, (level) * 6 + (projectile) * 2 + (0), out) = 1;
+            CF2(mob_projectile_directions, (level) * 6 + (projectile) * 2 + (1), out) = 1;
         }
         for (int projectile = 0; projectile < CRAFTAX_WG_MAX_PLAYER_PROJECTILES; projectile++) {
-            out->player_projectile_directions[level][projectile][0] = 1;
-            out->player_projectile_directions[level][projectile][1] = 1;
+            CF2(player_projectile_directions, (level) * 6 + (projectile) * 2 + (0), out) = 1;
+            CF2(player_projectile_directions, (level) * 6 + (projectile) * 2 + (1), out) = 1;
         }
     }
 
@@ -2209,24 +2341,24 @@ static __device__ inline void craftax_generate_world_from_key_lazy(
     CraftaxThreefryKey state_key;
     craftax_threefry_split(rng, &rng, &state_key);
     (void)rng;
-    out->state_rng[0] = state_key.word[0];
-    out->state_rng[1] = state_key.word[1];
+    CF2(state_rng, 0, out) = state_key.word[0];
+    CF2(state_rng, 1, out) = state_key.word[1];
 
-    out->monsters_killed[0] = 10;
-    out->player_position[0] = CRAFTAX_WG_MAP_SIZE / 2;
-    out->player_position[1] = CRAFTAX_WG_MAP_SIZE / 2;
-    out->player_level = 0;
-    out->player_direction = CRAFTAX_WG_ACTION_UP;
-    out->player_health = 9.0f;
-    out->player_food = 9;
-    out->player_drink = 9;
-    out->player_energy = 9;
-    out->player_mana = 9;
-    out->player_dexterity = 1;
-    out->player_strength = 1;
-    out->player_intelligence = 1;
-    out->boss_timesteps_to_spawn_this_round = CRAFTAX_WG_BOSS_FIGHT_SPAWN_TURNS;
-    out->light_level = craftax_calculate_initial_light_level();
+    CF2(monsters_killed, 0, out) = 10;
+    CF2(player_position, 0, out) = CRAFTAX_WG_MAP_SIZE / 2;
+    CF2(player_position, 1, out) = CRAFTAX_WG_MAP_SIZE / 2;
+    CF(player_level, out) = 0;
+    CF(player_direction, out) = CRAFTAX_WG_ACTION_UP;
+    CF(player_health, out) = 9.0f;
+    CF(player_food, out) = 9;
+    CF(player_drink, out) = 9;
+    CF(player_energy, out) = 9;
+    CF(player_mana, out) = 9;
+    CF(player_dexterity, out) = 1;
+    CF(player_strength, out) = 1;
+    CF(player_intelligence, out) = 1;
+    CF(boss_timesteps_to_spawn_this_round, out) = CRAFTAX_WG_BOSS_FIGHT_SPAWN_TURNS;
+    CF(light_level, out) = craftax_calculate_initial_light_level();
 }
 
 static __device__ inline void craftax_generate_world_from_key(
@@ -2293,37 +2425,37 @@ static __device__ inline bool craftax_wg_scatter_index(
 static __device__ inline bool craftax_wg_is_boss_vulnerable(
     const CraftaxWorldState* state
 ) {
-    int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     bool has_melee = false;
     bool has_ranged = false;
     for (int i = 0; i < CRAFTAX_WG_MAX_MELEE_MOBS; i++) {
-        has_melee = has_melee || state->melee_mobs.mask[level][i];
+        has_melee = has_melee || MOB_MASK(0, level, i, state);
     }
     for (int i = 0; i < CRAFTAX_WG_MAX_RANGED_MOBS; i++) {
-        has_ranged = has_ranged || state->ranged_mobs.mask[level][i];
+        has_ranged = has_ranged || MOB_MASK(2, level, i, state);
     }
     return !has_melee
         && !has_ranged
-        && state->boss_timesteps_to_spawn_this_round <= 0;
+        && CF(boss_timesteps_to_spawn_this_round, state) <= 0;
 }
 
 static __device__ inline void craftax_encode_mobs3_observation(
     const CraftaxWorldState* state,
-    const CraftaxWGMobs3* mobs,
+    const void* mobs, int mc,
     int mob_class_index,
     int channels,
     int mob_channels_offset,
     float* obs
 ) {
-    int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     for (int i = 0; i < 3; i++) {
-        int local_row = mobs->position[level][i][0]
-            - state->player_position[0]
+        int local_row = MOB_POS(mc, level, i, 0, mobs)
+            - CF2(player_position, 0, state)
             + CRAFTAX_WG_OBS_ROWS / 2;
-        int local_col = mobs->position[level][i][1]
-            - state->player_position[1]
+        int local_col = MOB_POS(mc, level, i, 1, mobs)
+            - CF2(player_position, 1, state)
             + CRAFTAX_WG_OBS_COLS / 2;
-        int type_id = mobs->type_id[level][i];
+        int type_id = MOB_TYPE(mc, level, i, mobs);
         int scatter_row;
         int scatter_col;
         if (!craftax_wg_scatter_index(
@@ -2345,8 +2477,8 @@ static __device__ inline void craftax_encode_mobs3_observation(
             && local_row < CRAFTAX_WG_OBS_ROWS
             && local_col >= 0
             && local_col < CRAFTAX_WG_OBS_COLS;
-        int world_row = mobs->position[level][i][0];
-        int world_col = mobs->position[level][i][1];
+        int world_row = MOB_POS(mc, level, i, 0, mobs);
+        int world_col = MOB_POS(mc, level, i, 1, mobs);
         bool in_bounds = world_row >= 0
             && world_row < CRAFTAX_WG_MAP_SIZE
             && world_col >= 0
@@ -2357,27 +2489,27 @@ static __device__ inline void craftax_encode_mobs3_observation(
             + mob_class_index * CRAFTAX_WG_NUM_MOB_TYPES
             + type_id;
         obs[obs_base + channel] =
-            mobs->mask[level][i] && on_screen && visible ? 1.0f : 0.0f;
+            MOB_MASK(mc, level, i, mobs) && on_screen && visible ? 1.0f : 0.0f;
     }
 }
 
 static __device__ inline void craftax_encode_mobs2_observation(
     const CraftaxWorldState* state,
-    const CraftaxWGMobs2* mobs,
+    const void* mobs, int mc,
     int mob_class_index,
     int channels,
     int mob_channels_offset,
     float* obs
 ) {
-    int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     for (int i = 0; i < 2; i++) {
-        int local_row = mobs->position[level][i][0]
-            - state->player_position[0]
+        int local_row = MOB_POS(mc, level, i, 0, mobs)
+            - CF2(player_position, 0, state)
             + CRAFTAX_WG_OBS_ROWS / 2;
-        int local_col = mobs->position[level][i][1]
-            - state->player_position[1]
+        int local_col = MOB_POS(mc, level, i, 1, mobs)
+            - CF2(player_position, 1, state)
             + CRAFTAX_WG_OBS_COLS / 2;
-        int type_id = mobs->type_id[level][i];
+        int type_id = MOB_TYPE(mc, level, i, mobs);
         int scatter_row;
         int scatter_col;
         if (!craftax_wg_scatter_index(
@@ -2399,8 +2531,8 @@ static __device__ inline void craftax_encode_mobs2_observation(
             && local_row < CRAFTAX_WG_OBS_ROWS
             && local_col >= 0
             && local_col < CRAFTAX_WG_OBS_COLS;
-        int world_row = mobs->position[level][i][0];
-        int world_col = mobs->position[level][i][1];
+        int world_row = MOB_POS(mc, level, i, 0, mobs);
+        int world_col = MOB_POS(mc, level, i, 1, mobs);
         bool in_bounds = world_row >= 0
             && world_row < CRAFTAX_WG_MAP_SIZE
             && world_col >= 0
@@ -2411,7 +2543,7 @@ static __device__ inline void craftax_encode_mobs2_observation(
             + mob_class_index * CRAFTAX_WG_NUM_MOB_TYPES
             + type_id;
         obs[obs_base + channel] =
-            mobs->mask[level][i] && on_screen && visible ? 1.0f : 0.0f;
+            MOB_MASK(mc, level, i, mobs) && on_screen && visible ? 1.0f : 0.0f;
     }
 }
 
@@ -2436,33 +2568,33 @@ static __device__ inline void craftax_write_binary_bits(
 
 static __device__ inline void craftax_encode_mobs3_binary(
     const CraftaxWorldState* state,
-    const CraftaxWGMobs3* mobs,
+    const void* mobs, int mc,
     int mob_class_index,
     int channels_per_cell,
     int mob_bits_offset,
     float* obs
 ) {
-    int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     for (int i = 0; i < 3; i++) {
-        int type_id = mobs->type_id[level][i];
+        int type_id = MOB_TYPE(mc, level, i, mobs);
         if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-            || !mobs->mask[level][i]) {
+            || !MOB_MASK(mc, level, i, mobs)) {
             continue;
         }
 
-        int local_row = mobs->position[level][i][0]
-            - state->player_position[0]
+        int local_row = MOB_POS(mc, level, i, 0, mobs)
+            - CF2(player_position, 0, state)
             + CRAFTAX_WG_OBS_ROWS / 2;
-        int local_col = mobs->position[level][i][1]
-            - state->player_position[1]
+        int local_col = MOB_POS(mc, level, i, 1, mobs)
+            - CF2(player_position, 1, state)
             + CRAFTAX_WG_OBS_COLS / 2;
         if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
             || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
             continue;
         }
 
-        int world_row = mobs->position[level][i][0];
-        int world_col = mobs->position[level][i][1];
+        int world_row = MOB_POS(mc, level, i, 0, mobs);
+        int world_col = MOB_POS(mc, level, i, 1, mobs);
         if (world_row < 0 || world_row >= CRAFTAX_WG_MAP_SIZE
             || world_col < 0 || world_col >= CRAFTAX_WG_MAP_SIZE
             || state->light_map[level][world_row][world_col] <= 12) {
@@ -2481,33 +2613,33 @@ static __device__ inline void craftax_encode_mobs3_binary(
 
 static __device__ inline void craftax_encode_mobs2_binary(
     const CraftaxWorldState* state,
-    const CraftaxWGMobs2* mobs,
+    const void* mobs, int mc,
     int mob_class_index,
     int channels_per_cell,
     int mob_bits_offset,
     float* obs
 ) {
-    int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     for (int i = 0; i < 2; i++) {
-        int type_id = mobs->type_id[level][i];
+        int type_id = MOB_TYPE(mc, level, i, mobs);
         if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-            || !mobs->mask[level][i]) {
+            || !MOB_MASK(mc, level, i, mobs)) {
             continue;
         }
 
-        int local_row = mobs->position[level][i][0]
-            - state->player_position[0]
+        int local_row = MOB_POS(mc, level, i, 0, mobs)
+            - CF2(player_position, 0, state)
             + CRAFTAX_WG_OBS_ROWS / 2;
-        int local_col = mobs->position[level][i][1]
-            - state->player_position[1]
+        int local_col = MOB_POS(mc, level, i, 1, mobs)
+            - CF2(player_position, 1, state)
             + CRAFTAX_WG_OBS_COLS / 2;
         if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
             || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
             continue;
         }
 
-        int world_row = mobs->position[level][i][0];
-        int world_col = mobs->position[level][i][1];
+        int world_row = MOB_POS(mc, level, i, 0, mobs);
+        int world_col = MOB_POS(mc, level, i, 1, mobs);
         if (world_row < 0 || world_row >= CRAFTAX_WG_MAP_SIZE
             || world_col < 0 || world_col >= CRAFTAX_WG_MAP_SIZE
             || state->light_map[level][world_row][world_col] <= 12) {
@@ -2529,9 +2661,9 @@ static __device__ inline void craftax_encode_map_base_observation(
     float* obs
 ) {
     const int channels = CRAFTAX_WG_BINARY_CHANNELS_PER_CELL;
-    const int top = state->player_position[0] - CRAFTAX_WG_OBS_ROWS / 2;
-    const int left = state->player_position[1] - CRAFTAX_WG_OBS_COLS / 2;
-    const int level = state->player_level;
+    const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
+    const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
+    const int level = CF(player_level, state);
     const float* empty_cell = CRAFTAX_WG_EMPTY_CELL_TEMPLATE;
 
     for (int row = 0; row < CRAFTAX_WG_OBS_ROWS; row++) {
@@ -2559,9 +2691,9 @@ static __device__ inline void craftax_encode_packed_map_base_observation(
     float* obs
 ) {
     const int channels = CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
-    const int top = state->player_position[0] - CRAFTAX_WG_OBS_ROWS / 2;
-    const int left = state->player_position[1] - CRAFTAX_WG_OBS_COLS / 2;
-    const int level = state->player_level;
+    const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
+    const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
+    const int level = CF(player_level, state);
 
     memset(obs, 0, CRAFTAX_WG_PACKED_MAP_OBS_SIZE * sizeof(float));
     for (int row = 0; row < CRAFTAX_WG_OBS_ROWS; row++) {
@@ -2593,32 +2725,32 @@ static __device__ inline void craftax_clear_mob_channels_observation(float* obs)
 
 static __device__ inline void craftax_encode_mobs3_packed(
     const CraftaxWorldState* state,
-    const CraftaxWGMobs3* mobs,
+    const void* mobs, int mc,
     int mob_class_index,
     float* obs
 ) {
-    const int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    const int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     const int mob_slot_offset = 3 + mob_class_index;
     for (int i = 0; i < 3; i++) {
-        int type_id = mobs->type_id[level][i];
+        int type_id = MOB_TYPE(mc, level, i, mobs);
         if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-            || !mobs->mask[level][i]) {
+            || !MOB_MASK(mc, level, i, mobs)) {
             continue;
         }
 
-        int local_row = mobs->position[level][i][0]
-            - state->player_position[0]
+        int local_row = MOB_POS(mc, level, i, 0, mobs)
+            - CF2(player_position, 0, state)
             + CRAFTAX_WG_OBS_ROWS / 2;
-        int local_col = mobs->position[level][i][1]
-            - state->player_position[1]
+        int local_col = MOB_POS(mc, level, i, 1, mobs)
+            - CF2(player_position, 1, state)
             + CRAFTAX_WG_OBS_COLS / 2;
         if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
             || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
             continue;
         }
 
-        int world_row = mobs->position[level][i][0];
-        int world_col = mobs->position[level][i][1];
+        int world_row = MOB_POS(mc, level, i, 0, mobs);
+        int world_col = MOB_POS(mc, level, i, 1, mobs);
         if (world_row < 0 || world_row >= CRAFTAX_WG_MAP_SIZE
             || world_col < 0 || world_col >= CRAFTAX_WG_MAP_SIZE
             || state->light_map[level][world_row][world_col] <= 12) {
@@ -2633,32 +2765,32 @@ static __device__ inline void craftax_encode_mobs3_packed(
 
 static __device__ inline void craftax_encode_mobs2_packed(
     const CraftaxWorldState* state,
-    const CraftaxWGMobs2* mobs,
+    const void* mobs, int mc,
     int mob_class_index,
     float* obs
 ) {
-    const int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    const int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     const int mob_slot_offset = 3 + mob_class_index;
     for (int i = 0; i < 2; i++) {
-        int type_id = mobs->type_id[level][i];
+        int type_id = MOB_TYPE(mc, level, i, mobs);
         if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-            || !mobs->mask[level][i]) {
+            || !MOB_MASK(mc, level, i, mobs)) {
             continue;
         }
 
-        int local_row = mobs->position[level][i][0]
-            - state->player_position[0]
+        int local_row = MOB_POS(mc, level, i, 0, mobs)
+            - CF2(player_position, 0, state)
             + CRAFTAX_WG_OBS_ROWS / 2;
-        int local_col = mobs->position[level][i][1]
-            - state->player_position[1]
+        int local_col = MOB_POS(mc, level, i, 1, mobs)
+            - CF2(player_position, 1, state)
             + CRAFTAX_WG_OBS_COLS / 2;
         if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
             || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
             continue;
         }
 
-        int world_row = mobs->position[level][i][0];
-        int world_col = mobs->position[level][i][1];
+        int world_row = MOB_POS(mc, level, i, 0, mobs);
+        int world_col = MOB_POS(mc, level, i, 1, mobs);
         if (world_row < 0 || world_row >= CRAFTAX_WG_MAP_SIZE
             || world_col < 0 || world_col >= CRAFTAX_WG_MAP_SIZE
             || state->light_map[level][world_row][world_col] <= 12) {
@@ -2675,11 +2807,11 @@ static __device__ inline void craftax_encode_packed_mobs_observation(
     const CraftaxWorldState* state,
     float* obs
 ) {
-    craftax_encode_mobs3_packed(state, &state->melee_mobs, 0, obs);
-    craftax_encode_mobs3_packed(state, &state->passive_mobs, 1, obs);
-    craftax_encode_mobs2_packed(state, &state->ranged_mobs, 2, obs);
-    craftax_encode_mobs3_packed(state, &state->mob_projectiles, 3, obs);
-    craftax_encode_mobs3_packed(state, &state->player_projectiles, 4, obs);
+    craftax_encode_mobs3_packed(state, state, 0, 0, obs);
+    craftax_encode_mobs3_packed(state, state, 1, 1, obs);
+    craftax_encode_mobs2_packed(state, state, 2, 2, obs);
+    craftax_encode_mobs3_packed(state, state, 3, 3, obs);
+    craftax_encode_mobs3_packed(state, state, 4, 4, obs);
 }
 
 static __device__ inline void craftax_encode_mobs_observation(
@@ -2691,7 +2823,7 @@ static __device__ inline void craftax_encode_mobs_observation(
 
     craftax_encode_mobs3_binary(
         state,
-        &state->melee_mobs,
+        state, 0,
         0,
         channels,
         mob_bits_offset,
@@ -2699,7 +2831,7 @@ static __device__ inline void craftax_encode_mobs_observation(
     );
     craftax_encode_mobs3_binary(
         state,
-        &state->passive_mobs,
+        state, 1,
         1,
         channels,
         mob_bits_offset,
@@ -2707,7 +2839,7 @@ static __device__ inline void craftax_encode_mobs_observation(
     );
     craftax_encode_mobs2_binary(
         state,
-        &state->ranged_mobs,
+        state, 2,
         2,
         channels,
         mob_bits_offset,
@@ -2715,7 +2847,7 @@ static __device__ inline void craftax_encode_mobs_observation(
     );
     craftax_encode_mobs3_binary(
         state,
-        &state->mob_projectiles,
+        state, 3,
         3,
         channels,
         mob_bits_offset,
@@ -2723,7 +2855,7 @@ static __device__ inline void craftax_encode_mobs_observation(
     );
     craftax_encode_mobs3_binary(
         state,
-        &state->player_projectiles,
+        state, 4,
         4,
         channels,
         mob_bits_offset,
@@ -2736,57 +2868,57 @@ static __device__ inline void craftax_encode_scalar_observation_tail_at(
     float* obs,
     int index
 ) {
-    const int level = state->player_level;
-    obs[index++] = sqrtf((float)state->inventory.wood) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.stone) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.coal) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.iron) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.diamond) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.sapphire) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.ruby) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.sapling) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.torches) * (1.0f / 10.0f);
-    obs[index++] = sqrtf((float)state->inventory.arrows) * (1.0f / 10.0f);
-    obs[index++] = (float)state->inventory.books * (1.0f / 2.0f);
-    obs[index++] = (float)state->inventory.pickaxe * (1.0f / 4.0f);
-    obs[index++] = (float)state->inventory.sword * (1.0f / 4.0f);
-    obs[index++] = (float)state->sword_enchantment;
-    obs[index++] = (float)state->bow_enchantment;
-    obs[index++] = (float)state->inventory.bow;
+    const int level = CF(player_level, state);
+    obs[index++] = sqrtf((float)CF(inv_wood, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_stone, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_coal, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_iron, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_diamond, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_sapphire, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_ruby, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_sapling, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_torches, state)) * (1.0f / 10.0f);
+    obs[index++] = sqrtf((float)CF(inv_arrows, state)) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(inv_books, state) * (1.0f / 2.0f);
+    obs[index++] = (float)CF(inv_pickaxe, state) * (1.0f / 4.0f);
+    obs[index++] = (float)CF(inv_sword, state) * (1.0f / 4.0f);
+    obs[index++] = (float)CF(sword_enchantment, state);
+    obs[index++] = (float)CF(bow_enchantment, state);
+    obs[index++] = (float)CF(inv_bow, state);
 
     for (int i = 0; i < 6; i++) {
-        obs[index++] = sqrtf((float)state->inventory.potions[i]) * (1.0f / 10.0f);
+        obs[index++] = sqrtf((float)CF2(inv_potions, i, state)) * (1.0f / 10.0f);
     }
 
-    obs[index++] = state->player_health * (1.0f / 10.0f);
-    obs[index++] = (float)state->player_food * (1.0f / 10.0f);
-    obs[index++] = (float)state->player_drink * (1.0f / 10.0f);
-    obs[index++] = (float)state->player_energy * (1.0f / 10.0f);
-    obs[index++] = (float)state->player_mana * (1.0f / 10.0f);
-    obs[index++] = (float)state->player_xp * (1.0f / 10.0f);
-    obs[index++] = (float)state->player_dexterity * (1.0f / 10.0f);
-    obs[index++] = (float)state->player_strength * (1.0f / 10.0f);
-    obs[index++] = (float)state->player_intelligence * (1.0f / 10.0f);
+    obs[index++] = CF(player_health, state) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(player_food, state) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(player_drink, state) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(player_energy, state) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(player_mana, state) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(player_xp, state) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(player_dexterity, state) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(player_strength, state) * (1.0f / 10.0f);
+    obs[index++] = (float)CF(player_intelligence, state) * (1.0f / 10.0f);
 
-    int direction_index = state->player_direction - 1;
+    int direction_index = CF(player_direction, state) - 1;
     for (int i = 0; i < 4; i++) {
         obs[index++] = i == direction_index ? 1.0f : 0.0f;
     }
 
     for (int i = 0; i < 4; i++) {
-        obs[index++] = (float)state->inventory.armour[i] * (1.0f / 2.0f);
+        obs[index++] = (float)CF2(inv_armour, i, state) * (1.0f / 2.0f);
     }
     for (int i = 0; i < 4; i++) {
-        obs[index++] = (float)state->armour_enchantments[i];
+        obs[index++] = (float)CF2(armour_enchantments, i, state);
     }
 
-    obs[index++] = state->light_level;
-    obs[index++] = state->is_sleeping ? 1.0f : 0.0f;
-    obs[index++] = state->is_resting ? 1.0f : 0.0f;
-    obs[index++] = state->learned_spells[0] ? 1.0f : 0.0f;
-    obs[index++] = state->learned_spells[1] ? 1.0f : 0.0f;
-    obs[index++] = (float)state->player_level * (1.0f / 10.0f);
-    obs[index++] = state->monsters_killed[level] >= CRAFTAX_WG_MONSTERS_KILLED_TO_CLEAR_LEVEL ? 1.0f : 0.0f;
+    obs[index++] = CF(light_level, state);
+    obs[index++] = CF(is_sleeping, state) ? 1.0f : 0.0f;
+    obs[index++] = CF(is_resting, state) ? 1.0f : 0.0f;
+    obs[index++] = CF2(learned_spells, 0, state) ? 1.0f : 0.0f;
+    obs[index++] = CF2(learned_spells, 1, state) ? 1.0f : 0.0f;
+    obs[index++] = (float)CF(player_level, state) * (1.0f / 10.0f);
+    obs[index++] = CF2(monsters_killed, level, state) >= CRAFTAX_WG_MONSTERS_KILLED_TO_CLEAR_LEVEL ? 1.0f : 0.0f;
     obs[index++] = craftax_wg_is_boss_vulnerable(state) ? 1.0f : 0.0f;
 }
 
@@ -2811,9 +2943,9 @@ static __device__ inline void craftax_encode_compact_map_base_observation(
     uint8_t* obs
 ) {
     const int channels = CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
-    const int top = state->player_position[0] - CRAFTAX_WG_OBS_ROWS / 2;
-    const int left = state->player_position[1] - CRAFTAX_WG_OBS_COLS / 2;
-    const int level = state->player_level;
+    const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
+    const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
+    const int level = CF(player_level, state);
 
     memset(obs, 0, CRAFTAX_WG_PACKED_MAP_OBS_SIZE);
     for (int row = 0; row < CRAFTAX_WG_OBS_ROWS; row++) {
@@ -2834,32 +2966,32 @@ static __device__ inline void craftax_encode_compact_map_base_observation(
 
 static __device__ inline void craftax_encode_mobs3_compact(
     const CraftaxWorldState* state,
-    const CraftaxWGMobs3* mobs,
+    const void* mobs, int mc,
     int mob_class_index,
     uint8_t* obs
 ) {
-    const int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    const int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     const int mob_slot_offset = 3 + mob_class_index;
     for (int i = 0; i < 3; i++) {
-        int type_id = mobs->type_id[level][i];
+        int type_id = MOB_TYPE(mc, level, i, mobs);
         if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-            || !mobs->mask[level][i]) {
+            || !MOB_MASK(mc, level, i, mobs)) {
             continue;
         }
 
-        int local_row = mobs->position[level][i][0]
-            - state->player_position[0]
+        int local_row = MOB_POS(mc, level, i, 0, mobs)
+            - CF2(player_position, 0, state)
             + CRAFTAX_WG_OBS_ROWS / 2;
-        int local_col = mobs->position[level][i][1]
-            - state->player_position[1]
+        int local_col = MOB_POS(mc, level, i, 1, mobs)
+            - CF2(player_position, 1, state)
             + CRAFTAX_WG_OBS_COLS / 2;
         if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
             || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
             continue;
         }
 
-        int world_row = mobs->position[level][i][0];
-        int world_col = mobs->position[level][i][1];
+        int world_row = MOB_POS(mc, level, i, 0, mobs);
+        int world_col = MOB_POS(mc, level, i, 1, mobs);
         if (world_row < 0 || world_row >= CRAFTAX_WG_MAP_SIZE
             || world_col < 0 || world_col >= CRAFTAX_WG_MAP_SIZE
             || state->light_map[level][world_row][world_col] <= 12) {
@@ -2874,32 +3006,32 @@ static __device__ inline void craftax_encode_mobs3_compact(
 
 static __device__ inline void craftax_encode_mobs2_compact(
     const CraftaxWorldState* state,
-    const CraftaxWGMobs2* mobs,
+    const void* mobs, int mc,
     int mob_class_index,
     uint8_t* obs
 ) {
-    const int level = craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
+    const int level = craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
     const int mob_slot_offset = 3 + mob_class_index;
     for (int i = 0; i < 2; i++) {
-        int type_id = mobs->type_id[level][i];
+        int type_id = MOB_TYPE(mc, level, i, mobs);
         if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-            || !mobs->mask[level][i]) {
+            || !MOB_MASK(mc, level, i, mobs)) {
             continue;
         }
 
-        int local_row = mobs->position[level][i][0]
-            - state->player_position[0]
+        int local_row = MOB_POS(mc, level, i, 0, mobs)
+            - CF2(player_position, 0, state)
             + CRAFTAX_WG_OBS_ROWS / 2;
-        int local_col = mobs->position[level][i][1]
-            - state->player_position[1]
+        int local_col = MOB_POS(mc, level, i, 1, mobs)
+            - CF2(player_position, 1, state)
             + CRAFTAX_WG_OBS_COLS / 2;
         if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
             || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
             continue;
         }
 
-        int world_row = mobs->position[level][i][0];
-        int world_col = mobs->position[level][i][1];
+        int world_row = MOB_POS(mc, level, i, 0, mobs);
+        int world_col = MOB_POS(mc, level, i, 1, mobs);
         if (world_row < 0 || world_row >= CRAFTAX_WG_MAP_SIZE
             || world_col < 0 || world_col >= CRAFTAX_WG_MAP_SIZE
             || state->light_map[level][world_row][world_col] <= 12) {
@@ -2920,11 +3052,11 @@ static __device__ inline void craftax_encode_compact_observation(
     uint8_t* obs
 ) {
     craftax_encode_compact_map_base_observation(state, obs);
-    craftax_encode_mobs3_compact(state, &state->melee_mobs, 0, obs);
-    craftax_encode_mobs3_compact(state, &state->passive_mobs, 1, obs);
-    craftax_encode_mobs2_compact(state, &state->ranged_mobs, 2, obs);
-    craftax_encode_mobs3_compact(state, &state->mob_projectiles, 3, obs);
-    craftax_encode_mobs3_compact(state, &state->player_projectiles, 4, obs);
+    craftax_encode_mobs3_compact(state, state, 0, 0, obs);
+    craftax_encode_mobs3_compact(state, state, 1, 1, obs);
+    craftax_encode_mobs2_compact(state, state, 2, 2, obs);
+    craftax_encode_mobs3_compact(state, state, 3, 3, obs);
+    craftax_encode_mobs3_compact(state, state, 4, 4, obs);
 
     float tail[CRAFTAX_WG_INVENTORY_OBS_SIZE];
     craftax_encode_scalar_observation_tail_at(state, tail, 0);
@@ -3309,65 +3441,21 @@ typedef struct CraftaxMobs2 {
 
 typedef struct CraftaxState {
     // === Hot data (accessed every step) ===
-    int32_t player_position[2];
-    int32_t player_level;
-    int32_t player_direction;
 
-    float player_health;
-    int32_t player_food;
-    int32_t player_drink;
-    int32_t player_energy;
-    int32_t player_mana;
-    bool is_sleeping;
-    bool is_resting;
 
-    float player_recover;
-    float player_hunger;
-    float player_thirst;
-    float player_fatigue;
-    float player_recover_mana;
 
-    int32_t player_xp;
-    int32_t player_dexterity;
-    int32_t player_strength;
-    int32_t player_intelligence;
 
-    CraftaxInventory inventory;
 
-    CraftaxMobs3 melee_mobs;
-    CraftaxMobs3 passive_mobs;
-    CraftaxMobs2 ranged_mobs;
 
-    CraftaxMobs3 mob_projectiles;
-    int32_t mob_projectile_directions[CRAFTAX_NUM_LEVELS][CRAFTAX_MAX_MOB_PROJECTILES][2];
-    CraftaxMobs3 player_projectiles;
-    int32_t player_projectile_directions[CRAFTAX_NUM_LEVELS][CRAFTAX_MAX_PLAYER_PROJECTILES][2];
 
-    int32_t growing_plants_positions[CRAFTAX_MAX_GROWING_PLANTS][2];
-    int32_t growing_plants_age[CRAFTAX_MAX_GROWING_PLANTS];
-    bool growing_plants_mask[CRAFTAX_MAX_GROWING_PLANTS];
 
     int32_t potion_mapping[6];
-    bool learned_spells[2];
 
-    int32_t sword_enchantment;
-    int32_t bow_enchantment;
-    int32_t armour_enchantments[4];
 
-    int32_t boss_progress;
-    int32_t boss_timesteps_to_spawn_this_round;
 
-    float light_level;
-    bool achievements[CRAFTAX_NUM_ACHIEVEMENTS];
-    uint32_t state_rng[2];
-    int32_t timestep;
     int32_t fractal_noise_angles[4];
 
     // === Medium-hot bitmaps, read during mob updates, spawn scans, encode_obs ===
-    uint64_t mob_bits[CRAFTAX_NUM_LEVELS][CRAFTAX_MAP_SIZE];
-    uint64_t spawn_all_bits[CRAFTAX_NUM_LEVELS][CRAFTAX_MAP_SIZE];
-    uint64_t spawn_grave_bits[CRAFTAX_NUM_LEVELS][CRAFTAX_MAP_SIZE];
-    uint64_t spawn_water_bits[CRAFTAX_NUM_LEVELS][CRAFTAX_MAP_SIZE];
 
     // === Cold data (large maps, scattered access) ===
     uint8_t map[CRAFTAX_NUM_LEVELS][CRAFTAX_MAP_SIZE][CRAFTAX_MAP_SIZE];
@@ -3376,12 +3464,9 @@ typedef struct CraftaxState {
 
     int32_t down_ladders[CRAFTAX_NUM_LEVELS][2];
     int32_t up_ladders[CRAFTAX_NUM_LEVELS][2];
-    bool chests_opened[CRAFTAX_NUM_LEVELS];
-    int32_t monsters_killed[CRAFTAX_NUM_LEVELS];
 
     // Mirrors CraftaxWorldState: lazy floor generation bookkeeping.
     uint32_t lazy_floor_keys[CRAFTAX_NUM_LEVELS][2];
-    uint32_t lazy_floors_pending;
 } CraftaxState;
 
 typedef char CraftaxStateMatchesWorldState[
@@ -3418,14 +3503,14 @@ static __device__ inline void craftax_refresh_spawn_bits_cell(
     uint64_t bit = 1ULL << col;
     uint8_t block = state->map[level][row][col];
 
-    state->spawn_all_bits[level][row] =
-        (state->spawn_all_bits[level][row] & ~bit)
+    CF_BITS(spawn_all_bits, level, row, state) =
+        (CF_BITS(spawn_all_bits, level, row, state) & ~bit)
         | ((0ULL - craftax_spawn_all_bit(block)) & bit);
-    state->spawn_grave_bits[level][row] =
-        (state->spawn_grave_bits[level][row] & ~bit)
+    CF_BITS(spawn_grave_bits, level, row, state) =
+        (CF_BITS(spawn_grave_bits, level, row, state) & ~bit)
         | ((0ULL - craftax_spawn_grave_bit(block)) & bit);
-    state->spawn_water_bits[level][row] =
-        (state->spawn_water_bits[level][row] & ~bit)
+    CF_BITS(spawn_water_bits, level, row, state) =
+        (CF_BITS(spawn_water_bits, level, row, state) & ~bit)
         | ((0ULL - craftax_spawn_water_bit(block)) & bit);
 }
 
@@ -3455,9 +3540,9 @@ static __device__ inline void craftax_refresh_spawn_bits_level(
             grave_bits |= (0ULL - craftax_spawn_grave_bit(block)) & bit;
             water_bits |= (0ULL - craftax_spawn_water_bit(block)) & bit;
         }
-        state->spawn_all_bits[level][row] = all_bits;
-        state->spawn_grave_bits[level][row] = grave_bits;
-        state->spawn_water_bits[level][row] = water_bits;
+        CF_BITS(spawn_all_bits, level, row, state) = all_bits;
+        CF_BITS(spawn_grave_bits, level, row, state) = grave_bits;
+        CF_BITS(spawn_water_bits, level, row, state) = water_bits;
     }
 }
 
@@ -3469,13 +3554,13 @@ static __device__ inline void craftax_ensure_floor_generated(
 ) {
     if (level < 0 || level >= CRAFTAX_NUM_LEVELS) return;
     uint32_t bit = 1u << (uint32_t)level;
-    if (!(state->lazy_floors_pending & bit)) return;
+    if (!(CF(lazy_floors_pending, state) & bit)) return;
     CraftaxThreefryKey key = {{
         state->lazy_floor_keys[level][0],
         state->lazy_floor_keys[level][1],
     }};
     craftax_generate_floor_from_key(key, level, (CraftaxWorldState*)(void*)state);
-    state->lazy_floors_pending &= ~bit;
+    CF(lazy_floors_pending, state) &= ~bit;
     craftax_refresh_spawn_bits_level(state, level);
 }
 
@@ -3644,7 +3729,7 @@ static __device__ inline void craftax_generate_state_from_world_key(
     // Deferred floors keep zeroed spawn bits; craftax_ensure_floor_generated
     // refreshes them when the floor materializes.
     for (int32_t level = 0; level < CRAFTAX_NUM_LEVELS; level++) {
-        if (out->lazy_floors_pending & (1u << (uint32_t)level)) continue;
+        if (CF(lazy_floors_pending, out) & (1u << (uint32_t)level)) continue;
         craftax_refresh_spawn_bits_level(out, level);
     }
 }
@@ -4118,6 +4203,13 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
             }
         }
     }
+    // Levels never generated during the dying episode still hold their
+    // post-reset values (mask/pos/type/cd/bits 0, health 1.0f, dirs 1), so
+    // only generated levels (prev pending bit clear) need re-clearing.
+    const uint32_t cf_gen_mask =
+        ~CF(lazy_floors_pending, out) & 0x1FFu;
+    __syncwarp();
+    cf_soa_zero_env_warp_lazy(out, lane, cf_gen_mask);
     __syncwarp();
 
     CraftaxThreefryKey smooth_split[7];
@@ -4149,22 +4241,14 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
             out->lazy_floor_keys[level][0] = dungeon_split[i + 1].word[0];
             out->lazy_floor_keys[level][1] = dungeon_split[i + 1].word[1];
         }
-        out->lazy_floors_pending = 0x1FEu;  // floors 1..8 deferred
-
-        craftax_init_empty_mobs3(&out->melee_mobs);
-        craftax_init_empty_mobs3(&out->passive_mobs);
-        craftax_init_empty_mobs2(&out->ranged_mobs);
-        craftax_init_empty_mobs3(&out->mob_projectiles);
-        craftax_init_empty_mobs3(&out->player_projectiles);
-        for (int level = 0; level < CRAFTAX_WG_NUM_LEVELS; level++) {
-            for (int projectile = 0; projectile < CRAFTAX_WG_MAX_MOB_PROJECTILES; projectile++) {
-                out->mob_projectile_directions[level][projectile][0] = 1;
-                out->mob_projectile_directions[level][projectile][1] = 1;
-            }
-            for (int projectile = 0; projectile < CRAFTAX_WG_MAX_PLAYER_PROJECTILES; projectile++) {
-                out->player_projectile_directions[level][projectile][0] = 1;
-                out->player_projectile_directions[level][projectile][1] = 1;
-            }
+        CF(lazy_floors_pending, out) = 0x1FEu;  // floors 1..8 deferred
+    }
+    // warp-distributed: same lane-per-entry stride as the zero pass above
+    cf_init_empty_mobs_warp(out, lane, cf_gen_mask);
+    for (int j = (int)lane; j < 54; j += 32) {
+        if (((cf_gen_mask >> (j / 6)) & 1u) != 0u) {
+            CF2(mob_projectile_directions, j, out) = 1;
+            CF2(player_projectile_directions, j, out) = 1;
         }
     }
 
@@ -4175,24 +4259,24 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
     (void)rng;
     if (lane == 0) {
         craftax_permutation_6(potion_key, out->potion_mapping);
-        out->state_rng[0] = state_key.word[0];
-        out->state_rng[1] = state_key.word[1];
+        CF2(state_rng, 0, out) = state_key.word[0];
+        CF2(state_rng, 1, out) = state_key.word[1];
 
-        out->monsters_killed[0] = 10;
-        out->player_position[0] = CRAFTAX_WG_MAP_SIZE / 2;
-        out->player_position[1] = CRAFTAX_WG_MAP_SIZE / 2;
-        out->player_level = 0;
-        out->player_direction = CRAFTAX_WG_ACTION_UP;
-        out->player_health = 9.0f;
-        out->player_food = 9;
-        out->player_drink = 9;
-        out->player_energy = 9;
-        out->player_mana = 9;
-        out->player_dexterity = 1;
-        out->player_strength = 1;
-        out->player_intelligence = 1;
-        out->boss_timesteps_to_spawn_this_round = CRAFTAX_WG_BOSS_FIGHT_SPAWN_TURNS;
-        out->light_level = craftax_calculate_initial_light_level();
+        CF2(monsters_killed, 0, out) = 10;
+        CF2(player_position, 0, out) = CRAFTAX_WG_MAP_SIZE / 2;
+        CF2(player_position, 1, out) = CRAFTAX_WG_MAP_SIZE / 2;
+        CF(player_level, out) = 0;
+        CF(player_direction, out) = CRAFTAX_WG_ACTION_UP;
+        CF(player_health, out) = 9.0f;
+        CF(player_food, out) = 9;
+        CF(player_drink, out) = 9;
+        CF(player_energy, out) = 9;
+        CF(player_mana, out) = 9;
+        CF(player_dexterity, out) = 1;
+        CF(player_strength, out) = 1;
+        CF(player_intelligence, out) = 1;
+        CF(boss_timesteps_to_spawn_this_round, out) = CRAFTAX_WG_BOSS_FIGHT_SPAWN_TURNS;
+        CF(light_level, out) = craftax_calculate_initial_light_level();
     }
     __syncwarp();
 
@@ -4208,9 +4292,9 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
             grave_bits |= (0ULL - craftax_spawn_grave_bit(block)) & bit;
             water_bits |= (0ULL - craftax_spawn_water_bit(block)) & bit;
         }
-        state->spawn_all_bits[0][row] = all_bits;
-        state->spawn_grave_bits[0][row] = grave_bits;
-        state->spawn_water_bits[0][row] = water_bits;
+        CF_BITS(spawn_all_bits, 0, row, state) = all_bits;
+        CF_BITS(spawn_grave_bits, 0, row, state) = grave_bits;
+        CF_BITS(spawn_water_bits, 0, row, state) = water_bits;
     }
     __syncwarp();
 }
@@ -4251,8 +4335,8 @@ static __device__ inline float craftax_calculate_light_level_native(int32_t time
 }
 
 static __device__ inline bool craftax_is_game_over_native(const CraftaxState* state) {
-    return state->timestep >= CRAFTAX_DEFAULT_MAX_TIMESTEPS
-        || state->player_health <= 0.0f;
+    return CF(timestep, state) >= CRAFTAX_DEFAULT_MAX_TIMESTEPS
+        || CF(player_health, state) <= 0.0f;
 }
 
 static __device__ inline void craftax_copy_achievements_to_env(
@@ -4260,7 +4344,7 @@ static __device__ inline void craftax_copy_achievements_to_env(
     const CraftaxState* state
 ) {
     for (int i = 0; i < CRAFTAX_NUM_ACHIEVEMENTS; i++) {
-        env->achievements[i] = state->achievements[i] ? 1.0f : 0.0f;
+        env->achievements[i] = CF2(achievements, i, state) ? 1.0f : 0.0f;
     }
 }
 
@@ -4286,11 +4370,13 @@ static __device__ float craftax_gameplay_step_native(
 ) {
     CRAFTAX_PROFILE_START();
     bool init_achievements[CRAFTAX_NUM_ACHIEVEMENTS];
-    memcpy(init_achievements, state->achievements, sizeof(init_achievements));
-    float init_health = state->player_health;
+    for (int i = 0; i < CRAFTAX_NUM_ACHIEVEMENTS; i++) {
+        init_achievements[i] = CF2(achievements, i, state);
+    }
+    float init_health = CF(player_health, state);
 
-    action = state->is_sleeping ? CRAFTAX_ACTION_NOOP : action;
-    action = state->is_resting ? CRAFTAX_ACTION_NOOP : action;
+    action = CF(is_sleeping, state) ? CRAFTAX_ACTION_NOOP : action;
+    action = CF(is_resting, state) ? CRAFTAX_ACTION_NOOP : action;
 
     CRAFTAX_PROFILE_ZONE(0);
     craftax_change_floor_native(state, action);
@@ -4345,17 +4431,17 @@ static __device__ float craftax_gameplay_step_native(
     CRAFTAX_PROFILE_ZONE(10);
     float reward = 0.0f;
     for (int i = 0; i < CRAFTAX_NUM_ACHIEVEMENTS; i++) {
-        int32_t delta = (int32_t)state->achievements[i]
+        int32_t delta = (int32_t)CF2(achievements, i, state)
             - (int32_t)init_achievements[i];
         reward += (float)delta * CRAFTAX_ACHIEVEMENT_REWARD_MAP[i];
     }
-    reward += (state->player_health - init_health) * 0.1f;
+    reward += (CF(player_health, state) - init_health) * 0.1f;
 
     subkey = craftax_step_native_next_key(&rng);
-    state->timestep += 1;
-    state->light_level = craftax_calculate_light_level_native(state->timestep);
-    state->state_rng[0] = subkey.word[0];
-    state->state_rng[1] = subkey.word[1];
+    CF(timestep, state) += 1;
+    CF(light_level, state) = craftax_calculate_light_level_native(CF(timestep, state));
+    CF2(state_rng, 0, state) = subkey.word[0];
+    CF2(state_rng, 1, state) = subkey.word[1];
     CRAFTAX_PROFILE_END(10);
 
     return reward;
@@ -4628,9 +4714,9 @@ static __device__ void c_render(Craftax* env) {
     if (IsKeyDown(KEY_ESCAPE)) exit(0);
 
     CraftaxState* s = env->state;
-    int lvl = s->player_level;
-    int pr = s->player_position[0];
-    int pc = s->player_position[1];
+    int lvl = CF(player_level, s);
+    int pr = CF2(player_position, 0, s);
+    int pc = CF2(player_position, 1, s);
     int half_r = CRAFTAX_RENDER_ROWS / 2;
     int half_c = CRAFTAX_RENDER_COLS / 2;
 
@@ -4663,12 +4749,12 @@ static __device__ void c_render(Craftax* env) {
     }
 
     // player in center
-    int pid = craftax_player_tex_id(s->player_direction, s->is_sleeping);
+    int pid = craftax_player_tex_id(CF(player_direction, s), CF(is_sleeping, s));
     craftax_draw_tile(pid, half_c * CRAFTAX_TEX_DRAW_PX, half_r * CRAFTAX_TEX_DRAW_PX, 1.0f);
 
     // night dim overlay
-    if (s->light_level < 1.0f) {
-        unsigned char a = (unsigned char)((1.0f - s->light_level) * 140.0f);
+    if (CF(light_level, s) < 1.0f) {
+        unsigned char a = (unsigned char)((1.0f - CF(light_level, s)) * 140.0f);
         DrawRectangle(0, 0, view_w, view_h, (Color){0, 0, 40, a});
     }
 
@@ -4676,15 +4762,15 @@ static __device__ void c_render(Craftax* env) {
     int hud_y = view_h;
     DrawRectangle(0, hud_y, view_w, hud_h, (Color){20, 20, 20, 255});
     DrawText(TextFormat("HP:%.0f  F:%d  D:%d  E:%d  M:%d  L:%d  t:%d",
-             s->player_health, s->player_food, s->player_drink,
-             s->player_energy, s->player_mana, s->player_level, s->timestep),
+             CF(player_health, s), CF(player_food, s), CF(player_drink, s),
+             CF(player_energy, s), CF(player_mana, s), CF(player_level, s), CF(timestep, s)),
              4, hud_y + 4, 14, WHITE);
     DrawText(TextFormat("XP:%d  DEX:%d  STR:%d  INT:%d  light:%.2f",
-             s->player_xp, s->player_dexterity, s->player_strength,
-             s->player_intelligence, s->light_level),
+             CF(player_xp, s), CF(player_dexterity, s), CF(player_strength, s),
+             CF(player_intelligence, s), CF(light_level, s)),
              4, hud_y + 22, 14, (Color){200, 200, 200, 255});
     int ach_count = 0;
-    for (int i = 0; i < CRAFTAX_NUM_ACHIEVEMENTS; i++) ach_count += s->achievements[i] ? 1 : 0;
+    for (int i = 0; i < CRAFTAX_NUM_ACHIEVEMENTS; i++) ach_count += CF2(achievements, i, s) ? 1 : 0;
     DrawText(TextFormat("achievements: %d / %d", ach_count, CRAFTAX_NUM_ACHIEVEMENTS),
              4, hud_y + 40, 14, (Color){180, 220, 180, 255});
     DrawText(TextFormat("ret:%.2f len:%d", env->episode_return_accum, env->episode_length_accum),
@@ -4743,31 +4829,31 @@ static __device__ inline float craftax_step_maxf32(float a, float b) {
 }
 
 static __device__ inline int32_t craftax_step_get_max_health(const CraftaxState* state) {
-    return 8 + state->player_strength;
+    return 8 + CF(player_strength, state);
 }
 
 static __device__ inline int32_t craftax_step_get_max_food(const CraftaxState* state) {
-    return 7 + 2 * state->player_dexterity;
+    return 7 + 2 * CF(player_dexterity, state);
 }
 
 static __device__ inline int32_t craftax_step_get_max_drink(const CraftaxState* state) {
-    return 7 + 2 * state->player_dexterity;
+    return 7 + 2 * CF(player_dexterity, state);
 }
 
 static __device__ inline int32_t craftax_step_get_max_energy(const CraftaxState* state) {
-    return 7 + 2 * state->player_dexterity;
+    return 7 + 2 * CF(player_dexterity, state);
 }
 
 static __device__ inline int32_t craftax_step_get_max_mana(const CraftaxState* state) {
-    return 6 + 3 * state->player_intelligence;
+    return 6 + 3 * CF(player_intelligence, state);
 }
 
 static __device__ inline bool craftax_step_is_fighting_boss(const CraftaxState* state) {
-    return state->player_level == CRAFTAX_NUM_LEVELS - 1;
+    return CF(player_level, state) == CRAFTAX_NUM_LEVELS - 1;
 }
 
 static __device__ inline bool craftax_step_has_beaten_boss(const CraftaxState* state) {
-    return state->boss_progress >= CRAFTAX_NUM_LEVELS - 1;
+    return CF(boss_progress, state) >= CRAFTAX_NUM_LEVELS - 1;
 }
 
 static __device__ inline void craftax_step_direction(int32_t action, int32_t direction[2]) {
@@ -4821,12 +4907,12 @@ static __device__ inline bool craftax_step_is_in_mob(
     int32_t row,
     int32_t col
 ) {
-    int32_t level = craftax_step_jax_index(state->player_level, CRAFTAX_NUM_LEVELS);
+    int32_t level = craftax_step_jax_index(CF(player_level, state), CRAFTAX_NUM_LEVELS);
     int32_t map_row = craftax_step_jax_index(row, CRAFTAX_MAP_SIZE);
     int32_t map_col = craftax_step_jax_index(col, CRAFTAX_MAP_SIZE);
-    bool player_here = state->player_position[0] == row
-        && state->player_position[1] == col;
-    return ((state->mob_bits[level][map_row] >> map_col) & 1ULL) || player_here;
+    bool player_here = CF2(player_position, 0, state) == row
+        && CF2(player_position, 1, state) == col;
+    return ((CF_BITS(mob_bits, level, map_row, state) >> map_col) & 1ULL) || player_here;
 }
 
 static __device__ inline bool craftax_step_valid_land_position(
@@ -4838,7 +4924,7 @@ static __device__ inline bool craftax_step_valid_land_position(
         && row < CRAFTAX_MAP_SIZE
         && col >= 0
         && col < CRAFTAX_MAP_SIZE;
-    int32_t level = craftax_step_jax_index(state->player_level, CRAFTAX_NUM_LEVELS);
+    int32_t level = craftax_step_jax_index(CF(player_level, state), CRAFTAX_NUM_LEVELS);
     int32_t map_row = craftax_step_jax_index(row, CRAFTAX_MAP_SIZE);
     int32_t map_col = craftax_step_jax_index(col, CRAFTAX_MAP_SIZE);
     int32_t block = state->map[level][map_row][map_col];
@@ -4861,8 +4947,8 @@ static __device__ inline void craftax_move_player_native(
     int32_t direction[2];
     craftax_step_direction(action, direction);
 
-    int32_t proposed_row = state->player_position[0] + direction[0];
-    int32_t proposed_col = state->player_position[1] + direction[1];
+    int32_t proposed_row = CF2(player_position, 0, state) + direction[0];
+    int32_t proposed_col = CF2(player_position, 1, state) + direction[1];
     bool valid_move = craftax_step_valid_land_position(
         state,
         proposed_row,
@@ -4870,11 +4956,11 @@ static __device__ inline void craftax_move_player_native(
     );
     valid_move = valid_move || god_mode;
 
-    state->player_position[0] += (int32_t)valid_move * direction[0];
-    state->player_position[1] += (int32_t)valid_move * direction[1];
+    CF2(player_position, 0, state) += (int32_t)valid_move * direction[0];
+    CF2(player_position, 1, state) += (int32_t)valid_move * direction[1];
 
     bool is_new_direction = direction[0] != 0 || direction[1] != 0;
-    state->player_direction = state->player_direction * (1 - (int32_t)is_new_direction)
+    CF(player_direction, state) = CF(player_direction, state) * (1 - (int32_t)is_new_direction)
         + action * (int32_t)is_new_direction;
 }
 
@@ -4882,19 +4968,19 @@ static __device__ inline void craftax_update_plants_native(CraftaxState* state) 
     bool finished_growing_plants[CRAFTAX_MAX_GROWING_PLANTS];
 
     for (int plant = 0; plant < CRAFTAX_MAX_GROWING_PLANTS; plant++) {
-        state->growing_plants_age[plant] =
-            (state->growing_plants_age[plant] + 1)
-            * (int32_t)state->growing_plants_mask[plant];
-        finished_growing_plants[plant] = state->growing_plants_age[plant] >= 600;
+        CF2(growing_plants_age, plant, state) =
+            (CF2(growing_plants_age, plant, state) + 1)
+            * (int32_t)CF2(growing_plants_mask, plant, state);
+        finished_growing_plants[plant] = CF2(growing_plants_age, plant, state) >= 600;
     }
 
     for (int plant = 0; plant < CRAFTAX_MAX_GROWING_PLANTS; plant++) {
         int32_t row = craftax_step_jax_index(
-            state->growing_plants_positions[plant][0],
+            CF2(growing_plants_positions, (plant) * 2 + (0), state),
             CRAFTAX_MAP_SIZE
         );
         int32_t col = craftax_step_jax_index(
-            state->growing_plants_positions[plant][1],
+            CF2(growing_plants_positions, (plant) * 2 + (1), state),
             CRAFTAX_MAP_SIZE
         );
         int32_t new_block = finished_growing_plants[plant]
@@ -4905,10 +4991,10 @@ static __device__ inline void craftax_update_plants_native(CraftaxState* state) 
 }
 
 static __device__ inline void craftax_boss_logic_native(CraftaxState* state) {
-    state->achievements[CRAFTAX_ACH_DEFEAT_NECROMANCER] =
-        state->achievements[CRAFTAX_ACH_DEFEAT_NECROMANCER]
+    CF2(achievements, CRAFTAX_ACH_DEFEAT_NECROMANCER, state) =
+        CF2(achievements, CRAFTAX_ACH_DEFEAT_NECROMANCER, state)
         || craftax_step_has_beaten_boss(state);
-    state->boss_timesteps_to_spawn_this_round -=
+    CF(boss_timesteps_to_spawn_this_round, state) -=
         (int32_t)craftax_step_is_fighting_boss(state);
 }
 
@@ -4917,76 +5003,76 @@ static __device__ inline void craftax_level_up_attributes_native(
     int32_t action,
     int32_t max_attribute
 ) {
-    bool can_level_up = state->player_xp >= 1;
+    bool can_level_up = CF(player_xp, state) >= 1;
     bool is_levelling_up_dex = can_level_up
         && action == CRAFTAX_ACTION_LEVEL_UP_DEXTERITY
-        && state->player_dexterity < max_attribute;
+        && CF(player_dexterity, state) < max_attribute;
     bool is_levelling_up_str = can_level_up
         && action == CRAFTAX_ACTION_LEVEL_UP_STRENGTH
-        && state->player_strength < max_attribute;
+        && CF(player_strength, state) < max_attribute;
     bool is_levelling_up_int = can_level_up
         && action == CRAFTAX_ACTION_LEVEL_UP_INTELLIGENCE
-        && state->player_intelligence < max_attribute;
+        && CF(player_intelligence, state) < max_attribute;
     bool is_levelling_up = is_levelling_up_dex
         || is_levelling_up_str
         || is_levelling_up_int;
 
-    state->player_dexterity += (int32_t)is_levelling_up_dex;
-    state->player_strength += (int32_t)is_levelling_up_str;
-    state->player_intelligence += (int32_t)is_levelling_up_int;
-    state->player_xp -= (int32_t)is_levelling_up;
+    CF(player_dexterity, state) += (int32_t)is_levelling_up_dex;
+    CF(player_strength, state) += (int32_t)is_levelling_up_str;
+    CF(player_intelligence, state) += (int32_t)is_levelling_up_int;
+    CF(player_xp, state) -= (int32_t)is_levelling_up;
 }
 
 static __device__ inline void craftax_clip_inventory_and_intrinsics_native(
     CraftaxState* state,
     bool god_mode
 ) {
-    state->inventory.wood = craftax_step_mini32(state->inventory.wood, 99);
-    state->inventory.stone = craftax_step_mini32(state->inventory.stone, 99);
-    state->inventory.coal = craftax_step_mini32(state->inventory.coal, 99);
-    state->inventory.iron = craftax_step_mini32(state->inventory.iron, 99);
-    state->inventory.diamond = craftax_step_mini32(state->inventory.diamond, 99);
-    state->inventory.sapling = craftax_step_mini32(state->inventory.sapling, 99);
-    state->inventory.pickaxe = craftax_step_mini32(state->inventory.pickaxe, 99);
-    state->inventory.sword = craftax_step_mini32(state->inventory.sword, 99);
-    state->inventory.bow = craftax_step_mini32(state->inventory.bow, 99);
-    state->inventory.arrows = craftax_step_mini32(state->inventory.arrows, 99);
+    CF(inv_wood, state) = craftax_step_mini32(CF(inv_wood, state), 99);
+    CF(inv_stone, state) = craftax_step_mini32(CF(inv_stone, state), 99);
+    CF(inv_coal, state) = craftax_step_mini32(CF(inv_coal, state), 99);
+    CF(inv_iron, state) = craftax_step_mini32(CF(inv_iron, state), 99);
+    CF(inv_diamond, state) = craftax_step_mini32(CF(inv_diamond, state), 99);
+    CF(inv_sapling, state) = craftax_step_mini32(CF(inv_sapling, state), 99);
+    CF(inv_pickaxe, state) = craftax_step_mini32(CF(inv_pickaxe, state), 99);
+    CF(inv_sword, state) = craftax_step_mini32(CF(inv_sword, state), 99);
+    CF(inv_bow, state) = craftax_step_mini32(CF(inv_bow, state), 99);
+    CF(inv_arrows, state) = craftax_step_mini32(CF(inv_arrows, state), 99);
     for (int i = 0; i < 4; i++) {
-        state->inventory.armour[i] = craftax_step_mini32(
-            state->inventory.armour[i],
+        CF2(inv_armour, i, state) = craftax_step_mini32(
+            CF2(inv_armour, i, state),
             99
         );
     }
-    state->inventory.torches = craftax_step_mini32(state->inventory.torches, 99);
-    state->inventory.ruby = craftax_step_mini32(state->inventory.ruby, 99);
-    state->inventory.sapphire = craftax_step_mini32(state->inventory.sapphire, 99);
+    CF(inv_torches, state) = craftax_step_mini32(CF(inv_torches, state), 99);
+    CF(inv_ruby, state) = craftax_step_mini32(CF(inv_ruby, state), 99);
+    CF(inv_sapphire, state) = craftax_step_mini32(CF(inv_sapphire, state), 99);
     for (int i = 0; i < 6; i++) {
-        state->inventory.potions[i] = craftax_step_mini32(
-            state->inventory.potions[i],
+        CF2(inv_potions, i, state) = craftax_step_mini32(
+            CF2(inv_potions, i, state),
             99
         );
     }
-    state->inventory.books = craftax_step_mini32(state->inventory.books, 99);
+    CF(inv_books, state) = craftax_step_mini32(CF(inv_books, state), 99);
 
     float min_health = god_mode ? 9.0f : 0.0f;
-    state->player_health = craftax_step_minf32(
-        craftax_step_maxf32(state->player_health, min_health),
+    CF(player_health, state) = craftax_step_minf32(
+        craftax_step_maxf32(CF(player_health, state), min_health),
         (float)craftax_step_get_max_health(state)
     );
-    state->player_food = craftax_step_mini32(
-        craftax_step_maxi32(state->player_food, 0),
+    CF(player_food, state) = craftax_step_mini32(
+        craftax_step_maxi32(CF(player_food, state), 0),
         craftax_step_get_max_food(state)
     );
-    state->player_drink = craftax_step_mini32(
-        craftax_step_maxi32(state->player_drink, 0),
+    CF(player_drink, state) = craftax_step_mini32(
+        craftax_step_maxi32(CF(player_drink, state), 0),
         craftax_step_get_max_drink(state)
     );
-    state->player_energy = craftax_step_mini32(
-        craftax_step_maxi32(state->player_energy, 0),
+    CF(player_energy, state) = craftax_step_mini32(
+        craftax_step_maxi32(CF(player_energy, state), 0),
         craftax_step_get_max_energy(state)
     );
-    state->player_mana = craftax_step_mini32(
-        craftax_step_maxi32(state->player_mana, 0),
+    CF(player_mana, state) = craftax_step_mini32(
+        craftax_step_maxi32(CF(player_mana, state), 0),
         craftax_step_get_max_mana(state)
     );
 }
@@ -4994,56 +5080,56 @@ static __device__ inline void craftax_clip_inventory_and_intrinsics_native(
 static __device__ inline void craftax_calculate_inventory_achievements_native(
     CraftaxState* state
 ) {
-    state->achievements[CRAFTAX_ACH_COLLECT_WOOD] =
-        state->achievements[CRAFTAX_ACH_COLLECT_WOOD] || state->inventory.wood > 0;
-    state->achievements[CRAFTAX_ACH_COLLECT_STONE] =
-        state->achievements[CRAFTAX_ACH_COLLECT_STONE] || state->inventory.stone > 0;
-    state->achievements[CRAFTAX_ACH_COLLECT_COAL] =
-        state->achievements[CRAFTAX_ACH_COLLECT_COAL] || state->inventory.coal > 0;
-    state->achievements[CRAFTAX_ACH_COLLECT_IRON] =
-        state->achievements[CRAFTAX_ACH_COLLECT_IRON] || state->inventory.iron > 0;
-    state->achievements[CRAFTAX_ACH_COLLECT_DIAMOND] =
-        state->achievements[CRAFTAX_ACH_COLLECT_DIAMOND] || state->inventory.diamond > 0;
-    state->achievements[CRAFTAX_ACH_COLLECT_RUBY] =
-        state->achievements[CRAFTAX_ACH_COLLECT_RUBY] || state->inventory.ruby > 0;
-    state->achievements[CRAFTAX_ACH_COLLECT_SAPPHIRE] =
-        state->achievements[CRAFTAX_ACH_COLLECT_SAPPHIRE]
-        || state->inventory.sapphire > 0;
-    state->achievements[CRAFTAX_ACH_COLLECT_SAPLING] =
-        state->achievements[CRAFTAX_ACH_COLLECT_SAPLING]
-        || state->inventory.sapling > 0;
-    state->achievements[CRAFTAX_ACH_FIND_BOW] =
-        state->achievements[CRAFTAX_ACH_FIND_BOW] || state->inventory.bow > 0;
-    state->achievements[CRAFTAX_ACH_MAKE_ARROW] =
-        state->achievements[CRAFTAX_ACH_MAKE_ARROW] || state->inventory.arrows > 0;
-    state->achievements[CRAFTAX_ACH_MAKE_TORCH] =
-        state->achievements[CRAFTAX_ACH_MAKE_TORCH] || state->inventory.torches > 0;
+    CF2(achievements, CRAFTAX_ACH_COLLECT_WOOD, state) =
+        CF2(achievements, CRAFTAX_ACH_COLLECT_WOOD, state) || CF(inv_wood, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_COLLECT_STONE, state) =
+        CF2(achievements, CRAFTAX_ACH_COLLECT_STONE, state) || CF(inv_stone, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_COLLECT_COAL, state) =
+        CF2(achievements, CRAFTAX_ACH_COLLECT_COAL, state) || CF(inv_coal, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_COLLECT_IRON, state) =
+        CF2(achievements, CRAFTAX_ACH_COLLECT_IRON, state) || CF(inv_iron, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_COLLECT_DIAMOND, state) =
+        CF2(achievements, CRAFTAX_ACH_COLLECT_DIAMOND, state) || CF(inv_diamond, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_COLLECT_RUBY, state) =
+        CF2(achievements, CRAFTAX_ACH_COLLECT_RUBY, state) || CF(inv_ruby, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_COLLECT_SAPPHIRE, state) =
+        CF2(achievements, CRAFTAX_ACH_COLLECT_SAPPHIRE, state)
+        || CF(inv_sapphire, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_COLLECT_SAPLING, state) =
+        CF2(achievements, CRAFTAX_ACH_COLLECT_SAPLING, state)
+        || CF(inv_sapling, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_FIND_BOW, state) =
+        CF2(achievements, CRAFTAX_ACH_FIND_BOW, state) || CF(inv_bow, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_MAKE_ARROW, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_ARROW, state) || CF(inv_arrows, state) > 0;
+    CF2(achievements, CRAFTAX_ACH_MAKE_TORCH, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_TORCH, state) || CF(inv_torches, state) > 0;
 
-    state->achievements[CRAFTAX_ACH_MAKE_WOOD_PICKAXE] =
-        state->achievements[CRAFTAX_ACH_MAKE_WOOD_PICKAXE]
-        || state->inventory.pickaxe >= 1;
-    state->achievements[CRAFTAX_ACH_MAKE_STONE_PICKAXE] =
-        state->achievements[CRAFTAX_ACH_MAKE_STONE_PICKAXE]
-        || state->inventory.pickaxe >= 2;
-    state->achievements[CRAFTAX_ACH_MAKE_IRON_PICKAXE] =
-        state->achievements[CRAFTAX_ACH_MAKE_IRON_PICKAXE]
-        || state->inventory.pickaxe >= 3;
-    state->achievements[CRAFTAX_ACH_MAKE_DIAMOND_PICKAXE] =
-        state->achievements[CRAFTAX_ACH_MAKE_DIAMOND_PICKAXE]
-        || state->inventory.pickaxe >= 4;
+    CF2(achievements, CRAFTAX_ACH_MAKE_WOOD_PICKAXE, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_WOOD_PICKAXE, state)
+        || CF(inv_pickaxe, state) >= 1;
+    CF2(achievements, CRAFTAX_ACH_MAKE_STONE_PICKAXE, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_STONE_PICKAXE, state)
+        || CF(inv_pickaxe, state) >= 2;
+    CF2(achievements, CRAFTAX_ACH_MAKE_IRON_PICKAXE, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_IRON_PICKAXE, state)
+        || CF(inv_pickaxe, state) >= 3;
+    CF2(achievements, CRAFTAX_ACH_MAKE_DIAMOND_PICKAXE, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_DIAMOND_PICKAXE, state)
+        || CF(inv_pickaxe, state) >= 4;
 
-    state->achievements[CRAFTAX_ACH_MAKE_WOOD_SWORD] =
-        state->achievements[CRAFTAX_ACH_MAKE_WOOD_SWORD]
-        || state->inventory.sword >= 1;
-    state->achievements[CRAFTAX_ACH_MAKE_STONE_SWORD] =
-        state->achievements[CRAFTAX_ACH_MAKE_STONE_SWORD]
-        || state->inventory.sword >= 2;
-    state->achievements[CRAFTAX_ACH_MAKE_IRON_SWORD] =
-        state->achievements[CRAFTAX_ACH_MAKE_IRON_SWORD]
-        || state->inventory.sword >= 3;
-    state->achievements[CRAFTAX_ACH_MAKE_DIAMOND_SWORD] =
-        state->achievements[CRAFTAX_ACH_MAKE_DIAMOND_SWORD]
-        || state->inventory.sword >= 4;
+    CF2(achievements, CRAFTAX_ACH_MAKE_WOOD_SWORD, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_WOOD_SWORD, state)
+        || CF(inv_sword, state) >= 1;
+    CF2(achievements, CRAFTAX_ACH_MAKE_STONE_SWORD, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_STONE_SWORD, state)
+        || CF(inv_sword, state) >= 2;
+    CF2(achievements, CRAFTAX_ACH_MAKE_IRON_SWORD, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_IRON_SWORD, state)
+        || CF(inv_sword, state) >= 3;
+    CF2(achievements, CRAFTAX_ACH_MAKE_DIAMOND_SWORD, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_DIAMOND_SWORD, state)
+        || CF(inv_sword, state) >= 4;
 }
 
 static __device__ inline void craftax_update_player_intrinsics_native(
@@ -5051,106 +5137,106 @@ static __device__ inline void craftax_update_player_intrinsics_native(
     int32_t action
 ) {
     bool is_starting_sleep = action == CRAFTAX_ACTION_SLEEP
-        && state->player_energy < craftax_step_get_max_energy(state);
-    state->is_sleeping = state->is_sleeping || is_starting_sleep;
+        && CF(player_energy, state) < craftax_step_get_max_energy(state);
+    CF(is_sleeping, state) = CF(is_sleeping, state) || is_starting_sleep;
 
-    bool is_waking_up = state->player_energy >= craftax_step_get_max_energy(state)
-        && state->is_sleeping;
-    state->is_sleeping = state->is_sleeping && !is_waking_up;
-    state->achievements[CRAFTAX_ACH_WAKE_UP] =
-        state->achievements[CRAFTAX_ACH_WAKE_UP] || is_waking_up;
+    bool is_waking_up = CF(player_energy, state) >= craftax_step_get_max_energy(state)
+        && CF(is_sleeping, state);
+    CF(is_sleeping, state) = CF(is_sleeping, state) && !is_waking_up;
+    CF2(achievements, CRAFTAX_ACH_WAKE_UP, state) =
+        CF2(achievements, CRAFTAX_ACH_WAKE_UP, state) || is_waking_up;
 
     bool is_starting_rest = action == CRAFTAX_ACTION_REST
-        && state->player_health < (float)craftax_step_get_max_health(state);
-    state->is_resting = state->is_resting || is_starting_rest;
+        && CF(player_health, state) < (float)craftax_step_get_max_health(state);
+    CF(is_resting, state) = CF(is_resting, state) || is_starting_rest;
 
-    is_waking_up = state->is_resting
+    is_waking_up = CF(is_resting, state)
         && (
-            state->player_health >= (float)craftax_step_get_max_health(state)
-            || state->player_food <= 0
-            || state->player_drink <= 0
+            CF(player_health, state) >= (float)craftax_step_get_max_health(state)
+            || CF(player_food, state) <= 0
+            || CF(player_drink, state) <= 0
         );
-    state->is_resting = state->is_resting && !is_waking_up;
+    CF(is_resting, state) = CF(is_resting, state) && !is_waking_up;
 
     bool not_boss = !craftax_step_is_fighting_boss(state);
     float intrinsic_decay_coeff =
-        1.0f - (0.125f * (float)(state->player_dexterity - 1));
+        1.0f - (0.125f * (float)(CF(player_dexterity, state) - 1));
 
-    float hunger_add = (state->is_sleeping ? 0.5f : 1.0f) * intrinsic_decay_coeff;
-    float new_hunger = state->player_hunger + hunger_add;
+    float hunger_add = (CF(is_sleeping, state) ? 0.5f : 1.0f) * intrinsic_decay_coeff;
+    float new_hunger = CF(player_hunger, state) + hunger_add;
     int32_t hungered_food = craftax_step_maxi32(
-        state->player_food - (int32_t)not_boss,
+        CF(player_food, state) - (int32_t)not_boss,
         0
     );
-    int32_t new_food = new_hunger > 25.0f ? hungered_food : state->player_food;
+    int32_t new_food = new_hunger > 25.0f ? hungered_food : CF(player_food, state);
     new_hunger = new_hunger > 25.0f ? 0.0f : new_hunger;
-    state->player_hunger = new_hunger;
-    state->player_food = new_food;
+    CF(player_hunger, state) = new_hunger;
+    CF(player_food, state) = new_food;
 
-    float thirst_add = (state->is_sleeping ? 0.5f : 1.0f) * intrinsic_decay_coeff;
-    float new_thirst = state->player_thirst + thirst_add;
+    float thirst_add = (CF(is_sleeping, state) ? 0.5f : 1.0f) * intrinsic_decay_coeff;
+    float new_thirst = CF(player_thirst, state) + thirst_add;
     int32_t thirsted_drink = craftax_step_maxi32(
-        state->player_drink - (int32_t)not_boss,
+        CF(player_drink, state) - (int32_t)not_boss,
         0
     );
-    int32_t new_drink = new_thirst > 20.0f ? thirsted_drink : state->player_drink;
+    int32_t new_drink = new_thirst > 20.0f ? thirsted_drink : CF(player_drink, state);
     new_thirst = new_thirst > 20.0f ? 0.0f : new_thirst;
-    state->player_thirst = new_thirst;
-    state->player_drink = new_drink;
+    CF(player_thirst, state) = new_thirst;
+    CF(player_drink, state) = new_drink;
 
-    float new_fatigue = state->is_sleeping
-        ? craftax_step_minf32(state->player_fatigue - 1.0f, 0.0f)
-        : state->player_fatigue + intrinsic_decay_coeff;
+    float new_fatigue = CF(is_sleeping, state)
+        ? craftax_step_minf32(CF(player_fatigue, state) - 1.0f, 0.0f)
+        : CF(player_fatigue, state) + intrinsic_decay_coeff;
     int32_t new_energy = new_fatigue > 30.0f
-        ? craftax_step_maxi32(state->player_energy - (int32_t)not_boss, 0)
-        : state->player_energy;
+        ? craftax_step_maxi32(CF(player_energy, state) - (int32_t)not_boss, 0)
+        : CF(player_energy, state);
     new_fatigue = new_fatigue > 30.0f ? 0.0f : new_fatigue;
     new_energy = new_fatigue < -10.0f
         ? craftax_step_mini32(
-            state->player_energy + 1,
+            CF(player_energy, state) + 1,
             craftax_step_get_max_energy(state)
         )
         : new_energy;
     new_fatigue = new_fatigue < -10.0f ? 0.0f : new_fatigue;
-    state->player_fatigue = new_fatigue;
-    state->player_energy = new_energy;
+    CF(player_fatigue, state) = new_fatigue;
+    CF(player_energy, state) = new_energy;
 
-    bool all_necessities = state->player_food > 0
-        && state->player_drink > 0
-        && (state->player_energy > 0 || state->is_sleeping);
-    float recover_all = state->is_sleeping ? 2.0f : 1.0f;
-    float recover_not_all = (state->is_sleeping ? -0.5f : -1.0f)
+    bool all_necessities = CF(player_food, state) > 0
+        && CF(player_drink, state) > 0
+        && (CF(player_energy, state) > 0 || CF(is_sleeping, state));
+    float recover_all = CF(is_sleeping, state) ? 2.0f : 1.0f;
+    float recover_not_all = (CF(is_sleeping, state) ? -0.5f : -1.0f)
         * (float)(int32_t)not_boss;
     float recover_add = all_necessities ? recover_all : recover_not_all;
-    float new_recover = state->player_recover + recover_add;
+    float new_recover = CF(player_recover, state) + recover_add;
 
     float recovered_health = craftax_step_minf32(
-        state->player_health + 1.0f,
+        CF(player_health, state) + 1.0f,
         (float)craftax_step_get_max_health(state)
     );
-    float derecovered_health = state->player_health - 1.0f;
+    float derecovered_health = CF(player_health, state) - 1.0f;
     float new_health = new_recover > 25.0f
         ? recovered_health
-        : state->player_health;
+        : CF(player_health, state);
     new_recover = new_recover > 25.0f ? 0.0f : new_recover;
     new_health = new_recover < -15.0f ? derecovered_health : new_health;
     new_recover = new_recover < -15.0f ? 0.0f : new_recover;
-    state->player_recover = new_recover;
-    state->player_health = new_health;
+    CF(player_recover, state) = new_recover;
+    CF(player_health, state) = new_health;
 
     float mana_recover_coeff =
-        1.0f + 0.25f * (float)(state->player_intelligence - 1);
+        1.0f + 0.25f * (float)(CF(player_intelligence, state) - 1);
     float new_recover_mana = (
-        state->is_sleeping
-            ? state->player_recover_mana + 2.0f
-            : state->player_recover_mana + 1.0f
+        CF(is_sleeping, state)
+            ? CF(player_recover_mana, state) + 2.0f
+            : CF(player_recover_mana, state) + 1.0f
     ) * mana_recover_coeff;
     int32_t new_mana = new_recover_mana > 30.0f
-        ? state->player_mana + 1
-        : state->player_mana;
+        ? CF(player_mana, state) + 1
+        : CF(player_mana, state);
     new_recover_mana = new_recover_mana > 30.0f ? 0.0f : new_recover_mana;
-    state->player_recover_mana = new_recover_mana;
-    state->player_mana = new_mana;
+    CF(player_recover_mana, state) = new_recover_mana;
+    CF(player_mana, state) = new_mana;
 }
 
 static __device__ inline void craftax_drink_potion_native(
@@ -5161,37 +5247,37 @@ static __device__ inline void craftax_drink_potion_native(
     bool is_drinking_potion = false;
 
     bool is_drinking_red_potion = action == CRAFTAX_ACTION_DRINK_POTION_RED
-        && state->inventory.potions[0] > 0;
+        && CF2(inv_potions, 0, state) > 0;
     drinking_potion_index = (int32_t)is_drinking_red_potion * 0
         + (1 - (int32_t)is_drinking_red_potion) * drinking_potion_index;
     is_drinking_potion = is_drinking_potion || is_drinking_red_potion;
 
     bool is_drinking_green_potion = action == CRAFTAX_ACTION_DRINK_POTION_GREEN
-        && state->inventory.potions[1] > 0;
+        && CF2(inv_potions, 1, state) > 0;
     drinking_potion_index = (int32_t)is_drinking_green_potion * 1
         + (1 - (int32_t)is_drinking_green_potion) * drinking_potion_index;
     is_drinking_potion = is_drinking_potion || is_drinking_green_potion;
 
     bool is_drinking_blue_potion = action == CRAFTAX_ACTION_DRINK_POTION_BLUE
-        && state->inventory.potions[2] > 0;
+        && CF2(inv_potions, 2, state) > 0;
     drinking_potion_index = (int32_t)is_drinking_blue_potion * 2
         + (1 - (int32_t)is_drinking_blue_potion) * drinking_potion_index;
     is_drinking_potion = is_drinking_potion || is_drinking_blue_potion;
 
     bool is_drinking_pink_potion = action == CRAFTAX_ACTION_DRINK_POTION_PINK
-        && state->inventory.potions[3] > 0;
+        && CF2(inv_potions, 3, state) > 0;
     drinking_potion_index = (int32_t)is_drinking_pink_potion * 3
         + (1 - (int32_t)is_drinking_pink_potion) * drinking_potion_index;
     is_drinking_potion = is_drinking_potion || is_drinking_pink_potion;
 
     bool is_drinking_cyan_potion = action == CRAFTAX_ACTION_DRINK_POTION_CYAN
-        && state->inventory.potions[4] > 0;
+        && CF2(inv_potions, 4, state) > 0;
     drinking_potion_index = (int32_t)is_drinking_cyan_potion * 4
         + (1 - (int32_t)is_drinking_cyan_potion) * drinking_potion_index;
     is_drinking_potion = is_drinking_potion || is_drinking_cyan_potion;
 
     bool is_drinking_yellow_potion = action == CRAFTAX_ACTION_DRINK_POTION_YELLOW
-        && state->inventory.potions[5] > 0;
+        && CF2(inv_potions, 5, state) > 0;
     drinking_potion_index = (int32_t)is_drinking_yellow_potion * 5
         + (1 - (int32_t)is_drinking_yellow_potion) * drinking_potion_index;
     is_drinking_potion = is_drinking_potion || is_drinking_yellow_potion;
@@ -5211,13 +5297,13 @@ static __device__ inline void craftax_drink_potion_native(
     delta_energy += (int32_t)is_drinking_potion * (int32_t)(potion_effect_index == 4) * 8;
     delta_energy += (int32_t)is_drinking_potion * (int32_t)(potion_effect_index == 5) * -3;
 
-    state->achievements[CRAFTAX_ACH_DRINK_POTION] =
-        state->achievements[CRAFTAX_ACH_DRINK_POTION] || is_drinking_potion;
-    state->inventory.potions[potion_index] =
-        state->inventory.potions[potion_index] - (int32_t)is_drinking_potion;
-    state->player_health += (float)delta_health;
-    state->player_mana += delta_mana;
-    state->player_energy += delta_energy;
+    CF2(achievements, CRAFTAX_ACH_DRINK_POTION, state) =
+        CF2(achievements, CRAFTAX_ACH_DRINK_POTION, state) || is_drinking_potion;
+    CF2(inv_potions, potion_index, state) =
+        CF2(inv_potions, potion_index, state) - (int32_t)is_drinking_potion;
+    CF(player_health, state) += (float)delta_health;
+    CF(player_mana, state) += delta_mana;
+    CF(player_energy, state) += delta_energy;
 }
 
 static __device__ inline void craftax_read_book_native(
@@ -5226,15 +5312,15 @@ static __device__ inline void craftax_read_book_native(
     int32_t action
 ) {
     bool is_reading_book = action == CRAFTAX_ACTION_READ_BOOK
-        && state->inventory.books > 0;
+        && CF(inv_books, state) > 0;
 
     CraftaxThreefryKey rng = {{rng_words[0], rng_words[1]}};
     CraftaxThreefryKey unused;
     CraftaxThreefryKey choice_key;
     craftax_threefry_split(rng, &unused, &choice_key);
 
-    float p0 = state->learned_spells[0] ? 0.0f : 1.0f;
-    float p1 = state->learned_spells[1] ? 0.0f : 1.0f;
+    float p0 = CF2(learned_spells, 0, state) ? 0.0f : 1.0f;
+    float p1 = CF2(learned_spells, 1, state) ? 0.0f : 1.0f;
     float p_sum = p0 + p1;
     int32_t spell_to_learn_index = 0;
     if (p_sum != 0.0f) {
@@ -5247,11 +5333,11 @@ static __device__ inline void craftax_read_book_native(
         ? CRAFTAX_ACH_LEARN_ICEBALL
         : CRAFTAX_ACH_LEARN_FIREBALL;
 
-    state->achievements[learn_spell_achievement] =
-        state->achievements[learn_spell_achievement] || is_reading_book;
-    state->inventory.books -= (int32_t)is_reading_book;
-    state->learned_spells[spell_to_learn_index] =
-        state->learned_spells[spell_to_learn_index] || is_reading_book;
+    CF2(achievements, learn_spell_achievement, state) =
+        CF2(achievements, learn_spell_achievement, state) || is_reading_book;
+    CF(inv_books, state) -= (int32_t)is_reading_book;
+    CF2(learned_spells, spell_to_learn_index, state) =
+        CF2(learned_spells, spell_to_learn_index, state) || is_reading_book;
 }
 
 // ============================================================
@@ -5281,12 +5367,12 @@ static __device__ inline bool craftax_crafting_is_near_block(
     };
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     for (int32_t i = 0; i < 8; i++) {
-        int32_t row = state->player_position[0] + close_blocks[i][0];
-        int32_t col = state->player_position[1] + close_blocks[i][1];
+        int32_t row = CF2(player_position, 0, state) + close_blocks[i][0];
+        int32_t col = CF2(player_position, 1, state) + close_blocks[i][1];
         bool in_bounds = row >= 0
             && row < CRAFTAX_MAP_SIZE
             && col >= 0
@@ -5299,14 +5385,14 @@ static __device__ inline bool craftax_crafting_is_near_block(
 }
 
 static __device__ inline int32_t craftax_crafting_first_armour_below(
-    const CraftaxInventory* inventory,
+    const void* inventory,
     int32_t threshold,
     int32_t* count
 ) {
     int32_t first = 0;
     *count = 0;
     for (int32_t i = 0; i < 4; i++) {
-        bool below = inventory->armour[i] < threshold;
+        bool below = CF2(inv_armour, i, inventory) < threshold;
         first = (*count == 0 && below) ? i : first;
         *count += (int32_t)below;
     }
@@ -5326,177 +5412,177 @@ static __device__ inline void craftax_do_crafting_native(
         CRAFTAX_BLOCK_FURNACE
     );
 
-    CraftaxInventory* inventory = &state->inventory;
+    const void* const inventory = (const void*)state;
 
-    bool can_craft_wood_pickaxe = inventory->wood >= 1;
+    bool can_craft_wood_pickaxe = CF(inv_wood, inventory) >= 1;
     bool is_crafting_wood_pickaxe =
         action == CRAFTAX_ACTION_MAKE_WOOD_PICKAXE
         && can_craft_wood_pickaxe
         && is_at_crafting_table
-        && inventory->pickaxe < 1;
-    inventory->wood -= 1 * (int32_t)is_crafting_wood_pickaxe;
-    inventory->pickaxe =
-        inventory->pickaxe * (1 - (int32_t)is_crafting_wood_pickaxe)
+        && CF(inv_pickaxe, inventory) < 1;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_wood_pickaxe;
+    CF(inv_pickaxe, inventory) =
+        CF(inv_pickaxe, inventory) * (1 - (int32_t)is_crafting_wood_pickaxe)
         + 1 * (int32_t)is_crafting_wood_pickaxe;
 
     bool can_craft_stone_pickaxe =
-        inventory->wood >= 1 && inventory->stone >= 1;
+        CF(inv_wood, inventory) >= 1 && CF(inv_stone, inventory) >= 1;
     bool is_crafting_stone_pickaxe =
         action == CRAFTAX_ACTION_MAKE_STONE_PICKAXE
         && can_craft_stone_pickaxe
         && is_at_crafting_table
-        && inventory->pickaxe < 2;
-    inventory->stone -= 1 * (int32_t)is_crafting_stone_pickaxe;
-    inventory->wood -= 1 * (int32_t)is_crafting_stone_pickaxe;
-    inventory->pickaxe =
-        inventory->pickaxe * (1 - (int32_t)is_crafting_stone_pickaxe)
+        && CF(inv_pickaxe, inventory) < 2;
+    CF(inv_stone, inventory) -= 1 * (int32_t)is_crafting_stone_pickaxe;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_stone_pickaxe;
+    CF(inv_pickaxe, inventory) =
+        CF(inv_pickaxe, inventory) * (1 - (int32_t)is_crafting_stone_pickaxe)
         + 2 * (int32_t)is_crafting_stone_pickaxe;
 
     bool can_craft_iron_pickaxe =
-        inventory->wood >= 1
-        && inventory->stone >= 1
-        && inventory->iron >= 1
-        && inventory->coal >= 1;
+        CF(inv_wood, inventory) >= 1
+        && CF(inv_stone, inventory) >= 1
+        && CF(inv_iron, inventory) >= 1
+        && CF(inv_coal, inventory) >= 1;
     bool is_crafting_iron_pickaxe =
         action == CRAFTAX_ACTION_MAKE_IRON_PICKAXE
         && can_craft_iron_pickaxe
         && is_at_furnace
         && is_at_crafting_table
-        && inventory->pickaxe < 3;
-    inventory->iron -= 1 * (int32_t)is_crafting_iron_pickaxe;
-    inventory->wood -= 1 * (int32_t)is_crafting_iron_pickaxe;
-    inventory->stone -= 1 * (int32_t)is_crafting_iron_pickaxe;
-    inventory->coal -= 1 * (int32_t)is_crafting_iron_pickaxe;
-    inventory->pickaxe =
-        inventory->pickaxe * (1 - (int32_t)is_crafting_iron_pickaxe)
+        && CF(inv_pickaxe, inventory) < 3;
+    CF(inv_iron, inventory) -= 1 * (int32_t)is_crafting_iron_pickaxe;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_iron_pickaxe;
+    CF(inv_stone, inventory) -= 1 * (int32_t)is_crafting_iron_pickaxe;
+    CF(inv_coal, inventory) -= 1 * (int32_t)is_crafting_iron_pickaxe;
+    CF(inv_pickaxe, inventory) =
+        CF(inv_pickaxe, inventory) * (1 - (int32_t)is_crafting_iron_pickaxe)
         + 3 * (int32_t)is_crafting_iron_pickaxe;
 
     bool can_craft_diamond_pickaxe =
-        inventory->wood >= 1 && inventory->diamond >= 3;
+        CF(inv_wood, inventory) >= 1 && CF(inv_diamond, inventory) >= 3;
     bool is_crafting_diamond_pickaxe =
         action == CRAFTAX_ACTION_MAKE_DIAMOND_PICKAXE
         && can_craft_diamond_pickaxe
         && is_at_crafting_table
-        && inventory->pickaxe < 4;
-    inventory->diamond -= 3 * (int32_t)is_crafting_diamond_pickaxe;
-    inventory->wood -= 1 * (int32_t)is_crafting_diamond_pickaxe;
-    inventory->pickaxe =
-        inventory->pickaxe * (1 - (int32_t)is_crafting_diamond_pickaxe)
+        && CF(inv_pickaxe, inventory) < 4;
+    CF(inv_diamond, inventory) -= 3 * (int32_t)is_crafting_diamond_pickaxe;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_diamond_pickaxe;
+    CF(inv_pickaxe, inventory) =
+        CF(inv_pickaxe, inventory) * (1 - (int32_t)is_crafting_diamond_pickaxe)
         + 4 * (int32_t)is_crafting_diamond_pickaxe;
 
-    bool can_craft_wood_sword = inventory->wood >= 1;
+    bool can_craft_wood_sword = CF(inv_wood, inventory) >= 1;
     bool is_crafting_wood_sword =
         action == CRAFTAX_ACTION_MAKE_WOOD_SWORD
         && can_craft_wood_sword
         && is_at_crafting_table
-        && inventory->sword < 1;
-    inventory->wood -= 1 * (int32_t)is_crafting_wood_sword;
-    inventory->sword =
-        inventory->sword * (1 - (int32_t)is_crafting_wood_sword)
+        && CF(inv_sword, inventory) < 1;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_wood_sword;
+    CF(inv_sword, inventory) =
+        CF(inv_sword, inventory) * (1 - (int32_t)is_crafting_wood_sword)
         + 1 * (int32_t)is_crafting_wood_sword;
 
     bool can_craft_stone_sword =
-        inventory->stone >= 1 && inventory->wood >= 1;
+        CF(inv_stone, inventory) >= 1 && CF(inv_wood, inventory) >= 1;
     bool is_crafting_stone_sword =
         action == CRAFTAX_ACTION_MAKE_STONE_SWORD
         && can_craft_stone_sword
         && is_at_crafting_table
-        && inventory->sword < 2;
-    inventory->wood -= 1 * (int32_t)is_crafting_stone_sword;
-    inventory->stone -= 1 * (int32_t)is_crafting_stone_sword;
-    inventory->sword =
-        inventory->sword * (1 - (int32_t)is_crafting_stone_sword)
+        && CF(inv_sword, inventory) < 2;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_stone_sword;
+    CF(inv_stone, inventory) -= 1 * (int32_t)is_crafting_stone_sword;
+    CF(inv_sword, inventory) =
+        CF(inv_sword, inventory) * (1 - (int32_t)is_crafting_stone_sword)
         + 2 * (int32_t)is_crafting_stone_sword;
 
     bool can_craft_iron_sword =
-        inventory->iron >= 1
-        && inventory->wood >= 1
-        && inventory->stone >= 1
-        && inventory->coal >= 1;
+        CF(inv_iron, inventory) >= 1
+        && CF(inv_wood, inventory) >= 1
+        && CF(inv_stone, inventory) >= 1
+        && CF(inv_coal, inventory) >= 1;
     bool is_crafting_iron_sword =
         action == CRAFTAX_ACTION_MAKE_IRON_SWORD
         && can_craft_iron_sword
         && is_at_furnace
         && is_at_crafting_table
-        && inventory->sword < 3;
-    inventory->wood -= 1 * (int32_t)is_crafting_iron_sword;
-    inventory->iron -= 1 * (int32_t)is_crafting_iron_sword;
-    inventory->stone -= 1 * (int32_t)is_crafting_iron_sword;
-    inventory->coal -= 1 * (int32_t)is_crafting_iron_sword;
-    inventory->sword =
-        inventory->sword * (1 - (int32_t)is_crafting_iron_sword)
+        && CF(inv_sword, inventory) < 3;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_iron_sword;
+    CF(inv_iron, inventory) -= 1 * (int32_t)is_crafting_iron_sword;
+    CF(inv_stone, inventory) -= 1 * (int32_t)is_crafting_iron_sword;
+    CF(inv_coal, inventory) -= 1 * (int32_t)is_crafting_iron_sword;
+    CF(inv_sword, inventory) =
+        CF(inv_sword, inventory) * (1 - (int32_t)is_crafting_iron_sword)
         + 3 * (int32_t)is_crafting_iron_sword;
 
     bool can_craft_diamond_sword =
-        inventory->diamond >= 2 && inventory->wood >= 1;
+        CF(inv_diamond, inventory) >= 2 && CF(inv_wood, inventory) >= 1;
     bool is_crafting_diamond_sword =
         action == CRAFTAX_ACTION_MAKE_DIAMOND_SWORD
         && can_craft_diamond_sword
         && is_at_crafting_table
-        && inventory->sword < 4;
-    inventory->wood -= 1 * (int32_t)is_crafting_diamond_sword;
-    inventory->diamond -= 2 * (int32_t)is_crafting_diamond_sword;
-    inventory->sword =
-        inventory->sword * (1 - (int32_t)is_crafting_diamond_sword)
+        && CF(inv_sword, inventory) < 4;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_diamond_sword;
+    CF(inv_diamond, inventory) -= 2 * (int32_t)is_crafting_diamond_sword;
+    CF(inv_sword, inventory) =
+        CF(inv_sword, inventory) * (1 - (int32_t)is_crafting_diamond_sword)
         + 4 * (int32_t)is_crafting_diamond_sword;
 
     int32_t armour_count = 0;
     int32_t iron_armour_index_to_craft =
         craftax_crafting_first_armour_below(inventory, 1, &armour_count);
     bool can_craft_iron_armour =
-        armour_count > 0 && inventory->iron >= 3 && inventory->coal >= 3;
+        armour_count > 0 && CF(inv_iron, inventory) >= 3 && CF(inv_coal, inventory) >= 3;
     bool is_crafting_iron_armour =
         action == CRAFTAX_ACTION_MAKE_IRON_ARMOUR
         && can_craft_iron_armour
         && is_at_crafting_table
         && is_at_furnace;
-    inventory->iron -= 3 * (int32_t)is_crafting_iron_armour;
-    inventory->coal -= 3 * (int32_t)is_crafting_iron_armour;
-    inventory->armour[iron_armour_index_to_craft] =
+    CF(inv_iron, inventory) -= 3 * (int32_t)is_crafting_iron_armour;
+    CF(inv_coal, inventory) -= 3 * (int32_t)is_crafting_iron_armour;
+    CF2(inv_armour, iron_armour_index_to_craft, inventory) =
         (int32_t)is_crafting_iron_armour * 1
         + (1 - (int32_t)is_crafting_iron_armour)
-        * inventory->armour[iron_armour_index_to_craft];
-    state->achievements[CRAFTAX_ACH_MAKE_IRON_ARMOUR] =
-        state->achievements[CRAFTAX_ACH_MAKE_IRON_ARMOUR]
+        * CF2(inv_armour, iron_armour_index_to_craft, inventory);
+    CF2(achievements, CRAFTAX_ACH_MAKE_IRON_ARMOUR, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_IRON_ARMOUR, state)
         || is_crafting_iron_armour;
 
     int32_t diamond_armour_count = 0;
     int32_t diamond_armour_index_to_craft =
         craftax_crafting_first_armour_below(inventory, 2, &diamond_armour_count);
     bool can_craft_diamond_armour =
-        diamond_armour_count > 0 && inventory->diamond >= 3;
+        diamond_armour_count > 0 && CF(inv_diamond, inventory) >= 3;
     bool is_crafting_diamond_armour =
         action == CRAFTAX_ACTION_MAKE_DIAMOND_ARMOUR
         && can_craft_diamond_armour
         && is_at_crafting_table;
-    inventory->diamond -= 3 * (int32_t)is_crafting_diamond_armour;
-    inventory->armour[diamond_armour_index_to_craft] =
+    CF(inv_diamond, inventory) -= 3 * (int32_t)is_crafting_diamond_armour;
+    CF2(inv_armour, diamond_armour_index_to_craft, inventory) =
         (int32_t)is_crafting_diamond_armour * 2
         + (1 - (int32_t)is_crafting_diamond_armour)
-        * inventory->armour[diamond_armour_index_to_craft];
-    state->achievements[CRAFTAX_ACH_MAKE_DIAMOND_ARMOUR] =
-        state->achievements[CRAFTAX_ACH_MAKE_DIAMOND_ARMOUR]
+        * CF2(inv_armour, diamond_armour_index_to_craft, inventory);
+    CF2(achievements, CRAFTAX_ACH_MAKE_DIAMOND_ARMOUR, state) =
+        CF2(achievements, CRAFTAX_ACH_MAKE_DIAMOND_ARMOUR, state)
         || is_crafting_diamond_armour;
 
-    bool can_craft_arrow = inventory->stone >= 1 && inventory->wood >= 1;
+    bool can_craft_arrow = CF(inv_stone, inventory) >= 1 && CF(inv_wood, inventory) >= 1;
     bool is_crafting_arrow =
         action == CRAFTAX_ACTION_MAKE_ARROW
         && can_craft_arrow
         && is_at_crafting_table
-        && inventory->arrows < 99;
-    inventory->wood -= 1 * (int32_t)is_crafting_arrow;
-    inventory->stone -= 1 * (int32_t)is_crafting_arrow;
-    inventory->arrows += 2 * (int32_t)is_crafting_arrow;
+        && CF(inv_arrows, inventory) < 99;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_arrow;
+    CF(inv_stone, inventory) -= 1 * (int32_t)is_crafting_arrow;
+    CF(inv_arrows, inventory) += 2 * (int32_t)is_crafting_arrow;
 
-    bool can_craft_torch = inventory->coal >= 1 && inventory->wood >= 1;
+    bool can_craft_torch = CF(inv_coal, inventory) >= 1 && CF(inv_wood, inventory) >= 1;
     bool is_crafting_torch =
         action == CRAFTAX_ACTION_MAKE_TORCH
         && can_craft_torch
         && is_at_crafting_table
-        && inventory->torches < 99;
-    inventory->wood -= 1 * (int32_t)is_crafting_torch;
-    inventory->coal -= 1 * (int32_t)is_crafting_torch;
-    inventory->torches += 4 * (int32_t)is_crafting_torch;
+        && CF(inv_torches, inventory) < 99;
+    CF(inv_wood, inventory) -= 1 * (int32_t)is_crafting_torch;
+    CF(inv_coal, inventory) -= 1 * (int32_t)is_crafting_torch;
+    CF(inv_torches, inventory) += 4 * (int32_t)is_crafting_torch;
 }
 
 static __device__ inline bool craftax_crafting_can_place_item(int32_t block) {
@@ -5559,7 +5645,7 @@ static __device__ inline void craftax_add_new_growing_plant_native(
     int32_t plant_index = 0;
     int32_t empty_count = 0;
     for (int32_t i = 0; i < CRAFTAX_MAX_GROWING_PLANTS; i++) {
-        bool is_empty = !state->growing_plants_mask[i];
+        bool is_empty = !CF2(growing_plants_mask, i, state);
         plant_index = (empty_count == 0 && is_empty) ? i : plant_index;
         empty_count += (int32_t)is_empty;
     }
@@ -5569,10 +5655,10 @@ static __device__ inline void craftax_add_new_growing_plant_native(
         return;
     }
 
-    state->growing_plants_positions[plant_index][0] = position[0];
-    state->growing_plants_positions[plant_index][1] = position[1];
-    state->growing_plants_age[plant_index] = 0;
-    state->growing_plants_mask[plant_index] = true;
+    CF2(growing_plants_positions, (plant_index) * 2 + (0), state) = position[0];
+    CF2(growing_plants_positions, (plant_index) * 2 + (1), state) = position[1];
+    CF2(growing_plants_age, plant_index, state) = 0;
+    CF2(growing_plants_mask, plant_index, state) = true;
 }
 
 static __device__ inline void craftax_place_block_native(
@@ -5580,10 +5666,10 @@ static __device__ inline void craftax_place_block_native(
     int32_t action
 ) {
     int32_t direction[2];
-    craftax_step_direction(state->player_direction, direction);
+    craftax_step_direction(CF(player_direction, state), direction);
 
-    int32_t row = state->player_position[0] + direction[0];
-    int32_t col = state->player_position[1] + direction[1];
+    int32_t row = CF2(player_position, 0, state) + direction[0];
+    int32_t col = CF2(player_position, 1, state) + direction[1];
     bool in_bounds = row >= 0
         && row < CRAFTAX_MAP_SIZE
         && col >= 0
@@ -5594,7 +5680,7 @@ static __device__ inline void craftax_place_block_native(
     }
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     int32_t original_block = state->map[level][row][col];
@@ -5603,30 +5689,30 @@ static __device__ inline void craftax_place_block_native(
         craftax_step_is_solid_block(original_block)
         || original_item != CRAFTAX_ITEM_NONE;
 
-    CraftaxInventory* inventory = &state->inventory;
+    const void* const inventory = (const void*)state;
 
     bool is_placing_crafting_table =
         action == CRAFTAX_ACTION_PLACE_TABLE
         && !is_placement_on_solid_block_or_item
-        && inventory->wood >= 2;
+        && CF(inv_wood, inventory) >= 2;
     if (is_placing_crafting_table) {
         craftax_set_map_block(state, level, row, col, CRAFTAX_BLOCK_CRAFTING_TABLE);
     }
-    inventory->wood -= 2 * (int32_t)is_placing_crafting_table;
-    state->achievements[CRAFTAX_ACH_PLACE_TABLE] =
-        state->achievements[CRAFTAX_ACH_PLACE_TABLE]
+    CF(inv_wood, inventory) -= 2 * (int32_t)is_placing_crafting_table;
+    CF2(achievements, CRAFTAX_ACH_PLACE_TABLE, state) =
+        CF2(achievements, CRAFTAX_ACH_PLACE_TABLE, state)
         || is_placing_crafting_table;
 
     bool is_placing_furnace =
         action == CRAFTAX_ACTION_PLACE_FURNACE
         && !is_placement_on_solid_block_or_item
-        && inventory->stone > 0;
+        && CF(inv_stone, inventory) > 0;
     if (is_placing_furnace) {
         craftax_set_map_block(state, level, row, col, CRAFTAX_BLOCK_FURNACE);
     }
-    inventory->stone -= 1 * (int32_t)is_placing_furnace;
-    state->achievements[CRAFTAX_ACH_PLACE_FURNACE] =
-        state->achievements[CRAFTAX_ACH_PLACE_FURNACE]
+    CF(inv_stone, inventory) -= 1 * (int32_t)is_placing_furnace;
+    CF2(achievements, CRAFTAX_ACH_PLACE_FURNACE, state) =
+        CF2(achievements, CRAFTAX_ACH_PLACE_FURNACE, state)
         || is_placing_furnace;
 
     bool is_placing_on_valid_stone_block =
@@ -5635,13 +5721,13 @@ static __device__ inline void craftax_place_block_native(
     bool is_placing_stone =
         action == CRAFTAX_ACTION_PLACE_STONE
         && is_placing_on_valid_stone_block
-        && inventory->stone > 0;
+        && CF(inv_stone, inventory) > 0;
     if (is_placing_stone) {
         craftax_set_map_block(state, level, row, col, CRAFTAX_BLOCK_STONE);
     }
-    inventory->stone -= 1 * (int32_t)is_placing_stone;
-    state->achievements[CRAFTAX_ACH_PLACE_STONE] =
-        state->achievements[CRAFTAX_ACH_PLACE_STONE]
+    CF(inv_stone, inventory) -= 1 * (int32_t)is_placing_stone;
+    CF2(achievements, CRAFTAX_ACH_PLACE_STONE, state) =
+        CF2(achievements, CRAFTAX_ACH_PLACE_STONE, state)
         || is_placing_stone;
 
     bool is_placing_on_valid_torch_block =
@@ -5650,20 +5736,20 @@ static __device__ inline void craftax_place_block_native(
     bool is_placing_torch =
         action == CRAFTAX_ACTION_PLACE_TORCH
         && is_placing_on_valid_torch_block
-        && inventory->torches > 0;
+        && CF(inv_torches, inventory) > 0;
     if (is_placing_torch) {
         state->item_map[level][row][col] = CRAFTAX_ITEM_TORCH;
         craftax_crafting_add_torch_light(state, level, row, col);
     }
-    inventory->torches -= 1 * (int32_t)is_placing_torch;
-    state->achievements[CRAFTAX_ACH_PLACE_TORCH] =
-        state->achievements[CRAFTAX_ACH_PLACE_TORCH]
+    CF(inv_torches, inventory) -= 1 * (int32_t)is_placing_torch;
+    CF2(achievements, CRAFTAX_ACH_PLACE_TORCH, state) =
+        CF2(achievements, CRAFTAX_ACH_PLACE_TORCH, state)
         || is_placing_torch;
 
     bool is_placing_sapling =
         action == CRAFTAX_ACTION_PLACE_PLANT
         && state->map[level][row][col] == CRAFTAX_BLOCK_GRASS
-        && inventory->sapling > 0
+        && CF(inv_sapling, inventory) > 0
         && state->item_map[level][row][col] == CRAFTAX_ITEM_NONE;
     if (is_placing_sapling) {
         int32_t position[2] = {row, col};
@@ -5674,9 +5760,9 @@ static __device__ inline void craftax_place_block_native(
             is_placing_sapling
         );
     }
-    inventory->sapling -= 1 * (int32_t)is_placing_sapling;
-    state->achievements[CRAFTAX_ACH_PLACE_PLANT] =
-        state->achievements[CRAFTAX_ACH_PLACE_PLANT]
+    CF(inv_sapling, inventory) -= 1 * (int32_t)is_placing_sapling;
+    CF2(achievements, CRAFTAX_ACH_PLACE_PLANT, state) =
+        CF2(achievements, CRAFTAX_ACH_PLACE_PLANT, state)
         || is_placing_sapling;
 }
 
@@ -5730,12 +5816,12 @@ static __device__ inline int32_t craftax_medium_choice_weighted(
 
 static __device__ inline int32_t craftax_medium_projectile_count(const CraftaxState* state) {
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     int32_t count = 0;
     for (int32_t i = 0; i < CRAFTAX_MAX_PLAYER_PROJECTILES; i++) {
-        count += (int32_t)state->player_projectiles.mask[level][i];
+        count += (int32_t)MOB_MASK(4, level, i, state);
     }
     return count;
 }
@@ -5744,11 +5830,11 @@ static __device__ inline int32_t craftax_medium_first_projectile_slot(
     const CraftaxState* state
 ) {
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     for (int32_t i = 0; i < CRAFTAX_MAX_PLAYER_PROJECTILES; i++) {
-        if (!state->player_projectiles.mask[level][i]) {
+        if (!MOB_MASK(4, level, i, state)) {
             return i;
         }
     }
@@ -5767,16 +5853,16 @@ static __device__ inline void craftax_medium_spawn_player_projectile(
     }
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     int32_t index = craftax_medium_first_projectile_slot(state);
-    state->player_projectiles.position[level][index][0] = new_projectile_position[0];
-    state->player_projectiles.position[level][index][1] = new_projectile_position[1];
-    state->player_projectiles.mask[level][index] = true;
-    state->player_projectiles.type_id[level][index] = projectile_type;
-    state->player_projectile_directions[level][index][0] = direction[0];
-    state->player_projectile_directions[level][index][1] = direction[1];
+    MOB_POS(4, level, index, 0, state) = new_projectile_position[0];
+    MOB_POS(4, level, index, 1, state) = new_projectile_position[1];
+    MOB_MASK(4, level, index, state) = true;
+    MOB_TYPE(4, level, index, state) = projectile_type;
+    CF2(player_projectile_directions, (level) * 6 + (index) * 2 + (0), state) = direction[0];
+    CF2(player_projectile_directions, (level) * 6 + (index) * 2 + (1), state) = direction[1];
 }
 
 static __device__ inline int32_t craftax_medium_level_achievement(int32_t level) {
@@ -5807,23 +5893,25 @@ static __device__ inline void craftax_shoot_projectile_native(
     int32_t action
 ) {
     bool is_shooting_arrow = action == CRAFTAX_ACTION_SHOOT_ARROW
-        && state->inventory.bow >= 1
-        && state->inventory.arrows >= 1
+        && CF(inv_bow, state) >= 1
+        && CF(inv_arrows, state) >= 1
         && craftax_medium_projectile_count(state) < CRAFTAX_MAX_PLAYER_PROJECTILES;
 
     int32_t direction[2];
-    craftax_step_direction(state->player_direction, direction);
+    craftax_step_direction(CF(player_direction, state), direction);
+    int32_t cf_pp_tmp[2] = {
+        CF2(player_position, 0, state), CF2(player_position, 1, state)};
     craftax_medium_spawn_player_projectile(
         state,
         is_shooting_arrow,
-        state->player_position,
+        cf_pp_tmp,
         direction,
         CRAFTAX_PROJECTILE_ARROW2
     );
 
-    state->achievements[CRAFTAX_ACH_FIRE_BOW] =
-        state->achievements[CRAFTAX_ACH_FIRE_BOW] || is_shooting_arrow;
-    state->inventory.arrows -= (int32_t)is_shooting_arrow;
+    CF2(achievements, CRAFTAX_ACH_FIRE_BOW, state) =
+        CF2(achievements, CRAFTAX_ACH_FIRE_BOW, state) || is_shooting_arrow;
+    CF(inv_arrows, state) -= (int32_t)is_shooting_arrow;
 }
 
 static __device__ inline void craftax_cast_spell_native(
@@ -5832,15 +5920,15 @@ static __device__ inline void craftax_cast_spell_native(
 ) {
     bool has_projectile_slot =
         craftax_medium_projectile_count(state) < CRAFTAX_MAX_PLAYER_PROJECTILES;
-    bool has_mana = state->player_mana >= 2;
+    bool has_mana = CF(player_mana, state) >= 2;
     bool is_casting_fireball = action == CRAFTAX_ACTION_CAST_FIREBALL
         && has_mana
         && has_projectile_slot
-        && state->learned_spells[0];
+        && CF2(learned_spells, 0, state);
     bool is_casting_iceball = action == CRAFTAX_ACTION_CAST_ICEBALL
         && has_mana
         && has_projectile_slot
-        && state->learned_spells[1];
+        && CF2(learned_spells, 1, state);
     bool is_casting_spell = is_casting_fireball || is_casting_iceball;
 
     int32_t projectile_type =
@@ -5848,22 +5936,24 @@ static __device__ inline void craftax_cast_spell_native(
         + (int32_t)is_casting_iceball * CRAFTAX_PROJECTILE_ICEBALL;
 
     int32_t direction[2];
-    craftax_step_direction(state->player_direction, direction);
+    craftax_step_direction(CF(player_direction, state), direction);
+    int32_t cf_pp_tmp[2] = {
+        CF2(player_position, 0, state), CF2(player_position, 1, state)};
     craftax_medium_spawn_player_projectile(
         state,
         is_casting_spell,
-        state->player_position,
+        cf_pp_tmp,
         direction,
         projectile_type
     );
 
     if (is_casting_fireball) {
-        state->achievements[CRAFTAX_ACH_CAST_FIREBALL] = true;
+        CF2(achievements, CRAFTAX_ACH_CAST_FIREBALL, state) = true;
     }
     if (is_casting_iceball) {
-        state->achievements[CRAFTAX_ACH_CAST_ICEBALL] = true;
+        CF2(achievements, CRAFTAX_ACH_CAST_ICEBALL, state) = true;
     }
-    state->player_mana -= (int32_t)is_casting_spell * 2;
+    CF(player_mana, state) -= (int32_t)is_casting_spell * 2;
 }
 
 static __device__ inline void craftax_enchant_native(
@@ -5872,18 +5962,18 @@ static __device__ inline void craftax_enchant_native(
     CraftaxThreefryKey rng
 ) {
     int32_t direction[2];
-    craftax_step_direction(state->player_direction, direction);
+    craftax_step_direction(CF(player_direction, state), direction);
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     int32_t target_row = craftax_step_jax_index(
-        state->player_position[0] + direction[0],
+        CF2(player_position, 0, state) + direction[0],
         CRAFTAX_MAP_SIZE
     );
     int32_t target_col = craftax_step_jax_index(
-        state->player_position[1] + direction[1],
+        CF2(player_position, 1, state) + direction[1],
         CRAFTAX_MAP_SIZE
     );
     int32_t target_block = state->map[level][target_row][target_col];
@@ -5893,22 +5983,22 @@ static __device__ inline void craftax_enchant_native(
     bool target_block_is_enchantment_table = is_fire_table || is_ice_table;
     int32_t enchantment_type = is_fire_table ? 1 : 2;
     int32_t num_gems = is_fire_table
-        ? state->inventory.ruby
-        : state->inventory.sapphire;
+        ? CF(inv_ruby, state)
+        : CF(inv_sapphire, state);
 
-    bool could_enchant = state->player_mana >= 9
+    bool could_enchant = CF(player_mana, state) >= 9
         && target_block_is_enchantment_table
         && num_gems >= 1;
     bool is_enchanting_bow = could_enchant
         && action == CRAFTAX_ACTION_ENCHANT_BOW
-        && state->inventory.bow > 0;
+        && CF(inv_bow, state) > 0;
     bool is_enchanting_sword = could_enchant
         && action == CRAFTAX_ACTION_ENCHANT_SWORD
-        && state->inventory.sword > 0;
+        && CF(inv_sword, state) > 0;
 
     int32_t armour_count = 0;
     for (int32_t i = 0; i < 4; i++) {
-        armour_count += state->inventory.armour[i];
+        armour_count += CF2(inv_armour, i, state);
     }
     bool is_enchanting_armour = could_enchant
         && action == CRAFTAX_ACTION_ENCHANT_ARMOUR
@@ -5917,14 +6007,14 @@ static __device__ inline void craftax_enchant_native(
     CraftaxThreefryKey armour_key = craftax_medium_next_random_key(&rng);
     int32_t unenchanted_count = 0;
     for (int32_t i = 0; i < 4; i++) {
-        unenchanted_count += (int32_t)(state->armour_enchantments[i] == 0);
+        unenchanted_count += (int32_t)(CF2(armour_enchantments, i, state) == 0);
     }
 
     float armour_targets[4];
     for (int32_t i = 0; i < 4; i++) {
-        bool unenchanted = state->armour_enchantments[i] == 0;
-        bool opposite_enchanted = state->armour_enchantments[i] != 0
-            && state->armour_enchantments[i] != enchantment_type;
+        bool unenchanted = CF2(armour_enchantments, i, state) == 0;
+        bool opposite_enchanted = CF2(armour_enchantments, i, state) != 0
+            && CF2(armour_enchantments, i, state) != enchantment_type;
         armour_targets[i] = (unenchanted || (
             unenchanted_count == 0 && opposite_enchanted
         )) ? 1.0f : 0.0f;
@@ -5939,22 +6029,22 @@ static __device__ inline void craftax_enchant_native(
         || is_enchanting_bow
         || is_enchanting_armour;
     if (is_enchanting_sword) {
-        state->sword_enchantment = enchantment_type;
-        state->achievements[CRAFTAX_ACH_ENCHANT_SWORD] = true;
+        CF(sword_enchantment, state) = enchantment_type;
+        CF2(achievements, CRAFTAX_ACH_ENCHANT_SWORD, state) = true;
     }
     if (is_enchanting_bow) {
-        state->bow_enchantment = enchantment_type;
+        CF(bow_enchantment, state) = enchantment_type;
     }
     if (is_enchanting_armour) {
-        state->armour_enchantments[armour_target] = enchantment_type;
-        state->achievements[CRAFTAX_ACH_ENCHANT_ARMOUR] = true;
+        CF2(armour_enchantments, armour_target, state) = enchantment_type;
+        CF2(achievements, CRAFTAX_ACH_ENCHANT_ARMOUR, state) = true;
     }
 
-    state->inventory.sapphire -=
+    CF(inv_sapphire, state) -=
         (int32_t)is_enchanting * (int32_t)(enchantment_type == 2);
-    state->inventory.ruby -=
+    CF(inv_ruby, state) -=
         (int32_t)is_enchanting * (int32_t)(enchantment_type == 1);
-    state->player_mana -= (int32_t)is_enchanting * 9;
+    CF(player_mana, state) -= (int32_t)is_enchanting * 9;
 }
 
 static __device__ inline void craftax_change_floor_native(
@@ -5962,15 +6052,15 @@ static __device__ inline void craftax_change_floor_native(
     int32_t action
 ) {
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     int32_t player_row = craftax_step_jax_index(
-        state->player_position[0],
+        CF2(player_position, 0, state),
         CRAFTAX_MAP_SIZE
     );
     int32_t player_col = craftax_step_jax_index(
-        state->player_position[1],
+        CF2(player_position, 1, state),
         CRAFTAX_MAP_SIZE
     );
 
@@ -5978,47 +6068,47 @@ static __device__ inline void craftax_change_floor_native(
         state->item_map[level][player_row][player_col] == CRAFTAX_ITEM_LADDER_DOWN;
     bool is_moving_down = action == CRAFTAX_ACTION_DESCEND
         && on_down_ladder
-        && state->monsters_killed[level] >= CRAFTAX_MONSTERS_KILLED_TO_CLEAR_LEVEL
-        && state->player_level < CRAFTAX_NUM_LEVELS - 1;
+        && CF2(monsters_killed, level, state) >= CRAFTAX_MONSTERS_KILLED_TO_CLEAR_LEVEL
+        && CF(player_level, state) < CRAFTAX_NUM_LEVELS - 1;
 
     bool on_up_ladder =
         state->item_map[level][player_row][player_col] == CRAFTAX_ITEM_LADDER_UP;
     bool is_moving_up = action == CRAFTAX_ACTION_ASCEND
         && on_up_ladder
-        && state->player_level > 0;
+        && CF(player_level, state) > 0;
 
     int32_t delta_floor = (int32_t)is_moving_down - (int32_t)is_moving_up;
-    int32_t new_level = state->player_level + delta_floor;
+    int32_t new_level = CF(player_level, state) + delta_floor;
     int32_t achievement = craftax_medium_level_achievement(new_level);
-    bool new_floor = new_level != 0 && !state->achievements[achievement];
+    bool new_floor = new_level != 0 && !CF2(achievements, achievement, state);
 
     if (is_moving_down) {
         int32_t ladder_level = craftax_step_jax_index(
-            state->player_level + 1,
+            CF(player_level, state) + 1,
             CRAFTAX_NUM_LEVELS
         );
         craftax_ensure_floor_generated(state, ladder_level);
-        state->player_position[0] = state->up_ladders[ladder_level][0];
-        state->player_position[1] = state->up_ladders[ladder_level][1];
+        CF2(player_position, 0, state) = state->up_ladders[ladder_level][0];
+        CF2(player_position, 1, state) = state->up_ladders[ladder_level][1];
     } else if (is_moving_up) {
         int32_t ladder_level = craftax_step_jax_index(
-            state->player_level - 1,
+            CF(player_level, state) - 1,
             CRAFTAX_NUM_LEVELS
         );
         craftax_ensure_floor_generated(state, ladder_level);
-        state->player_position[0] = state->down_ladders[ladder_level][0];
-        state->player_position[1] = state->down_ladders[ladder_level][1];
+        CF2(player_position, 0, state) = state->down_ladders[ladder_level][0];
+        CF2(player_position, 1, state) = state->down_ladders[ladder_level][1];
     }
 
-    state->player_level = new_level;
-    state->achievements[achievement] =
-        state->achievements[achievement] || new_level != 0;
-    state->player_xp += (int32_t)new_floor;
+    CF(player_level, state) = new_level;
+    CF2(achievements, achievement, state) =
+        CF2(achievements, achievement, state) || new_level != 0;
+    CF(player_xp, state) += (int32_t)new_floor;
 }
 
 static __device__ inline void craftax_add_items_from_chest_native(
     const CraftaxState* state,
-    CraftaxInventory* inventory,
+    const void* inventory,
     bool is_opening_chest,
     CraftaxThreefryKey rng
 ) {
@@ -6097,11 +6187,11 @@ static __device__ inline void craftax_add_items_from_chest_native(
     ) * (int32_t)is_looting_pickaxe;
     pickaxe_loot_level = craftax_step_maxi32(
         pickaxe_loot_level,
-        inventory->pickaxe
+        CF(inv_pickaxe, inventory)
     );
     int32_t new_pickaxe_level = is_looting_pickaxe
         ? pickaxe_loot_level
-        : inventory->pickaxe;
+        : CF(inv_pickaxe, inventory);
 
     bool is_looting_sword = is_looting_tool
         && tool_id == 1
@@ -6110,37 +6200,37 @@ static __device__ inline void craftax_add_items_from_chest_native(
     int32_t sword_loot_level = (
         craftax_medium_choice_weighted(draw_key, tool_weights, 4) + 1
     ) * (int32_t)is_looting_sword;
-    sword_loot_level = craftax_step_maxi32(sword_loot_level, inventory->sword);
+    sword_loot_level = craftax_step_maxi32(sword_loot_level, CF(inv_sword, inventory));
     int32_t new_sword_level = is_looting_sword
         ? sword_loot_level
-        : inventory->sword;
+        : CF(inv_sword, inventory);
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     bool is_looting_bow = is_opening_chest
-        && state->player_level == 1
-        && !state->chests_opened[level];
-    int32_t new_bow_level = is_looting_bow ? 1 : inventory->bow;
+        && CF(player_level, state) == 1
+        && !CF2(chests_opened, level, state);
+    int32_t new_bow_level = is_looting_bow ? 1 : CF(inv_bow, inventory);
 
-    bool is_looting_book = !state->chests_opened[level]
-        && (state->player_level == 3 || state->player_level == 4);
+    bool is_looting_book = !CF2(chests_opened, level, state)
+        && (CF(player_level, state) == 3 || CF(player_level, state) == 4);
 
     int32_t opening = (int32_t)is_opening_chest;
-    inventory->torches += torch_loot_amount * opening;
-    inventory->coal += coal_loot_amount * opening;
-    inventory->iron += iron_loot_amount * opening;
-    inventory->diamond += diamond_loot_amount * opening;
-    inventory->sapphire += sapphire_loot_amount * opening;
-    inventory->ruby += ruby_loot_amount * opening;
-    inventory->arrows += arrows_loot_amount * opening;
-    inventory->pickaxe = new_pickaxe_level;
-    inventory->sword = new_sword_level;
-    inventory->potions[potion_loot_index] +=
+    CF(inv_torches, inventory) += torch_loot_amount * opening;
+    CF(inv_coal, inventory) += coal_loot_amount * opening;
+    CF(inv_iron, inventory) += iron_loot_amount * opening;
+    CF(inv_diamond, inventory) += diamond_loot_amount * opening;
+    CF(inv_sapphire, inventory) += sapphire_loot_amount * opening;
+    CF(inv_ruby, inventory) += ruby_loot_amount * opening;
+    CF(inv_arrows, inventory) += arrows_loot_amount * opening;
+    CF(inv_pickaxe, inventory) = new_pickaxe_level;
+    CF(inv_sword, inventory) = new_sword_level;
+    CF2(inv_potions, potion_loot_index, inventory) +=
         potion_loot_amount * (int32_t)is_looting_potion * opening;
-    inventory->bow = new_bow_level;
-    inventory->books += (int32_t)is_looting_book * opening;
+    CF(inv_bow, inventory) = new_bow_level;
+    CF(inv_books, inventory) += (int32_t)is_looting_book * opening;
 }
 
 // ============================================================
@@ -6266,16 +6356,16 @@ static __device__ inline void craftax_do_action_player_damage_vector(
 ) {
     static const float physical_damages[5] = {1.0f, 2.0f, 3.0f, 5.0f, 8.0f};
 
-    int32_t sword_index = craftax_step_jax_index(state->inventory.sword, 5);
+    int32_t sword_index = craftax_step_jax_index(CF(inv_sword, state), 5);
     float physical_damage = physical_damages[sword_index];
     float fire_damage =
-        physical_damage * (float)(state->sword_enchantment == 1) * 0.5f;
+        physical_damage * (float)(CF(sword_enchantment, state) == 1) * 0.5f;
     float ice_damage =
-        physical_damage * (float)(state->sword_enchantment == 2) * 0.5f;
+        physical_damage * (float)(CF(sword_enchantment, state) == 2) * 0.5f;
 
-    physical_damage *= 1.0f + 0.25f * (float)(state->player_strength - 1);
-    fire_damage *= 1.0f + 0.05f * (float)(state->player_intelligence - 1);
-    ice_damage *= 1.0f + 0.05f * (float)(state->player_intelligence - 1);
+    physical_damage *= 1.0f + 0.25f * (float)(CF(player_strength, state) - 1);
+    fire_damage *= 1.0f + 0.05f * (float)(CF(player_intelligence, state) - 1);
+    ice_damage *= 1.0f + 0.05f * (float)(CF(player_intelligence, state) - 1);
 
     damage_vector[0] = physical_damage;
     damage_vector[1] = fire_damage;
@@ -6299,27 +6389,27 @@ static __device__ inline float craftax_do_action_damage_done(
     return damage;
 }
 
-static __device__ inline void craftax_do_action_refresh_mobs3_masks(CraftaxMobs3* mobs) {
+static __device__ inline void craftax_do_action_refresh_mobs3_masks(void* mobs, int mc) {
     for (int32_t level = 0; level < CRAFTAX_NUM_LEVELS; level++) {
         for (int32_t i = 0; i < 3; i++) {
-            mobs->mask[level][i] =
-                mobs->mask[level][i] && mobs->health[level][i] > 0.0f;
+            MOB_MASK(mc, level, i, mobs) =
+                MOB_MASK(mc, level, i, mobs) && MOB_HP(mc, level, i, mobs) > 0.0f;
         }
     }
 }
 
-static __device__ inline void craftax_do_action_refresh_mobs2_masks(CraftaxMobs2* mobs) {
+static __device__ inline void craftax_do_action_refresh_mobs2_masks(void* mobs, int mc) {
     for (int32_t level = 0; level < CRAFTAX_NUM_LEVELS; level++) {
         for (int32_t i = 0; i < 2; i++) {
-            mobs->mask[level][i] =
-                mobs->mask[level][i] && mobs->health[level][i] > 0.0f;
+            MOB_MASK(mc, level, i, mobs) =
+                MOB_MASK(mc, level, i, mobs) && MOB_HP(mc, level, i, mobs) > 0.0f;
         }
     }
 }
 
 static __device__ inline void craftax_do_action_attack_mobs3(
     CraftaxState* state,
-    CraftaxMobs3* mobs,
+    void* mobs, int mc,
     int32_t row,
     int32_t col,
     const float damage_vector[3],
@@ -6329,7 +6419,7 @@ static __device__ inline void craftax_do_action_attack_mobs3(
     bool* is_attacking_mob
 ) {
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     bool is_attacking_array[3];
@@ -6337,40 +6427,40 @@ static __device__ inline void craftax_do_action_attack_mobs3(
     int32_t target_mob_index = 0;
 
     for (int32_t i = 0; i < 3; i++) {
-        bool in_mob = mobs->position[level][i][0] == row
-            && mobs->position[level][i][1] == col;
-        is_attacking_array[i] = in_mob && mobs->mask[level][i];
+        bool in_mob = MOB_POS(mc, level, i, 0, mobs) == row
+            && MOB_POS(mc, level, i, 1, mobs) == col;
+        is_attacking_array[i] = in_mob && MOB_MASK(mc, level, i, mobs);
         if (is_attacking_array[i] && !*is_attacking_mob) {
             target_mob_index = i;
         }
         *is_attacking_mob = *is_attacking_mob || is_attacking_array[i];
     }
 
-    int32_t target_type_id = mobs->type_id[level][target_mob_index];
+    int32_t target_type_id = MOB_TYPE(mc, level, target_mob_index, mobs);
     float damage = craftax_do_action_damage_done(
         damage_vector,
         target_type_id,
         mob_class_index
     );
-    mobs->health[level][target_mob_index] -=
+    MOB_HP(mc, level, target_mob_index, mobs) -=
         damage * (float)(int32_t)(*is_attacking_mob);
 
-    bool old_mask = mobs->mask[level][target_mob_index];
-    craftax_do_action_refresh_mobs3_masks(mobs);
-    *did_kill_mob = old_mask && !mobs->mask[level][target_mob_index];
+    bool old_mask = MOB_MASK(mc, level, target_mob_index, mobs);
+    craftax_do_action_refresh_mobs3_masks(mobs, mc);
+    *did_kill_mob = old_mask && !MOB_MASK(mc, level, target_mob_index, mobs);
 
     int32_t achievement_for_kill = craftax_do_action_mob_achievement(
         mob_class_index,
         target_type_id
     );
     bool unlock = *did_kill_mob && can_get_achievement;
-    state->achievements[achievement_for_kill] =
-        state->achievements[achievement_for_kill] || unlock;
+    CF2(achievements, achievement_for_kill, state) =
+        CF2(achievements, achievement_for_kill, state) || unlock;
 }
 
 static __device__ inline void craftax_do_action_attack_mobs2(
     CraftaxState* state,
-    CraftaxMobs2* mobs,
+    void* mobs, int mc,
     int32_t row,
     int32_t col,
     const float damage_vector[3],
@@ -6380,7 +6470,7 @@ static __device__ inline void craftax_do_action_attack_mobs2(
     bool* is_attacking_mob
 ) {
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     bool is_attacking_array[2];
@@ -6388,35 +6478,35 @@ static __device__ inline void craftax_do_action_attack_mobs2(
     int32_t target_mob_index = 0;
 
     for (int32_t i = 0; i < 2; i++) {
-        bool in_mob = mobs->position[level][i][0] == row
-            && mobs->position[level][i][1] == col;
-        is_attacking_array[i] = in_mob && mobs->mask[level][i];
+        bool in_mob = MOB_POS(mc, level, i, 0, mobs) == row
+            && MOB_POS(mc, level, i, 1, mobs) == col;
+        is_attacking_array[i] = in_mob && MOB_MASK(mc, level, i, mobs);
         if (is_attacking_array[i] && !*is_attacking_mob) {
             target_mob_index = i;
         }
         *is_attacking_mob = *is_attacking_mob || is_attacking_array[i];
     }
 
-    int32_t target_type_id = mobs->type_id[level][target_mob_index];
+    int32_t target_type_id = MOB_TYPE(mc, level, target_mob_index, mobs);
     float damage = craftax_do_action_damage_done(
         damage_vector,
         target_type_id,
         mob_class_index
     );
-    mobs->health[level][target_mob_index] -=
+    MOB_HP(mc, level, target_mob_index, mobs) -=
         damage * (float)(int32_t)(*is_attacking_mob);
 
-    bool old_mask = mobs->mask[level][target_mob_index];
-    craftax_do_action_refresh_mobs2_masks(mobs);
-    *did_kill_mob = old_mask && !mobs->mask[level][target_mob_index];
+    bool old_mask = MOB_MASK(mc, level, target_mob_index, mobs);
+    craftax_do_action_refresh_mobs2_masks(mobs, mc);
+    *did_kill_mob = old_mask && !MOB_MASK(mc, level, target_mob_index, mobs);
 
     int32_t achievement_for_kill = craftax_do_action_mob_achievement(
         mob_class_index,
         target_type_id
     );
     bool unlock = *did_kill_mob && can_get_achievement;
-    state->achievements[achievement_for_kill] =
-        state->achievements[achievement_for_kill] || unlock;
+    CF2(achievements, achievement_for_kill, state) =
+        CF2(achievements, achievement_for_kill, state) || unlock;
 }
 
 static __device__ inline bool craftax_do_action_update_index(
@@ -6445,17 +6535,17 @@ static __device__ inline void craftax_do_action_update_mob_map(
     }
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     int32_t read_row = craftax_step_jax_index(row, CRAFTAX_MAP_SIZE);
     int32_t read_col = craftax_step_jax_index(col, CRAFTAX_MAP_SIZE);
-    bool old_value = (state->mob_bits[level][read_row] >> read_col) & 1ULL;
+    bool old_value = (CF_BITS(mob_bits, level, read_row, state) >> read_col) & 1ULL;
     bool new_value = old_value && !did_kill_mob;
     if (new_value) {
-        state->mob_bits[level][update_row] |= (1ULL << update_col);
+        CF_BITS(mob_bits, level, update_row, state) |= (1ULL << update_col);
     } else {
-        state->mob_bits[level][update_row] &= ~(1ULL << update_col);
+        CF_BITS(mob_bits, level, update_row, state) &= ~(1ULL << update_col);
     }
 }
 
@@ -6474,7 +6564,7 @@ static __device__ inline void craftax_do_action_attack_mob(
     bool is_attacking_melee_mob = false;
     craftax_do_action_attack_mobs3(
         state,
-        &state->melee_mobs,
+        state, 0,
         row,
         col,
         damage_vector,
@@ -6488,7 +6578,7 @@ static __device__ inline void craftax_do_action_attack_mob(
     bool is_attacking_passive_mob = false;
     craftax_do_action_attack_mobs3(
         state,
-        &state->passive_mobs,
+        state, 1,
         row,
         col,
         damage_vector,
@@ -6499,18 +6589,18 @@ static __device__ inline void craftax_do_action_attack_mob(
     );
 
     if (did_kill_passive_mob && can_eat) {
-        state->player_food = craftax_step_mini32(
+        CF(player_food, state) = craftax_step_mini32(
             craftax_step_get_max_food(state),
-            state->player_food + 6
+            CF(player_food, state) + 6
         );
-        state->player_hunger = 0.0f;
+        CF(player_hunger, state) = 0.0f;
     }
 
     bool did_kill_ranged_mob = false;
     bool is_attacking_ranged_mob = false;
     craftax_do_action_attack_mobs2(
         state,
-        &state->ranged_mobs,
+        state, 2,
         row,
         col,
         damage_vector,
@@ -6529,10 +6619,10 @@ static __device__ inline void craftax_do_action_attack_mob(
     craftax_do_action_update_mob_map(state, row, col, *did_kill_mob);
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
-    state->monsters_killed[level] += (int32_t)did_kill_monster;
+    CF2(monsters_killed, level, state) += (int32_t)did_kill_monster;
 }
 
 static __device__ inline bool craftax_do_action_in_bounds(int32_t row, int32_t col) {
@@ -6546,20 +6636,20 @@ static __device__ inline bool craftax_do_action_boss_vulnerable(
     const CraftaxState* state
 ) {
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     int32_t melee_count = 0;
     int32_t ranged_count = 0;
     for (int32_t i = 0; i < CRAFTAX_MAX_MELEE_MOBS; i++) {
-        melee_count += (int32_t)state->melee_mobs.mask[level][i];
+        melee_count += (int32_t)MOB_MASK(0, level, i, state);
     }
     for (int32_t i = 0; i < CRAFTAX_MAX_RANGED_MOBS; i++) {
-        ranged_count += (int32_t)state->ranged_mobs.mask[level][i];
+        ranged_count += (int32_t)MOB_MASK(2, level, i, state);
     }
     return melee_count == 0
         && ranged_count == 0
-        && state->boss_timesteps_to_spawn_this_round <= 0;
+        && CF(boss_timesteps_to_spawn_this_round, state) <= 0;
 }
 
 static __device__ inline void craftax_do_action_update_plants_with_eat(
@@ -6570,14 +6660,14 @@ static __device__ inline void craftax_do_action_update_plants_with_eat(
     int32_t plant_index = 0;
     bool found = false;
     for (int32_t i = 0; i < CRAFTAX_MAX_GROWING_PLANTS; i++) {
-        bool is_plant = state->growing_plants_positions[i][0] == row
-            && state->growing_plants_positions[i][1] == col;
+        bool is_plant = CF2(growing_plants_positions, (i) * 2 + (0), state) == row
+            && CF2(growing_plants_positions, (i) * 2 + (1), state) == col;
         if (is_plant && !found) {
             plant_index = i;
             found = true;
         }
     }
-    state->growing_plants_age[plant_index] = 0;
+    CF2(growing_plants_age, plant_index, state) = 0;
 }
 
 static __device__ inline void craftax_do_action_native(
@@ -6590,9 +6680,9 @@ static __device__ inline void craftax_do_action_native(
     }
 
     int32_t direction[2];
-    craftax_step_direction(state->player_direction, direction);
-    int32_t target_row = state->player_position[0] + direction[0];
-    int32_t target_col = state->player_position[1] + direction[1];
+    craftax_step_direction(CF(player_direction, state), direction);
+    int32_t target_row = CF2(player_position, 0, state) + direction[0];
+    int32_t target_col = CF2(player_position, 1, state) + direction[1];
 
     bool did_attack_mob = false;
     bool did_kill_mob = false;
@@ -6607,7 +6697,7 @@ static __device__ inline void craftax_do_action_native(
     (void)did_kill_mob;
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     int32_t read_row = craftax_step_jax_index(target_row, CRAFTAX_MAP_SIZE);
@@ -6638,14 +6728,14 @@ static __device__ inline void craftax_do_action_native(
                     ? CRAFTAX_BLOCK_FIRE_GRASS
                     : CRAFTAX_BLOCK_ICE_GRASS);
             craftax_set_map_block(state, level, target_row, target_col, replacement);
-            state->inventory.wood += 1;
+            CF(inv_wood, state) += 1;
         }
 
         bool is_mining_stone = target_block == CRAFTAX_BLOCK_STONE
-            && state->inventory.pickaxe >= 1;
+            && CF(inv_pickaxe, state) >= 1;
         if (is_mining_stone) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PATH);
-            state->inventory.stone += 1;
+            CF(inv_stone, state) += 1;
         }
 
         if (target_block == CRAFTAX_BLOCK_FURNACE) {
@@ -6657,64 +6747,64 @@ static __device__ inline void craftax_do_action_native(
         }
 
         bool is_mining_coal = target_block == CRAFTAX_BLOCK_COAL
-            && state->inventory.pickaxe >= 1;
+            && CF(inv_pickaxe, state) >= 1;
         if (is_mining_coal) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PATH);
-            state->inventory.coal += 1;
+            CF(inv_coal, state) += 1;
         }
 
         bool is_mining_iron = target_block == CRAFTAX_BLOCK_IRON
-            && state->inventory.pickaxe >= 2;
+            && CF(inv_pickaxe, state) >= 2;
         if (is_mining_iron) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PATH);
-            state->inventory.iron += 1;
+            CF(inv_iron, state) += 1;
         }
 
         bool is_mining_diamond = target_block == CRAFTAX_BLOCK_DIAMOND
-            && state->inventory.pickaxe >= 3;
+            && CF(inv_pickaxe, state) >= 3;
         if (is_mining_diamond) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PATH);
-            state->inventory.diamond += 1;
+            CF(inv_diamond, state) += 1;
         }
 
         bool is_mining_sapphire = target_block == CRAFTAX_BLOCK_SAPPHIRE
-            && state->inventory.pickaxe >= 4;
+            && CF(inv_pickaxe, state) >= 4;
         if (is_mining_sapphire) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PATH);
-            state->inventory.sapphire += 1;
+            CF(inv_sapphire, state) += 1;
         }
 
         bool is_mining_ruby = target_block == CRAFTAX_BLOCK_RUBY
-            && state->inventory.pickaxe >= 4;
+            && CF(inv_pickaxe, state) >= 4;
         if (is_mining_ruby) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PATH);
-            state->inventory.ruby += 1;
+            CF(inv_ruby, state) += 1;
         }
 
         bool is_mining_sapling = target_block == CRAFTAX_BLOCK_GRASS
             && craftax_threefry_uniform_f32(sapling_key) < 0.1f;
-        state->inventory.sapling += (int32_t)is_mining_sapling;
+        CF(inv_sapling, state) += (int32_t)is_mining_sapling;
 
         bool is_drinking_water = target_block == CRAFTAX_BLOCK_WATER
             || target_block == CRAFTAX_BLOCK_FOUNTAIN;
         if (is_drinking_water) {
-            state->player_drink = craftax_step_mini32(
+            CF(player_drink, state) = craftax_step_mini32(
                 craftax_step_get_max_drink(state),
-                state->player_drink + 1
+                CF(player_drink, state) + 1
             );
-            state->player_thirst = 0.0f;
-            state->achievements[CRAFTAX_ACH_COLLECT_DRINK] = true;
+            CF(player_thirst, state) = 0.0f;
+            CF2(achievements, CRAFTAX_ACH_COLLECT_DRINK, state) = true;
         }
 
         bool is_eating_plant = target_block == CRAFTAX_BLOCK_RIPE_PLANT;
         if (is_eating_plant) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PLANT);
-            state->player_food = craftax_step_mini32(
+            CF(player_food, state) = craftax_step_mini32(
                 craftax_step_get_max_food(state),
-                state->player_food + 4
+                CF(player_food, state) + 4
             );
-            state->player_hunger = 0.0f;
-            state->achievements[CRAFTAX_ACH_EAT_PLANT] = true;
+            CF(player_hunger, state) = 0.0f;
+            CF2(achievements, CRAFTAX_ACH_EAT_PLANT, state) = true;
             craftax_do_action_update_plants_with_eat(
                 state,
                 target_row,
@@ -6723,34 +6813,34 @@ static __device__ inline void craftax_do_action_native(
         }
 
         bool is_mining_stalagmite = target_block == CRAFTAX_BLOCK_STALAGMITE
-            && state->inventory.pickaxe >= 1;
+            && CF(inv_pickaxe, state) >= 1;
         if (is_mining_stalagmite) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PATH);
-            state->inventory.stone += 1;
+            CF(inv_stone, state) += 1;
         }
 
         if (is_opening_chest) {
             craftax_set_map_block(state, level, target_row, target_col, CRAFTAX_BLOCK_PATH);
             craftax_add_items_from_chest_native(
                 state,
-                &state->inventory,
+                state,
                 true,
                 chest_key
             );
-            state->achievements[CRAFTAX_ACH_OPEN_CHEST] = true;
+            CF2(achievements, CRAFTAX_ACH_OPEN_CHEST, state) = true;
         }
 
         if (is_damaging_boss) {
-            state->achievements[CRAFTAX_ACH_DAMAGE_NECROMANCER] = true;
+            CF2(achievements, CRAFTAX_ACH_DAMAGE_NECROMANCER, state) = true;
         }
     }
 
-    state->chests_opened[level] =
-        state->chests_opened[level] || is_opening_chest;
+    CF2(chests_opened, level, state) =
+        CF2(chests_opened, level, state) || is_opening_chest;
 
-    state->boss_progress += (int32_t)is_damaging_boss;
+    CF(boss_progress, state) += (int32_t)is_damaging_boss;
     if (is_damaging_boss) {
-        state->boss_timesteps_to_spawn_this_round =
+        CF(boss_timesteps_to_spawn_this_round, state) =
             CRAFTAX_DO_ACTION_BOSS_FIGHT_SPAWN_TURNS;
     }
 }
@@ -6849,7 +6939,7 @@ static __device__ inline bool craftax_update_mobs_read_mob_map(
     int32_t map_level = craftax_step_jax_index(level, CRAFTAX_NUM_LEVELS);
     int32_t map_row = craftax_step_jax_index(row, CRAFTAX_MAP_SIZE);
     int32_t map_col = craftax_step_jax_index(col, CRAFTAX_MAP_SIZE);
-    return (state->mob_bits[map_level][map_row] >> map_col) & 1ULL;
+    return (CF_BITS(mob_bits, map_level, map_row, state) >> map_col) & 1ULL;
 }
 
 static __device__ inline void craftax_update_mobs_set_mob_map(
@@ -6880,9 +6970,9 @@ static __device__ inline void craftax_update_mobs_set_mob_map(
         return;
     }
     if (value) {
-        state->mob_bits[map_level][map_row] |= (1ULL << map_col);
+        CF_BITS(mob_bits, map_level, map_row, state) |= (1ULL << map_col);
     } else {
-        state->mob_bits[map_level][map_row] &= ~(1ULL << map_col);
+        CF_BITS(mob_bits, map_level, map_row, state) &= ~(1ULL << map_col);
     }
 }
 
@@ -7129,7 +7219,7 @@ static __device__ inline bool craftax_update_mobs_valid_position(
     const bool collision[3]
 ) {
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
     bool pos_in_bounds = craftax_update_mobs_in_bounds(row, col);
@@ -7152,8 +7242,8 @@ static __device__ inline int32_t craftax_update_mobs_manhattan_to_player(
     int32_t row,
     int32_t col
 ) {
-    return craftax_update_mobs_abs_i32(row - state->player_position[0])
-        + craftax_update_mobs_abs_i32(col - state->player_position[1]);
+    return craftax_update_mobs_abs_i32(row - CF2(player_position, 0, state))
+        + craftax_update_mobs_abs_i32(col - CF2(player_position, 1, state));
 }
 
 static __device__ inline float craftax_update_mobs_damage_done_to_player(
@@ -7162,11 +7252,11 @@ static __device__ inline float craftax_update_mobs_damage_done_to_player(
 ) {
     float defense_vector[3] = {0.0f, 0.0f, 0.0f};
     for (int32_t i = 0; i < 4; i++) {
-        defense_vector[0] += (float)state->inventory.armour[i] * 0.1f;
+        defense_vector[0] += (float)CF2(inv_armour, i, state) * 0.1f;
         defense_vector[1] +=
-            (float)(int32_t)(state->armour_enchantments[i] == 1) * 0.2f;
+            (float)(int32_t)(CF2(armour_enchantments, i, state) == 1) * 0.2f;
         defense_vector[2] +=
-            (float)(int32_t)(state->armour_enchantments[i] == 2) * 0.2f;
+            (float)(int32_t)(CF2(armour_enchantments, i, state) == 2) * 0.2f;
     }
 
     float boss_coeff = craftax_step_is_fighting_boss(state)
@@ -7183,18 +7273,18 @@ static __device__ inline int32_t craftax_update_mobs_count_mob_projectiles(
     const CraftaxState* state,
     int32_t level
 ) {
-    const bool* mask = state->mob_projectiles.mask[level];
-    return (int32_t)mask[0] + (int32_t)mask[1] + (int32_t)mask[2];
+    return (int32_t)MOB_MASK(3, level, 0, state)
+        + (int32_t)MOB_MASK(3, level, 1, state)
+        + (int32_t)MOB_MASK(3, level, 2, state);
 }
 
 static __device__ inline int32_t craftax_update_mobs_first_empty_mob_projectile(
     const CraftaxState* state,
     int32_t level
 ) {
-    const bool* mask = state->mob_projectiles.mask[level];
-    if (!mask[0]) return 0;
-    if (!mask[1]) return 1;
-    if (!mask[2]) return 2;
+    if (!MOB_MASK(3, level, 0, state)) return 0;
+    if (!MOB_MASK(3, level, 1, state)) return 1;
+    if (!MOB_MASK(3, level, 2, state)) return 2;
     return 0;
 }
 
@@ -7214,12 +7304,12 @@ static __device__ inline void craftax_update_mobs_spawn_mob_projectile(
         state,
         level
     );
-    state->mob_projectiles.position[level][index][0] = position[0];
-    state->mob_projectiles.position[level][index][1] = position[1];
-    state->mob_projectiles.mask[level][index] = true;
-    state->mob_projectiles.type_id[level][index] = projectile_type;
-    state->mob_projectile_directions[level][index][0] = direction[0];
-    state->mob_projectile_directions[level][index][1] = direction[1];
+    MOB_POS(3, level, index, 0, state) = position[0];
+    MOB_POS(3, level, index, 1, state) = position[1];
+    MOB_MASK(3, level, index, state) = true;
+    MOB_TYPE(3, level, index, state) = projectile_type;
+    CF2(mob_projectile_directions, (level) * 6 + (index) * 2 + (0), state) = direction[0];
+    CF2(mob_projectile_directions, (level) * 6 + (index) * 2 + (1), state) = direction[1];
 }
 
 static __device__ inline void craftax_update_mobs_attack_mob_with_damage(
@@ -7235,7 +7325,7 @@ static __device__ inline void craftax_update_mobs_attack_mob_with_damage(
     bool is_attacking_melee_mob = false;
     craftax_do_action_attack_mobs3(
         state,
-        &state->melee_mobs,
+        state, 0,
         row,
         col,
         damage_vector,
@@ -7249,7 +7339,7 @@ static __device__ inline void craftax_update_mobs_attack_mob_with_damage(
     bool is_attacking_passive_mob = false;
     craftax_do_action_attack_mobs3(
         state,
-        &state->passive_mobs,
+        state, 1,
         row,
         col,
         damage_vector,
@@ -7260,18 +7350,18 @@ static __device__ inline void craftax_update_mobs_attack_mob_with_damage(
     );
 
     if (did_kill_passive_mob && can_eat) {
-        state->player_food = craftax_step_mini32(
+        CF(player_food, state) = craftax_step_mini32(
             craftax_step_get_max_food(state),
-            state->player_food + 6
+            CF(player_food, state) + 6
         );
-        state->player_hunger = 0.0f;
+        CF(player_hunger, state) = 0.0f;
     }
 
     bool did_kill_ranged_mob = false;
     bool is_attacking_ranged_mob = false;
     craftax_do_action_attack_mobs2(
         state,
-        &state->ranged_mobs,
+        state, 2,
         row,
         col,
         damage_vector,
@@ -7290,10 +7380,10 @@ static __device__ inline void craftax_update_mobs_attack_mob_with_damage(
     craftax_do_action_update_mob_map(state, row, col, *did_kill_mob);
 
     int32_t level = craftax_step_jax_index(
-        state->player_level,
+        CF(player_level, state),
         CRAFTAX_NUM_LEVELS
     );
-    state->monsters_killed[level] += (int32_t)did_kill_monster;
+    CF2(monsters_killed, level, state) += (int32_t)did_kill_monster;
 }
 
 static __device__ inline void craftax_update_mobs_player_projectile_damage_vector(
@@ -7303,7 +7393,7 @@ static __device__ inline void craftax_update_mobs_player_projectile_damage_vecto
     float damage_vector[3]
 ) {
     int32_t projectile_type =
-        state->player_projectiles.type_id[level][projectile_index];
+        MOB_TYPE(4, level, projectile_index, state);
     craftax_update_mobs_damage_vector(
         projectile_type,
         CRAFTAX_MOB_PROJECTILE,
@@ -7311,7 +7401,7 @@ static __device__ inline void craftax_update_mobs_player_projectile_damage_vecto
     );
 
     float mask = (float)(int32_t)
-        state->player_projectiles.mask[level][projectile_index];
+        MOB_MASK(4, level, projectile_index, state);
     for (int32_t i = 0; i < 3; i++) {
         damage_vector[i] *= mask;
     }
@@ -7322,7 +7412,7 @@ static __device__ inline void craftax_update_mobs_player_projectile_damage_vecto
         float arrow_damage_add[3] = {0.0f, 0.0f, 0.0f};
         int32_t enchantment_index;
         if (craftax_update_mobs_scatter_index(
-                state->bow_enchantment,
+                CF(bow_enchantment, state),
                 3,
                 &enchantment_index
             )) {
@@ -7336,7 +7426,7 @@ static __device__ inline void craftax_update_mobs_player_projectile_damage_vecto
 
     if (is_arrow) {
         float arrow_damage_coeff =
-            1.0f + 0.2f * (float)(state->player_dexterity - 1);
+            1.0f + 0.2f * (float)(CF(player_dexterity, state) - 1);
         for (int32_t i = 0; i < 3; i++) {
             damage_vector[i] *= arrow_damage_coeff;
         }
@@ -7346,7 +7436,7 @@ static __device__ inline void craftax_update_mobs_player_projectile_damage_vecto
         || projectile_type == CRAFTAX_PROJECTILE_ICEBALL;
     if (is_magic_projectile) {
         float magic_damage_coeff =
-            1.0f + 0.5f * (float)(state->player_intelligence - 1);
+            1.0f + 0.5f * (float)(CF(player_intelligence, state) - 1);
         for (int32_t i = 0; i < 3; i++) {
             damage_vector[i] *= magic_damage_coeff;
         }
@@ -7358,8 +7448,8 @@ static __device__ inline void craftax_update_mobs_move_melee(
     CraftaxThreefryKey* rng,
     int32_t index
 ) {
-    int32_t level = state->player_level;
-    bool old_mask = state->melee_mobs.mask[level][index];
+    int32_t level = CF(player_level, state);
+    bool old_mask = MOB_MASK(0, level, index, state);
     // Dead slot early-out: no observable effect on obs/reward/terminal.
     // Skip body and RNG draws for speed. Breaks per-seed replay against
     // JAX; define CRAFTAX_JAX_PARITY at build time to restore the
@@ -7367,10 +7457,10 @@ static __device__ inline void craftax_update_mobs_move_melee(
 #ifndef CRAFTAX_JAX_PARITY
     if (!old_mask) return;
 #endif
-    int32_t old_row = state->melee_mobs.position[level][index][0];
-    int32_t old_col = state->melee_mobs.position[level][index][1];
-    int32_t old_cooldown = state->melee_mobs.attack_cooldown[level][index];
-    int32_t mob_type = state->melee_mobs.type_id[level][index];
+    int32_t old_row = MOB_POS(0, level, index, 0, state);
+    int32_t old_col = MOB_POS(0, level, index, 1, state);
+    int32_t old_cooldown = MOB_CD(0, level, index, state);
+    int32_t mob_type = MOB_TYPE(0, level, index, state);
 
     CraftaxThreefryKey draw_key =
         craftax_update_mobs_next_random_key(rng);
@@ -7380,9 +7470,9 @@ static __device__ inline void craftax_update_mobs_move_melee(
     int32_t random_col = old_col + random_direction[1];
 
     int32_t distance_row =
-        craftax_update_mobs_abs_i32(state->player_position[0] - old_row);
+        craftax_update_mobs_abs_i32(CF2(player_position, 0, state) - old_row);
     int32_t distance_col =
-        craftax_update_mobs_abs_i32(state->player_position[1] - old_col);
+        craftax_update_mobs_abs_i32(CF2(player_position, 1, state) - old_col);
     draw_key = craftax_update_mobs_next_random_key(rng);
     int32_t player_move_axis = craftax_update_mobs_player_axis_choice(
         draw_key,
@@ -7392,10 +7482,10 @@ static __device__ inline void craftax_update_mobs_move_melee(
     int32_t player_direction[2] = {0, 0};
     if (player_move_axis == 0) {
         player_direction[0] =
-            craftax_update_mobs_sign_i32(state->player_position[0] - old_row);
+            craftax_update_mobs_sign_i32(CF2(player_position, 0, state) - old_row);
     } else {
         player_direction[1] =
-            craftax_update_mobs_sign_i32(state->player_position[1] - old_col);
+            craftax_update_mobs_sign_i32(CF2(player_position, 1, state) - old_col);
     }
     int32_t player_row = old_row + player_direction[0];
     int32_t player_col = old_col + player_direction[1];
@@ -7424,7 +7514,7 @@ static __device__ inline void craftax_update_mobs_move_melee(
         CRAFTAX_MOB_MELEE,
         base_damage
     );
-    float sleeping_coeff = 1.0f + 2.5f * (float)(int32_t)state->is_sleeping;
+    float sleeping_coeff = 1.0f + 2.5f * (float)(int32_t)CF(is_sleeping, state);
     for (int32_t i = 0; i < 3; i++) {
         base_damage[i] *= sleeping_coeff;
     }
@@ -7434,12 +7524,12 @@ static __device__ inline void craftax_update_mobs_move_melee(
     );
 
     int32_t new_cooldown = is_attacking_player ? 5 : old_cooldown - 1;
-    bool is_waking_player = state->is_sleeping && is_attacking_player;
-    state->player_health -= damage * (float)(int32_t)is_attacking_player;
-    state->is_sleeping = state->is_sleeping && !is_attacking_player;
-    state->is_resting = state->is_resting && !is_attacking_player;
-    state->achievements[CRAFTAX_ACH_WAKE_UP] =
-        state->achievements[CRAFTAX_ACH_WAKE_UP] || is_waking_player;
+    bool is_waking_player = CF(is_sleeping, state) && is_attacking_player;
+    CF(player_health, state) -= damage * (float)(int32_t)is_attacking_player;
+    CF(is_sleeping, state) = CF(is_sleeping, state) && !is_attacking_player;
+    CF(is_resting, state) = CF(is_resting, state) && !is_attacking_player;
+    CF2(achievements, CRAFTAX_ACH_WAKE_UP, state) =
+        CF2(achievements, CRAFTAX_ACH_WAKE_UP, state) || is_waking_player;
 
     bool collision[3];
     craftax_update_mobs_collision_map(
@@ -7480,10 +7570,10 @@ static __device__ inline void craftax_update_mobs_move_melee(
         new_mask
     );
 
-    state->melee_mobs.position[level][index][0] = new_row;
-    state->melee_mobs.position[level][index][1] = new_col;
-    state->melee_mobs.attack_cooldown[level][index] = new_cooldown;
-    state->melee_mobs.mask[level][index] = new_mask;
+    MOB_POS(0, level, index, 0, state) = new_row;
+    MOB_POS(0, level, index, 1, state) = new_col;
+    MOB_CD(0, level, index, state) = new_cooldown;
+    MOB_MASK(0, level, index, state) = new_mask;
 }
 
 static __device__ inline void craftax_update_mobs_move_passive(
@@ -7491,14 +7581,14 @@ static __device__ inline void craftax_update_mobs_move_passive(
     CraftaxThreefryKey* rng,
     int32_t index
 ) {
-    int32_t level = state->player_level;
-    bool old_mask = state->passive_mobs.mask[level][index];
+    int32_t level = CF(player_level, state);
+    bool old_mask = MOB_MASK(1, level, index, state);
 #ifndef CRAFTAX_JAX_PARITY
     if (!old_mask) return;
 #endif
-    int32_t old_row = state->passive_mobs.position[level][index][0];
-    int32_t old_col = state->passive_mobs.position[level][index][1];
-    int32_t mob_type = state->passive_mobs.type_id[level][index];
+    int32_t old_row = MOB_POS(1, level, index, 0, state);
+    int32_t old_col = MOB_POS(1, level, index, 1, state);
+    int32_t mob_type = MOB_TYPE(1, level, index, state);
 
     CraftaxThreefryKey draw_key =
         craftax_update_mobs_next_random_key(rng);
@@ -7546,9 +7636,9 @@ static __device__ inline void craftax_update_mobs_move_passive(
         new_mask
     );
 
-    state->passive_mobs.position[level][index][0] = new_row;
-    state->passive_mobs.position[level][index][1] = new_col;
-    state->passive_mobs.mask[level][index] = new_mask;
+    MOB_POS(1, level, index, 0, state) = new_row;
+    MOB_POS(1, level, index, 1, state) = new_col;
+    MOB_MASK(1, level, index, state) = new_mask;
 }
 
 static __device__ inline void craftax_update_mobs_move_ranged(
@@ -7556,15 +7646,15 @@ static __device__ inline void craftax_update_mobs_move_ranged(
     CraftaxThreefryKey* rng,
     int32_t index
 ) {
-    int32_t level = state->player_level;
-    bool old_mask = state->ranged_mobs.mask[level][index];
+    int32_t level = CF(player_level, state);
+    bool old_mask = MOB_MASK(2, level, index, state);
 #ifndef CRAFTAX_JAX_PARITY
     if (!old_mask) return;
 #endif
-    int32_t old_row = state->ranged_mobs.position[level][index][0];
-    int32_t old_col = state->ranged_mobs.position[level][index][1];
-    int32_t old_cooldown = state->ranged_mobs.attack_cooldown[level][index];
-    int32_t mob_type = state->ranged_mobs.type_id[level][index];
+    int32_t old_row = MOB_POS(2, level, index, 0, state);
+    int32_t old_col = MOB_POS(2, level, index, 1, state);
+    int32_t old_cooldown = MOB_CD(2, level, index, state);
+    int32_t mob_type = MOB_TYPE(2, level, index, state);
 
     CraftaxThreefryKey draw_key =
         craftax_update_mobs_next_random_key(rng);
@@ -7574,9 +7664,9 @@ static __device__ inline void craftax_update_mobs_move_ranged(
     int32_t random_col = old_col + random_direction[1];
 
     int32_t distance_row =
-        craftax_update_mobs_abs_i32(state->player_position[0] - old_row);
+        craftax_update_mobs_abs_i32(CF2(player_position, 0, state) - old_row);
     int32_t distance_col =
-        craftax_update_mobs_abs_i32(state->player_position[1] - old_col);
+        craftax_update_mobs_abs_i32(CF2(player_position, 1, state) - old_col);
     draw_key = craftax_update_mobs_next_random_key(rng);
     int32_t player_move_axis = craftax_update_mobs_player_axis_choice(
         draw_key,
@@ -7586,10 +7676,10 @@ static __device__ inline void craftax_update_mobs_move_ranged(
     int32_t player_direction[2] = {0, 0};
     if (player_move_axis == 0) {
         player_direction[0] =
-            craftax_update_mobs_sign_i32(state->player_position[0] - old_row);
+            craftax_update_mobs_sign_i32(CF2(player_position, 0, state) - old_row);
     } else {
         player_direction[1] =
-            craftax_update_mobs_sign_i32(state->player_position[1] - old_col);
+            craftax_update_mobs_sign_i32(CF2(player_position, 1, state) - old_col);
     }
     int32_t towards_row = old_row + player_direction[0];
     int32_t towards_col = old_col + player_direction[1];
@@ -7684,31 +7774,31 @@ static __device__ inline void craftax_update_mobs_move_ranged(
         new_mask
     );
 
-    state->ranged_mobs.position[level][index][0] = new_row;
-    state->ranged_mobs.position[level][index][1] = new_col;
-    state->ranged_mobs.attack_cooldown[level][index] = new_cooldown;
-    state->ranged_mobs.mask[level][index] = new_mask;
+    MOB_POS(2, level, index, 0, state) = new_row;
+    MOB_POS(2, level, index, 1, state) = new_col;
+    MOB_CD(2, level, index, state) = new_cooldown;
+    MOB_MASK(2, level, index, state) = new_mask;
 }
 
 static __device__ inline void craftax_update_mobs_move_mob_projectile(
     CraftaxState* state,
     int32_t index
 ) {
-    int32_t level = state->player_level;
-    bool old_mask = state->mob_projectiles.mask[level][index];
+    int32_t level = CF(player_level, state);
+    bool old_mask = MOB_MASK(3, level, index, state);
 #ifndef CRAFTAX_JAX_PARITY
     if (!old_mask) return;
 #endif
-    int32_t old_row = state->mob_projectiles.position[level][index][0];
-    int32_t old_col = state->mob_projectiles.position[level][index][1];
+    int32_t old_row = MOB_POS(3, level, index, 0, state);
+    int32_t old_col = MOB_POS(3, level, index, 1, state);
     int32_t proposed_row =
-        old_row + state->mob_projectile_directions[level][index][0];
+        old_row + CF2(mob_projectile_directions, (level) * 6 + (index) * 2 + (0), state);
     int32_t proposed_col =
-        old_col + state->mob_projectile_directions[level][index][1];
+        old_col + CF2(mob_projectile_directions, (level) * 6 + (index) * 2 + (1), state);
 
     bool proposed_in_player =
-        proposed_row == state->player_position[0]
-        && proposed_col == state->player_position[1];
+        proposed_row == CF2(player_position, 0, state)
+        && proposed_col == CF2(player_position, 1, state);
     bool proposed_in_bounds = craftax_update_mobs_in_bounds(
         proposed_row,
         proposed_col
@@ -7725,8 +7815,8 @@ static __device__ inline void craftax_update_mobs_move_mob_projectile(
     bool continue_move = proposed_in_bounds && !in_wall && !in_mob;
 
     bool hit_player0 =
-        old_row == state->player_position[0]
-        && old_col == state->player_position[1]
+        old_row == CF2(player_position, 0, state)
+        && old_col == CF2(player_position, 1, state)
         && old_mask;
     bool hit_player1 = proposed_in_player && old_mask;
     bool hit_player = hit_player0 || hit_player1;
@@ -7740,7 +7830,7 @@ static __device__ inline void craftax_update_mobs_move_mob_projectile(
     int32_t new_block = removing_block ? CRAFTAX_BLOCK_PATH : proposed_block;
 
     int32_t projectile_type =
-        state->mob_projectiles.type_id[level][index];
+        MOB_TYPE(3, level, index, state);
     float damage_vector[3];
     craftax_update_mobs_damage_vector(
         projectile_type,
@@ -7752,12 +7842,12 @@ static __device__ inline void craftax_update_mobs_move_mob_projectile(
         damage_vector
     );
 
-    state->mob_projectiles.position[level][index][0] = proposed_row;
-    state->mob_projectiles.position[level][index][1] = proposed_col;
-    state->mob_projectiles.mask[level][index] = new_mask;
-    state->player_health -= damage * (float)(int32_t)hit_player;
-    state->is_sleeping = state->is_sleeping && !hit_player;
-    state->is_resting = state->is_resting && !hit_player;
+    MOB_POS(3, level, index, 0, state) = proposed_row;
+    MOB_POS(3, level, index, 1, state) = proposed_col;
+    MOB_MASK(3, level, index, state) = new_mask;
+    CF(player_health, state) -= damage * (float)(int32_t)hit_player;
+    CF(is_sleeping, state) = CF(is_sleeping, state) && !hit_player;
+    CF(is_resting, state) = CF(is_resting, state) && !hit_player;
     craftax_update_mobs_set_block(
         state,
         level,
@@ -7771,17 +7861,17 @@ static __device__ inline void craftax_update_mobs_move_player_projectile(
     CraftaxState* state,
     int32_t index
 ) {
-    int32_t level = state->player_level;
-    bool old_mask = state->player_projectiles.mask[level][index];
+    int32_t level = CF(player_level, state);
+    bool old_mask = MOB_MASK(4, level, index, state);
 #ifndef CRAFTAX_JAX_PARITY
     if (!old_mask) return;
 #endif
-    int32_t old_row = state->player_projectiles.position[level][index][0];
-    int32_t old_col = state->player_projectiles.position[level][index][1];
+    int32_t old_row = MOB_POS(4, level, index, 0, state);
+    int32_t old_col = MOB_POS(4, level, index, 1, state);
     int32_t proposed_row =
-        old_row + state->player_projectile_directions[level][index][0];
+        old_row + CF2(player_projectile_directions, (level) * 6 + (index) * 2 + (0), state);
     int32_t proposed_col =
-        old_col + state->player_projectile_directions[level][index][1];
+        old_col + CF2(player_projectile_directions, (level) * 6 + (index) * 2 + (1), state);
 
     float damage_vector[3];
     craftax_update_mobs_player_projectile_damage_vector(
@@ -7840,9 +7930,9 @@ static __device__ inline void craftax_update_mobs_move_player_projectile(
     bool continue_move = proposed_in_bounds && !in_wall && !did_attack_mob;
     bool new_mask = continue_move && old_mask;
 
-    state->player_projectiles.position[level][index][0] = proposed_row;
-    state->player_projectiles.position[level][index][1] = proposed_col;
-    state->player_projectiles.mask[level][index] = new_mask;
+    MOB_POS(4, level, index, 0, state) = proposed_row;
+    MOB_POS(4, level, index, 1, state) = proposed_col;
+    MOB_MASK(4, level, index, state) = new_mask;
 }
 
 static __device__ inline void craftax_update_mobs_native(
@@ -8019,12 +8109,12 @@ static __device__ inline uint64_t craftax_spawn_row_bits_for_mask(
     uint64_t terrain_mask
 ) {
     if (terrain_mask == CRAFTAX_SPAWN_ALL_VALID_BLOCK_MASK) {
-        return state->spawn_all_bits[level][row];
+        return CF_BITS(spawn_all_bits, level, row, state);
     }
     if (terrain_mask == CRAFTAX_SPAWN_GRAVE_BLOCK_MASK) {
-        return state->spawn_grave_bits[level][row];
+        return CF_BITS(spawn_grave_bits, level, row, state);
     }
-    return state->spawn_water_bits[level][row];
+    return CF_BITS(spawn_water_bits, level, row, state);
 }
 
 static __device__ inline uint64_t craftax_spawn_col_mask(int32_t col0, int32_t col1) {
@@ -8118,51 +8208,51 @@ static __device__ inline bool craftax_spawn_is_water_block(int32_t block) {
 static __device__ inline int32_t craftax_spawn_player_distance_squared(
     const CraftaxState* state, int32_t row, int32_t col
 ) {
-    int32_t dr = row - state->player_position[0];
-    int32_t dc = col - state->player_position[1];
+    int32_t dr = row - CF2(player_position, 0, state);
+    int32_t dc = col - CF2(player_position, 1, state);
     if (dr < 0) dr = -dr;
     if (dc < 0) dc = -dc;
     return dr * dr + dc * dc;
 }
 
 static __device__ inline int32_t craftax_spawn_count_mobs3(
-    const CraftaxMobs3* mobs, int32_t level
+    const void* mobs, int mc, int32_t level
 ) {
     int32_t count = 0;
-    for (int32_t i = 0; i < 3; i++) count += (int32_t)mobs->mask[level][i];
+    for (int32_t i = 0; i < 3; i++) count += (int32_t)MOB_MASK(mc, level, i, mobs);
     return count;
 }
 
 static __device__ inline int32_t craftax_spawn_count_mobs2(
-    const CraftaxMobs2* mobs, int32_t level
+    const void* mobs, int mc, int32_t level
 ) {
     int32_t count = 0;
-    for (int32_t i = 0; i < 2; i++) count += (int32_t)mobs->mask[level][i];
+    for (int32_t i = 0; i < 2; i++) count += (int32_t)MOB_MASK(mc, level, i, mobs);
     return count;
 }
 
 static __device__ inline int32_t craftax_spawn_first_empty_mobs3(
-    const CraftaxMobs3* mobs, int32_t level
+    const void* mobs, int mc, int32_t level
 ) {
-    for (int32_t i = 0; i < 3; i++) if (!mobs->mask[level][i]) return i;
+    for (int32_t i = 0; i < 3; i++) if (!MOB_MASK(mc, level, i, mobs)) return i;
     return 0;
 }
 
 static __device__ inline int32_t craftax_spawn_first_empty_mobs2(
-    const CraftaxMobs2* mobs, int32_t level
+    const void* mobs, int mc, int32_t level
 ) {
-    for (int32_t i = 0; i < 2; i++) if (!mobs->mask[level][i]) return i;
+    for (int32_t i = 0; i < 2; i++) if (!MOB_MASK(mc, level, i, mobs)) return i;
     return 0;
 }
 
 static __device__ inline void craftax_spawn_mobs3_count_and_empty(
-    const CraftaxMobs3* mobs, int32_t level,
+    const void* mobs, int mc, int32_t level,
     int32_t* count_out, int32_t* first_empty_out
 ) {
     int32_t count = 0, first_empty = 0;
     bool found = false;
     for (int32_t i = 0; i < 3; i++) {
-        bool m = mobs->mask[level][i];
+        bool m = MOB_MASK(mc, level, i, mobs);
         count += (int32_t)m;
         if (!m && !found) { first_empty = i; found = true; }
     }
@@ -8171,13 +8261,13 @@ static __device__ inline void craftax_spawn_mobs3_count_and_empty(
 }
 
 static __device__ inline void craftax_spawn_mobs2_count_and_empty(
-    const CraftaxMobs2* mobs, int32_t level,
+    const void* mobs, int mc, int32_t level,
     int32_t* count_out, int32_t* first_empty_out
 ) {
     int32_t count = 0, first_empty = 0;
     bool found = false;
     for (int32_t i = 0; i < 2; i++) {
-        bool m = mobs->mask[level][i];
+        bool m = MOB_MASK(mc, level, i, mobs);
         count += (int32_t)m;
         if (!m && !found) { first_empty = i; found = true; }
     }
@@ -8222,8 +8312,8 @@ static __device__ inline int32_t craftax_spawn_collect_spans(
     uint64_t terrain_mask,
     CraftaxSpawnCoord* coords
 ) {
-    int32_t pr = state->player_position[0];
-    int32_t pc = state->player_position[1];
+    int32_t pr = CF2(player_position, 0, state);
+    int32_t pc = CF2(player_position, 1, state);
     int32_t n = 0;
     for (int32_t i = 0; i < span_count; i++) {
         int32_t row = pr + spans[i].dr;
@@ -8235,7 +8325,7 @@ static __device__ inline int32_t craftax_spawn_collect_spans(
         if (col0 > col1) continue;
         uint64_t candidates =
             craftax_spawn_row_bits_for_mask(state, level, row, terrain_mask)
-            & ~state->mob_bits[level][row]
+            & ~CF_BITS(mob_bits, level, row, state)
             & craftax_spawn_col_mask(col0, col1);
         while (candidates != 0) {
             int32_t col = __builtin_ctzll(candidates);
@@ -8264,8 +8354,8 @@ static __device__ inline bool craftax_spawn_scan_spans(
     // craftax_spawn_pick_kth bitwise (cum goes 1.0f, 2.0f, ... exactly, so
     // the first k with (float)(k+1) >= draw is ceilf(draw) - 1); pass 2
     // walks the same span order to the k-th set bit.
-    int32_t pr = state->player_position[0];
-    int32_t pc = state->player_position[1];
+    int32_t pr = CF2(player_position, 0, state);
+    int32_t pc = CF2(player_position, 1, state);
     int32_t n = 0;
     for (int32_t i = 0; i < span_count; i++) {
         int32_t row = pr + spans[i].dr;
@@ -8277,7 +8367,7 @@ static __device__ inline bool craftax_spawn_scan_spans(
         if (col0 > col1) continue;
         uint64_t candidates =
             craftax_spawn_row_bits_for_mask(state, level, row, terrain_mask)
-            & ~state->mob_bits[level][row]
+            & ~CF_BITS(mob_bits, level, row, state)
             & craftax_spawn_col_mask(col0, col1);
         n += __popcll(candidates);
     }
@@ -8299,7 +8389,7 @@ static __device__ inline bool craftax_spawn_scan_spans(
         if (col0 > col1) continue;
         uint64_t candidates =
             craftax_spawn_row_bits_for_mask(state, level, row, terrain_mask)
-            & ~state->mob_bits[level][row]
+            & ~CF_BITS(mob_bits, level, row, state)
             & craftax_spawn_col_mask(col0, col1);
         int32_t c = __popcll(candidates);
         if (seen + c <= k) {
@@ -8381,8 +8471,8 @@ static __device__ inline void craftax_spawn_scan_all(
 
     if (!need_melee && !need_ranged) return;
 
-    int32_t pr = state->player_position[0];
-    int32_t pc = state->player_position[1];
+    int32_t pr = CF2(player_position, 0, state);
+    int32_t pc = CF2(player_position, 1, state);
     const CraftaxSpawnOffsetSpan* spans = fighting_boss
         ? craftax_spawn_boss_spans
         : craftax_spawn_hostile_spans;
@@ -8412,7 +8502,7 @@ static __device__ inline void craftax_spawn_scan_all(
         if (col1 >= CRAFTAX_MAP_SIZE) col1 = CRAFTAX_MAP_SIZE - 1;
         if (col0 > col1) continue;
         uint64_t open_bits =
-            ~state->mob_bits[level][row] & craftax_spawn_col_mask(col0, col1);
+            ~CF_BITS(mob_bits, level, row, state) & craftax_spawn_col_mask(col0, col1);
 
         if (need_melee) {
             uint64_t melee_candidates =
@@ -8516,13 +8606,13 @@ static __device__ inline void craftax_spawn_passive_mob(
     int32_t level, bool fighting_boss
 ) {
     int32_t count, slot;
-    craftax_spawn_mobs3_count_and_empty(&state->passive_mobs, level, &count, &slot);
+    craftax_spawn_mobs3_count_and_empty(state, 1, level, &count, &slot);
 
     CraftaxThreefryKey prob_key = craftax_spawn_next_random_key(rng);
     CraftaxThreefryKey pos_key  = craftax_spawn_next_random_key(rng);
 
     int32_t type = craftax_spawn_floor_mob_type(level, CRAFTAX_MOB_PASSIVE);
-    state->passive_mobs.type_id[level][slot] = type;
+    MOB_TYPE(1, level, slot, state) = type;
 
     if (fighting_boss) return;
     if (count >= CRAFTAX_MAX_PASSIVE_MOBS) return;
@@ -8532,12 +8622,12 @@ static __device__ inline void craftax_spawn_passive_mob(
     int32_t row, col;
     if (!craftax_spawn_scan_passive(state, level, pos_key, &row, &col)) return;
 
-    state->passive_mobs.position[level][slot][0] = row;
-    state->passive_mobs.position[level][slot][1] = col;
-    state->passive_mobs.health[level][slot]      =
+    MOB_POS(1, level, slot, 0, state) = row;
+    MOB_POS(1, level, slot, 1, state) = col;
+    MOB_HP(1, level, slot, state)      =
         craftax_spawn_mob_type_health(type, CRAFTAX_MOB_PASSIVE);
-    state->passive_mobs.mask[level][slot]        = true;
-    state->mob_bits[level][row] |= (1ULL << col);
+    MOB_MASK(1, level, slot, state)        = true;
+    CF_BITS(mob_bits, level, row, state) |= (1ULL << col);
 }
 
 static __device__ inline void craftax_spawn_melee_mob(
@@ -8545,19 +8635,19 @@ static __device__ inline void craftax_spawn_melee_mob(
     int32_t level, bool fighting_boss, int32_t monster_spawn_coeff
 ) {
     int32_t count, slot;
-    craftax_spawn_mobs3_count_and_empty(&state->melee_mobs, level, &count, &slot);
+    craftax_spawn_mobs3_count_and_empty(state, 0, level, &count, &slot);
 
     int32_t type = fighting_boss
-        ? craftax_spawn_floor_mob_type(state->boss_progress, CRAFTAX_MOB_MELEE)
+        ? craftax_spawn_floor_mob_type(CF(boss_progress, state), CRAFTAX_MOB_MELEE)
         : craftax_spawn_floor_mob_type(level, CRAFTAX_MOB_MELEE);
 
     CraftaxThreefryKey prob_key = craftax_spawn_next_random_key(rng);
-    float night_coeff = 1.0f - state->light_level;
+    float night_coeff = 1.0f - CF(light_level, state);
     float spawn_chance = craftax_spawn_floor_spawn_chance(level, 1)
         + craftax_spawn_floor_spawn_chance(level, 3) * night_coeff * night_coeff;
     CraftaxThreefryKey pos_key = craftax_spawn_next_random_key(rng);
 
-    state->melee_mobs.type_id[level][slot] = type;
+    MOB_TYPE(0, level, slot, state) = type;
 
     if (count >= CRAFTAX_MAX_MELEE_MOBS) return;
     if (craftax_threefry_uniform_f32(prob_key)
@@ -8567,12 +8657,12 @@ static __device__ inline void craftax_spawn_melee_mob(
     if (!craftax_spawn_scan_melee(state, level, fighting_boss, pos_key, &row, &col))
         return;
 
-    state->melee_mobs.position[level][slot][0] = row;
-    state->melee_mobs.position[level][slot][1] = col;
-    state->melee_mobs.health[level][slot]      =
+    MOB_POS(0, level, slot, 0, state) = row;
+    MOB_POS(0, level, slot, 1, state) = col;
+    MOB_HP(0, level, slot, state)      =
         craftax_spawn_mob_type_health(type, CRAFTAX_MOB_MELEE);
-    state->melee_mobs.mask[level][slot]        = true;
-    state->mob_bits[level][row] |= (1ULL << col);
+    MOB_MASK(0, level, slot, state)        = true;
+    CF_BITS(mob_bits, level, row, state) |= (1ULL << col);
 }
 
 static __device__ inline void craftax_spawn_ranged_mob(
@@ -8580,16 +8670,16 @@ static __device__ inline void craftax_spawn_ranged_mob(
     int32_t level, bool fighting_boss, int32_t monster_spawn_coeff
 ) {
     int32_t count, slot;
-    craftax_spawn_mobs2_count_and_empty(&state->ranged_mobs, level, &count, &slot);
+    craftax_spawn_mobs2_count_and_empty(state, 2, level, &count, &slot);
 
     int32_t type = fighting_boss
-        ? craftax_spawn_floor_mob_type(state->boss_progress, CRAFTAX_MOB_RANGED)
+        ? craftax_spawn_floor_mob_type(CF(boss_progress, state), CRAFTAX_MOB_RANGED)
         : craftax_spawn_floor_mob_type(level, CRAFTAX_MOB_RANGED);
 
     CraftaxThreefryKey prob_key = craftax_spawn_next_random_key(rng);
     CraftaxThreefryKey pos_key  = craftax_spawn_next_random_key(rng);
 
-    state->ranged_mobs.type_id[level][slot] = type;
+    MOB_TYPE(2, level, slot, state) = type;
 
     if (count >= CRAFTAX_MAX_RANGED_MOBS) return;
     if (craftax_threefry_uniform_f32(prob_key)
@@ -8600,67 +8690,67 @@ static __device__ inline void craftax_spawn_ranged_mob(
     if (!craftax_spawn_scan_ranged(state, level, type, fighting_boss, pos_key,
                                     &row, &col)) return;
 
-    state->ranged_mobs.position[level][slot][0] = row;
-    state->ranged_mobs.position[level][slot][1] = col;
-    state->ranged_mobs.health[level][slot]      =
+    MOB_POS(2, level, slot, 0, state) = row;
+    MOB_POS(2, level, slot, 1, state) = col;
+    MOB_HP(2, level, slot, state)      =
         craftax_spawn_mob_type_health(type, CRAFTAX_MOB_RANGED);
-    state->ranged_mobs.mask[level][slot]        = true;
-    state->mob_bits[level][row] |= (1ULL << col);
+    MOB_MASK(2, level, slot, state)        = true;
+    CF_BITS(mob_bits, level, row, state) |= (1ULL << col);
 }
 
 static __device__ inline void craftax_spawn_mobs_native(
     CraftaxState* state, CraftaxThreefryKey rng
 ) {
     int32_t level = craftax_step_jax_index(
-        state->player_level, CRAFTAX_NUM_LEVELS
+        CF(player_level, state), CRAFTAX_NUM_LEVELS
     );
     bool fighting_boss = craftax_step_is_fighting_boss(state);
     int32_t monster_spawn_coeff =
         1
-        + (int32_t)(state->monsters_killed[level]
+        + (int32_t)(CF2(monsters_killed, level, state)
                     < CRAFTAX_MONSTERS_KILLED_TO_CLEAR_LEVEL) * 2;
 
     bool boss_spawn_wave =
-        fighting_boss && state->boss_timesteps_to_spawn_this_round >= 1;
+        fighting_boss && CF(boss_timesteps_to_spawn_this_round, state) >= 1;
     if (fighting_boss) {
         monster_spawn_coeff *= (int32_t)boss_spawn_wave * 1000;
     }
 
     int32_t passive_count, passive_slot;
     craftax_spawn_mobs3_count_and_empty(
-        &state->passive_mobs, level, &passive_count, &passive_slot
+        state, 1, level, &passive_count, &passive_slot
     );
     CraftaxThreefryKey passive_prob_key = craftax_spawn_next_random_key(&rng);
     CraftaxThreefryKey passive_pos_key = craftax_spawn_next_random_key(&rng);
     int32_t passive_type = craftax_spawn_floor_mob_type(
         level, CRAFTAX_MOB_PASSIVE
     );
-    state->passive_mobs.type_id[level][passive_slot] = passive_type;
+    MOB_TYPE(1, level, passive_slot, state) = passive_type;
 
     int32_t melee_count, melee_slot;
     craftax_spawn_mobs3_count_and_empty(
-        &state->melee_mobs, level, &melee_count, &melee_slot
+        state, 0, level, &melee_count, &melee_slot
     );
     int32_t melee_type = fighting_boss
-        ? craftax_spawn_floor_mob_type(state->boss_progress, CRAFTAX_MOB_MELEE)
+        ? craftax_spawn_floor_mob_type(CF(boss_progress, state), CRAFTAX_MOB_MELEE)
         : craftax_spawn_floor_mob_type(level, CRAFTAX_MOB_MELEE);
     CraftaxThreefryKey melee_prob_key = craftax_spawn_next_random_key(&rng);
-    float night_coeff = 1.0f - state->light_level;
+    float night_coeff = 1.0f - CF(light_level, state);
     float melee_spawn_chance = craftax_spawn_floor_spawn_chance(level, 1)
         + craftax_spawn_floor_spawn_chance(level, 3) * night_coeff * night_coeff;
     CraftaxThreefryKey melee_pos_key = craftax_spawn_next_random_key(&rng);
-    state->melee_mobs.type_id[level][melee_slot] = melee_type;
+    MOB_TYPE(0, level, melee_slot, state) = melee_type;
 
     int32_t ranged_count, ranged_slot;
     craftax_spawn_mobs2_count_and_empty(
-        &state->ranged_mobs, level, &ranged_count, &ranged_slot
+        state, 2, level, &ranged_count, &ranged_slot
     );
     int32_t ranged_type = fighting_boss
-        ? craftax_spawn_floor_mob_type(state->boss_progress, CRAFTAX_MOB_RANGED)
+        ? craftax_spawn_floor_mob_type(CF(boss_progress, state), CRAFTAX_MOB_RANGED)
         : craftax_spawn_floor_mob_type(level, CRAFTAX_MOB_RANGED);
     CraftaxThreefryKey ranged_prob_key = craftax_spawn_next_random_key(&rng);
     CraftaxThreefryKey ranged_pos_key = craftax_spawn_next_random_key(&rng);
-    state->ranged_mobs.type_id[level][ranged_slot] = ranged_type;
+    MOB_TYPE(2, level, ranged_slot, state) = ranged_type;
 
     bool try_passive = !fighting_boss
         && passive_count < CRAFTAX_MAX_PASSIVE_MOBS
@@ -8690,12 +8780,12 @@ static __device__ inline void craftax_spawn_mobs_native(
     if (try_passive && craftax_spawn_scan_passive(
             state, level, passive_pos_key, &passive_row, &passive_col
         )) {
-        state->passive_mobs.position[level][passive_slot][0] = passive_row;
-        state->passive_mobs.position[level][passive_slot][1] = passive_col;
-        state->passive_mobs.health[level][passive_slot] =
+        MOB_POS(1, level, passive_slot, 0, state) = passive_row;
+        MOB_POS(1, level, passive_slot, 1, state) = passive_col;
+        MOB_HP(1, level, passive_slot, state) =
             craftax_spawn_mob_type_health(passive_type, CRAFTAX_MOB_PASSIVE);
-        state->passive_mobs.mask[level][passive_slot] = true;
-        state->mob_bits[level][passive_row] |= (1ULL << passive_col);
+        MOB_MASK(1, level, passive_slot, state) = true;
+        CF_BITS(mob_bits, level, passive_row, state) |= (1ULL << passive_col);
         passive_spawned = true;
     }
 
@@ -8707,12 +8797,12 @@ static __device__ inline void craftax_spawn_mobs_native(
             state, level, fighting_boss, melee_pos_key,
             &melee_row, &melee_col
         )) {
-        state->melee_mobs.position[level][melee_slot][0] = melee_row;
-        state->melee_mobs.position[level][melee_slot][1] = melee_col;
-        state->melee_mobs.health[level][melee_slot] =
+        MOB_POS(0, level, melee_slot, 0, state) = melee_row;
+        MOB_POS(0, level, melee_slot, 1, state) = melee_col;
+        MOB_HP(0, level, melee_slot, state) =
             craftax_spawn_mob_type_health(melee_type, CRAFTAX_MOB_MELEE);
-        state->melee_mobs.mask[level][melee_slot] = true;
-        state->mob_bits[level][melee_row] |= (1ULL << melee_col);
+        MOB_MASK(0, level, melee_slot, state) = true;
+        CF_BITS(mob_bits, level, melee_row, state) |= (1ULL << melee_col);
         melee_spawned = true;
     }
 
@@ -8723,12 +8813,12 @@ static __device__ inline void craftax_spawn_mobs_native(
             state, level, ranged_type, fighting_boss, ranged_pos_key,
             &ranged_row, &ranged_col
         )) {
-        state->ranged_mobs.position[level][ranged_slot][0] = ranged_row;
-        state->ranged_mobs.position[level][ranged_slot][1] = ranged_col;
-        state->ranged_mobs.health[level][ranged_slot] =
+        MOB_POS(2, level, ranged_slot, 0, state) = ranged_row;
+        MOB_POS(2, level, ranged_slot, 1, state) = ranged_col;
+        MOB_HP(2, level, ranged_slot, state) =
             craftax_spawn_mob_type_health(ranged_type, CRAFTAX_MOB_RANGED);
-        state->ranged_mobs.mask[level][ranged_slot] = true;
-        state->mob_bits[level][ranged_row] |= (1ULL << ranged_col);
+        MOB_MASK(2, level, ranged_slot, state) = true;
+        CF_BITS(mob_bits, level, ranged_row, state) |= (1ULL << ranged_col);
     }
 }
 
@@ -8820,6 +8910,24 @@ typedef struct CraftaxResetRec {
 
 __device__ int g_reset_count = 0;
 
+// Scalar-tail encode (inventory/intrinsics block after the packed map).
+// Runs thread-per-env in k_step (state is register/L1-hot there) and in the
+// reset kernels for just-reset envs, replacing the serial lane-0 tail in
+// k_encode. Values and destination bytes are identical.
+static __device__ inline void cf_encode_tail(
+    const CraftaxState* state, CraftaxObs* obs
+) {
+    const CraftaxWorldState* ws = (const CraftaxWorldState*)(const void*)state;
+#ifdef CRAFTAX_COMPACT_OBS
+    float tail[CRAFTAX_WG_INVENTORY_OBS_SIZE];
+    craftax_encode_scalar_observation_tail_at(ws, tail, 0);
+    memcpy(obs + CRAFTAX_WG_PACKED_MAP_OBS_SIZE, tail, sizeof(tail));
+#else
+    craftax_encode_scalar_observation_tail_at(
+        ws, obs, CRAFTAX_WG_PACKED_MAP_OBS_SIZE);
+#endif
+}
+
 __global__ void k_step(
     Craftax* envs, uint32_t* action_rng, int num_envs, CraftaxResetRec* resets
 ) {
@@ -8836,6 +8944,8 @@ __global__ void k_step(
         resets[slot].env = i;
         resets[slot].key0 = reset_key.word[0];
         resets[slot].key1 = reset_key.word[1];
+    } else {
+        cf_encode_tail(env->state, env->observations);
     }
 }
 
@@ -8848,41 +8958,27 @@ __global__ void k_step(
 // also covers post-reset observations.
 #define CRAFTAX_ENC_WARPS_PER_BLOCK 4
 
-__global__ void k_encode(Craftax* envs, int num_envs) {
-    int env_idx = blockIdx.x * CRAFTAX_ENC_WARPS_PER_BLOCK + threadIdx.y;
-    if (env_idx >= num_envs) return;
-    const Craftax* env = &envs[env_idx];
+// Warp-cooperative packed-map encode for one env (lanes stride the packed
+// map channels; the scalar tail is written by k_step / the reset kernels).
+static __device__ inline void cf_encode_map_warp(
+    const Craftax* env, unsigned lane
+) {
     const CraftaxWorldState* state =
         (const CraftaxWorldState*)(const void*)env->state;
     CraftaxObs* obs = env->observations;
-    unsigned lane = threadIdx.x;
 
-    const int level = state->player_level;
+    const int level = CF(player_level, state);
     const int mob_level =
-        craftax_wg_jax_index(state->player_level, CRAFTAX_WG_NUM_LEVELS);
-    const int top = state->player_position[0] - CRAFTAX_WG_OBS_ROWS / 2;
-    const int left = state->player_position[1] - CRAFTAX_WG_OBS_COLS / 2;
+        craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
+    const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
+    const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
 
-    // Warp-uniform per-class liveness (masks are tiny and L1-broadcast), so
-    // lanes handling mob channels of an empty class skip their scan loops.
-    bool class_active[5];
-    {
-        const bool* m3;
-        m3 = state->melee_mobs.mask[mob_level];
-        class_active[0] = m3[0] | m3[1] | m3[2];
-        m3 = state->passive_mobs.mask[mob_level];
-        class_active[1] = m3[0] | m3[1] | m3[2];
-        const bool* m2 = state->ranged_mobs.mask[mob_level];
-        class_active[2] = m2[0] | m2[1];
-        m3 = state->mob_projectiles.mask[mob_level];
-        class_active[3] = m3[0] | m3[1] | m3[2];
-        m3 = state->player_projectiles.mask[mob_level];
-        class_active[4] = m3[0] | m3[1] | m3[2];
-    }
-
-    for (int k = (int)lane; k < CRAFTAX_WG_PACKED_MAP_OBS_SIZE; k += 32) {
-        int cell = k / CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
-        int ch = k % CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
+    // One lane per cell: map/item/light loaded once per cell (the previous
+    // per-(cell,channel) loop reloaded light_map for each of the 8 channels)
+    // and the 8 channel values are written as one contiguous 8-element run,
+    // so a full warp stores a coalesced 32 * 8 * sizeof(CraftaxObs) block.
+    for (int cell = (int)lane;
+         cell < CRAFTAX_WG_OBS_ROWS * CRAFTAX_WG_OBS_COLS; cell += 32) {
         int row = cell / CRAFTAX_WG_OBS_COLS;
         int col = cell % CRAFTAX_WG_OBS_COLS;
         int world_row = top + row;
@@ -8892,95 +8988,65 @@ __global__ void k_encode(Craftax* envs, int num_envs) {
         bool visible =
             in_bounds && state->light_map[level][world_row][world_col] > 12;
 
-        CraftaxObs value = 0;
-        if (ch == 0) {
-            if (visible) {
-                value = (CraftaxObs)state->map[level][world_row][world_col];
-            }
-        } else if (ch == 1) {
-            if (visible) {
+        CraftaxObs* cell_obs =
+            obs + (size_t)cell * CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
+        CraftaxObs v0 = 0;
+        CraftaxObs v1 = 0;
+        if (visible) {
+            v0 = (CraftaxObs)state->map[level][world_row][world_col];
 #ifdef CRAFTAX_COMPACT_OBS
-                value = (uint8_t)(
-                    state->item_map[level][world_row][world_col] + 1);
+            v1 = (uint8_t)(state->item_map[level][world_row][world_col] + 1);
 #else
-                value =
-                    (float)state->item_map[level][world_row][world_col] + 1.0f;
+            v1 = (float)state->item_map[level][world_row][world_col] + 1.0f;
 #endif
-            }
-        } else if (ch == 2) {
-            value = visible ? (CraftaxObs)1 : (CraftaxObs)0;
-        } else {
-            // Mob channels: last mob (highest slot index) of this class in
-            // this cell that passes the scalar encoder's checks wins,
-            // matching its write order.
-            int mob_class = ch - 3;
-            if (!class_active[mob_class]) {
-                obs[k] = 0;
+        }
+        cell_obs[0] = v0;
+        cell_obs[1] = v1;
+        cell_obs[2] = visible ? (CraftaxObs)1 : (CraftaxObs)0;
+        // Mob channels (ch >= 3): zero here, scattered below. The per-cell
+        // scan visited 5 classes x 3 slots for each of 130 cells; scattering
+        // the <= 14 mobs directly writes the same values in the same
+        // last-slot-wins order per class (classes write disjoint channels).
+#pragma unroll
+        for (int c = 0; c < CRAFTAX_WG_NUM_MOB_CLASSES; c++) {
+            cell_obs[3 + c] = 0;
+        }
+    }
+    __syncwarp();
+    if (lane < 5) {
+        const int c = (int)lane;
+        const int nslots = c == 2 ? 2 : 3;
+        for (int i = 0; i < nslots; i++) {
+            int type_id = MOB_TYPE(c, mob_level, i, state);
+            if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
+                || !MOB_MASK(c, mob_level, i, state)) {
                 continue;
             }
-            const int32_t (*positions)[2] = NULL;
-            const int32_t* type_ids = NULL;
-            const bool* masks = NULL;
-            int count = 3;
-            switch (mob_class) {
-                case 0:
-                    positions = state->melee_mobs.position[mob_level];
-                    type_ids = state->melee_mobs.type_id[mob_level];
-                    masks = state->melee_mobs.mask[mob_level];
-                    break;
-                case 1:
-                    positions = state->passive_mobs.position[mob_level];
-                    type_ids = state->passive_mobs.type_id[mob_level];
-                    masks = state->passive_mobs.mask[mob_level];
-                    break;
-                case 2:
-                    positions = state->ranged_mobs.position[mob_level];
-                    type_ids = state->ranged_mobs.type_id[mob_level];
-                    masks = state->ranged_mobs.mask[mob_level];
-                    count = 2;
-                    break;
-                case 3:
-                    positions = state->mob_projectiles.position[mob_level];
-                    type_ids = state->mob_projectiles.type_id[mob_level];
-                    masks = state->mob_projectiles.mask[mob_level];
-                    break;
-                default:
-                    positions = state->player_projectiles.position[mob_level];
-                    type_ids = state->player_projectiles.type_id[mob_level];
-                    masks = state->player_projectiles.mask[mob_level];
-                    break;
+            int mob_row = MOB_POS(c, mob_level, i, 0, state);
+            int mob_col = MOB_POS(c, mob_level, i, 1, state);
+            int local_row = mob_row - top;
+            int local_col = mob_col - left;
+            if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
+                || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
+                continue;
             }
-            for (int i = 0; i < count; i++) {
-                int type_id = type_ids[i];
-                if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-                    || !masks[i]) {
-                    continue;
-                }
-                int mob_row = positions[i][0];
-                int mob_col = positions[i][1];
-                if (mob_row != world_row || mob_col != world_col) continue;
-                // cell equality implies the encoder's local-window bounds;
-                // in_bounds covers its world-bounds check.
-                if (!in_bounds
-                    || state->light_map[mob_level][mob_row][mob_col] <= 12) {
-                    continue;
-                }
-                value = (CraftaxObs)(type_id + 1);
+            bool in_bounds = mob_row >= 0 && mob_row < CRAFTAX_WG_MAP_SIZE
+                && mob_col >= 0 && mob_col < CRAFTAX_WG_MAP_SIZE;
+            if (!in_bounds
+                || state->light_map[mob_level][mob_row][mob_col] <= 12) {
+                continue;
             }
+            int cell = local_row * CRAFTAX_WG_OBS_COLS + local_col;
+            obs[cell * CRAFTAX_WG_PACKED_CHANNELS_PER_CELL + 3 + c] =
+                (CraftaxObs)(type_id + 1);
         }
-        obs[k] = value;
     }
+}
 
-    if (lane == 0) {
-#ifdef CRAFTAX_COMPACT_OBS
-        float tail[CRAFTAX_WG_INVENTORY_OBS_SIZE];
-        craftax_encode_scalar_observation_tail_at(state, tail, 0);
-        memcpy(obs + CRAFTAX_WG_PACKED_MAP_OBS_SIZE, tail, sizeof(tail));
-#else
-        craftax_encode_scalar_observation_tail_at(
-            state, obs, CRAFTAX_WG_PACKED_MAP_OBS_SIZE);
-#endif
-    }
+__global__ void k_encode(Craftax* envs, int num_envs) {
+    int env_idx = blockIdx.x * CRAFTAX_ENC_WARPS_PER_BLOCK + threadIdx.y;
+    if (env_idx >= num_envs) return;
+    cf_encode_map_warp(&envs[env_idx], threadIdx.x);
 }
 
 __global__ void k_reset_list(Craftax* envs, const CraftaxResetRec* resets) {
@@ -8991,6 +9057,7 @@ __global__ void k_reset_list(Craftax* envs, const CraftaxResetRec* resets) {
     reset_key.word[0] = resets[idx].key0;
     reset_key.word[1] = resets[idx].key1;
     craftax_reset_state_on_done(env->state, reset_key);
+    cf_encode_tail(env->state, env->observations);
 }
 
 // Warp-cooperative reset: one warp (= one block) per finished env, noise
@@ -9008,6 +9075,62 @@ __global__ void __launch_bounds__(32) k_reset_list_warp(
     reset_key.word[0] = resets[idx].key0;
     reset_key.word[1] = resets[idx].key1;
     craftax_reset_state_on_done_warp(env->state, reset_key, &s, lane);
+    if (lane == 0) {
+        cf_encode_tail(env->state, env->observations);
+    }
+}
+
+// ============================================================
+// Megakernel: fused step + reset + encode, num_steps per launch.
+// One thread per env for gameplay; the owning warp then handles resets
+// (warp-cooperative worldgen, scratch in a per-warp global arena instead of
+// shared memory so occupancy is not smem-capped) and the packed-map encode
+// for its 32 envs. Envs never interact, so multi-step launches need no
+// grid-wide synchronization and are bitwise identical to running the
+// split kernels num_steps times.
+// ============================================================
+__global__ void k_mega(
+    Craftax* envs, uint32_t* action_rng, int num_envs, int num_steps,
+    CraftaxWarpScratch* warp_scratch
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned lane = (unsigned)(threadIdx.x & 31);
+    const int warp_id = i >> 5;
+    const int warp_base = warp_id << 5;
+    const bool active = i < num_envs;
+    CraftaxWarpScratch* ws = &warp_scratch[warp_id];
+    uint32_t arng = active ? action_rng[i] : 0u;
+
+    for (int step = 0; step < num_steps; step++) {
+        bool done = false;
+        CraftaxThreefryKey reset_key;
+        reset_key.word[0] = 0u;
+        reset_key.word[1] = 0u;
+        if (active) {
+            Craftax* env = &envs[i];
+            env->actions[0] =
+                (float)(cf_xorshift32(&arng) % CRAFTAX_NUM_ACTIONS);
+            done = c_step_gameplay_core(env, &reset_key);
+            if (!done) cf_encode_tail(env->state, env->observations);
+        }
+        unsigned done_mask = __ballot_sync(0xffffffffu, done);
+        while (done_mask != 0u) {
+            int src = __ffs((int)done_mask) - 1;
+            done_mask &= done_mask - 1u;
+            CraftaxThreefryKey rk;
+            rk.word[0] = __shfl_sync(0xffffffffu, reset_key.word[0], src);
+            rk.word[1] = __shfl_sync(0xffffffffu, reset_key.word[1], src);
+            Craftax* denv = &envs[warp_base + src];
+            craftax_reset_state_on_done_warp(denv->state, rk, ws, lane);
+            if (lane == 0) cf_encode_tail(denv->state, denv->observations);
+        }
+        __syncwarp();
+        for (int e = warp_base; e < warp_base + 32 && e < num_envs; e++) {
+            cf_encode_map_warp(&envs[e], lane);
+        }
+        __syncwarp();
+    }
+    if (active) action_rng[i] = arng;
 }
 
 __device__ int g_nan_flag = 0;
@@ -9042,7 +9165,11 @@ typedef struct {
     CraftaxResetRec* d_resets;
     int* d_reset_count;  // symbol address of g_reset_count
     CraftaxWorldgenScratch* d_wg_scratch;
+    void* d_soa[64];
+    int num_soa;
     int lazy;
+    int mega;
+    CraftaxWarpScratch* d_warp_scratch;
     CraftaxObs* h_obs;
     float* h_rewards;
     float* h_terminals;
@@ -9090,6 +9217,21 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
                         (size_t)num_envs * sizeof(CraftaxWorldgenScratch)));
     CU_CHECK(cudaMemcpyToSymbol(g_craftax_wg_scratch, &v->d_wg_scratch,
                                 sizeof(v->d_wg_scratch)));
+    {
+        char* base = (char*)v->d_states;
+        CU_CHECK(cudaMemcpyToSymbol(g_cf_state_base, &base, sizeof(base)));
+        CU_CHECK(cudaMemcpyToSymbol(g_cf_n, &num_envs, sizeof(num_envs)));
+        v->num_soa = 0;
+#define CF_SOA_ALLOC(f, t, k) { \
+        t* p = NULL; \
+        size_t bytes = sizeof(t) * (size_t)(k) * (size_t)num_envs; \
+        CU_CHECK(cudaMalloc(&p, bytes)); \
+        CU_CHECK(cudaMemset(p, 0, bytes)); \
+        CU_CHECK(cudaMemcpyToSymbol(g_cf_##f, &p, sizeof(p))); \
+        v->d_soa[v->num_soa++] = p; }
+        CF_SOA_FIELDS(CF_SOA_ALLOC)
+#undef CF_SOA_ALLOC
+    }
     // calloc semantics of the C harness
     CU_CHECK(cudaMemset(v->d_envs, 0, (size_t)num_envs * sizeof(Craftax)));
     CU_CHECK(cudaMemset(v->d_states, 0, (size_t)num_envs * sizeof(CraftaxState)));
@@ -9112,6 +9254,21 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
     int lazy = lazy_env == NULL ? 1 : atoi(lazy_env);
     CU_CHECK(cudaMemcpyToSymbol(g_craftax_lazy_floors, &lazy, sizeof(int)));
     v->lazy = lazy;
+    // Megakernel path (fused step+reset+encode, multi-step launches in
+    // bench mode), CRAFTAX_CU_MEGA=1. Verified bitwise identical to the
+    // split kernels (statehash mode), but measured SLOWER on sm_120 (64.0M
+    // vs 69.9M SPS @65k envs): one fused kernel forces a single
+    // register/occupancy configuration on phases with opposite needs
+    // (gameplay wants registers, encode wants resident warps), so the split
+    // path stays the default. Requires lazy floors (warp reset).
+    const char* mega_env = getenv("CRAFTAX_CU_MEGA");
+    v->mega = (mega_env == NULL ? 0 : atoi(mega_env)) && lazy;
+    v->d_warp_scratch = NULL;
+    if (v->mega) {
+        size_t n_warps = ((size_t)num_envs + 63) / 64 * 2;
+        CU_CHECK(cudaMalloc(&v->d_warp_scratch,
+                            n_warps * sizeof(CraftaxWarpScratch)));
+    }
     k_global_init<<<1, 1>>>();
     CU_CHECK(cudaDeviceSynchronize());
 
@@ -9131,6 +9288,8 @@ static void cu_vec_free(CuVec* v) {
     cudaFree(v->d_actions); cudaFree(v->d_rewards); cudaFree(v->d_terminals);
     cudaFree(v->d_action_rng); cudaFree(v->d_resets);
     cudaFree(v->d_wg_scratch);
+    if (v->d_warp_scratch != NULL) cudaFree(v->d_warp_scratch);
+    for (int i = 0; i < v->num_soa; i++) cudaFree(v->d_soa[i]);
     free(v->h_obs); free(v->h_rewards); free(v->h_terminals);
 }
 
@@ -9180,7 +9339,17 @@ static void cu_print_logs(CuVec* v, bool histogram) {
     free(h_envs);
 }
 
+static void cu_mega_launch(CuVec* v, int num_steps) {
+    k_mega<<<(v->num_envs + 63) / 64, 64>>>(
+        v->d_envs, v->d_action_rng, v->num_envs, num_steps,
+        v->d_warp_scratch);
+}
+
 static void cu_step_launch(CuVec* v) {
+    if (v->mega) {
+        cu_mega_launch(v, 1);
+        return;
+    }
     CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int)));
     k_step<<<(v->num_envs + 63) / 64, 64>>>(
         v->d_envs, v->d_action_rng, v->num_envs, v->d_resets);
@@ -9386,6 +9555,60 @@ static int cu_run_stats(int num_envs, int num_steps, uint64_t seed) {
 }
 
 // ------------------------------------------------------------
+// statehash mode: step N times (megakernel path uses multi-step chunked
+// launches, split path one launch set per step), then hash ALL device
+// state: env structs, AoS states, SoA arrays, obs, rewards, terminals,
+// action rng. Bitwise equality between CRAFTAX_CU_MEGA=1 and =0 proves the
+// multi-step megakernel is trajectory-identical to the split kernels.
+// ------------------------------------------------------------
+static int cu_run_statehash(int num_envs, int num_steps, uint64_t seed) {
+    CuVec v;
+    cu_vec_init(&v, num_envs, seed);
+    if (v.mega) {
+        const int chunk = 64;
+        for (int k = 0; k < num_steps; k += chunk) {
+            cu_mega_launch(&v, num_steps - k < chunk ? num_steps - k : chunk);
+        }
+    } else {
+        for (int k = 0; k < num_steps; k++) cu_step_launch(&v);
+    }
+    CU_CHECK(cudaDeviceSynchronize());
+    uint64_t h = 0xcbf29ce484222325ULL;
+    void* buf = malloc((size_t)num_envs * sizeof(CraftaxState));
+#define CF_HASH_DEV(ptr, bytes) do { \
+        CU_CHECK(cudaMemcpy(buf, ptr, bytes, cudaMemcpyDeviceToHost)); \
+        h = cf_fnv1a(h, buf, bytes); } while (0)
+    CF_HASH_DEV(v.d_states, (size_t)num_envs * sizeof(CraftaxState));
+    {
+        int idx = 0;
+#define CF_HASH_SOA(f, t, k) \
+        CF_HASH_DEV(v.d_soa[idx], sizeof(t) * (size_t)(k) * (size_t)num_envs); \
+        if (getenv("CRAFTAX_CU_HASH_FIELDS")) { \
+            size_t _b = sizeof(t) * (size_t)(k) * (size_t)num_envs; \
+            CU_CHECK(cudaMemcpy(buf, v.d_soa[idx], _b, cudaMemcpyDeviceToHost)); \
+            printf("field %-34s 0x%016llx\n", #f, \
+                (unsigned long long)cf_fnv1a(0xcbf29ce484222325ULL, buf, _b)); \
+        } \
+        idx++;
+        CF_SOA_FIELDS(CF_HASH_SOA)
+#undef CF_HASH_SOA
+        (void)idx;
+    }
+    CF_HASH_DEV(v.d_obs, (size_t)num_envs * CRAFTAX_OBS_SIZE * sizeof(CraftaxObs));
+    CF_HASH_DEV(v.d_rewards, (size_t)num_envs * sizeof(float));
+    CF_HASH_DEV(v.d_terminals, (size_t)num_envs * sizeof(float));
+    CF_HASH_DEV(v.d_action_rng, (size_t)num_envs * sizeof(uint32_t));
+#undef CF_HASH_DEV
+    free(buf);
+    printf("state_hash 0x%016llx (envs=%d steps=%d seed=%llu mega=%d)\n",
+           (unsigned long long)h, num_envs, num_steps,
+           (unsigned long long)seed, v.mega);
+    cu_print_logs(&v, false);
+    cu_vec_free(&v);
+    return 0;
+}
+
+// ------------------------------------------------------------
 // bench mode: pure device stepping, no per-step copies.
 // ------------------------------------------------------------
 static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
@@ -9399,7 +9622,16 @@ static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
     CU_CHECK(cudaDeviceSynchronize());
 
     double t0 = cf_now_s();
-    for (int k = 0; k < iters; k++) cu_step_launch(&v);
+    if (v.mega) {
+        // Chunked multi-step launches (bounded per-launch runtime keeps the
+        // display-GPU watchdog happy); still amortizes all launch overhead.
+        const int chunk = 64;
+        for (int k = 0; k < iters; k += chunk) {
+            cu_mega_launch(&v, iters - k < chunk ? iters - k : chunk);
+        }
+    } else {
+        for (int k = 0; k < iters; k++) cu_step_launch(&v);
+    }
     CU_CHECK(cudaDeviceSynchronize());
     double dt = cf_now_s() - t0;
     double sps = (double)num_envs * (double)iters / dt;
@@ -9470,6 +9702,7 @@ int main(int argc, char** argv) {
         return cu_run_cmp(dump, seed, max_report);
     }
     if (!strcmp(mode, "stats")) return cu_run_stats(envs, steps, seed);
+    if (!strcmp(mode, "statehash")) return cu_run_statehash(envs, steps, seed);
     if (!strcmp(mode, "bench")) return cu_run_bench(envs, iters, seed);
     cu_usage(argv[0]);
     return 1;
