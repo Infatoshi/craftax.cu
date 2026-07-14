@@ -5,7 +5,7 @@ CUDA and C (AVX-512) implementations of [Craftax](https://github.com/MichaelTMat
 | | C (CPU) | CUDA |
 |---|---|---|
 | Classic (17 actions, one 64x64 map) | `craftax_classic.c` | `craftax_classic.cu` |
-| Full (43 actions, multi-floor dungeons) | `craftax_full.c` | planned |
+| Full (43 actions, multi-floor dungeons) | `craftax_full.c` | `craftax_full.cu` |
 
 The classic CUDA path is the most developed: fused env+policy rollout
 megakernel plus fully on-device PPO training. The full game starts from
@@ -33,6 +33,16 @@ Full game (env only, random actions, auto-reset included):
 |---|---|---:|
 | C, 8192 envs, 32T | Ryzen 9 9950X3D | 5.6M |
 | C, 1024 envs, 1T | Ryzen 9 9950X3D | 750K |
+| CUDA (naive port), 65k envs | RTX PRO 6000 Blackwell | 1.7M |
+
+The full-game CUDA port is milestone 1 (correctness): one thread per
+env, AoS state, inline resets, and it is **bit-identical to the C
+build** -- the trajectory hash matches the CPU reference exactly at
+64x2000 and 4x20000 steps (gcc's -ffast-math float semantics are
+emulated: reciprocal division at literal-divisor sites, a
+host-computed glibc-cosf light table, and -fmad=false). Optimization
+(SoA state, warp resets, compact obs -- the classic playbook) comes
+next; classic went 14.4M -> 312M on the same ladder.
 
 "Env + policy" is a rollout megakernel: the PufferLib default craftax policy
 (Linear 1345->32 encoder, MinGRU, actor/critic heads), categorical sampling,
@@ -61,6 +71,7 @@ The classic CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 ./craftax_classic gradcheck                          # analytic grads vs finite differences
 ./craftax_full bench --envs 8192 --iters 2048 --threads 32   # full game, random actions
 ./craftax_full hash --envs 64 --steps 2000           # full-game determinism anchor
+./craftax_full_cuda hash --envs 64 --steps 2000      # CUDA port, same hash bit-exactly
 ```
 
 ## Verification

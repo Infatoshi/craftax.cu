@@ -18,6 +18,15 @@ craftax_classic: main_classic.cu craftax_classic.cu craftax_classic_cpu.o
 
 craftax_classic_cpu.o: craftax_classic.c
 	$(CC) $(CPUFLAGS) -c craftax_classic.c -o $@
+
+# Full-game CUDA port (M1: correctness, one thread per env). -fmad=false is
+# required: exact IEEE per-op float semantics make the GPU trajectory hash
+# bit-identical to the gcc -ffast-math C build (verified 64x2000 and 4x20000
+# seed 42 anchors).
+NVCCFLAGS_FULL ?= -O3 -arch=native --expt-relaxed-constexpr -fmad=false
+full: craftax_full_cuda
+craftax_full_cuda: craftax_full.cu
+	$(NVCC) $(NVCCFLAGS_FULL) craftax_full.cu -o $@
 else
 craftax_classic: craftax_classic.c
 	$(CC) $(CPUFLAGS) -DCRAFTAX_STANDALONE craftax_classic.c -o $@ -lpthread -lm
@@ -27,6 +36,6 @@ craftax_full: craftax_full.c
 	$(CC) $(CPUFLAGS) craftax_full.c -o $@ -lpthread -lm
 
 clean:
-	rm -f craftax_classic craftax_full craftax_classic_cpu.o
+	rm -f craftax_classic craftax_full craftax_full_cuda craftax_classic_cpu.o
 
 .PHONY: all classic full clean
