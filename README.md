@@ -27,19 +27,19 @@ launch/sync overhead more than pays for a hidden-32 policy.
 ## Build
 
 ```bash
-make cuda    # -> ./craftax    (needs CUDA toolkit)
-make cpu     # -> ./craftax_c  (needs AVX-512: Zen 4/5, Ice Lake+)
+make    # -> ./craftax with both backends; CPU-only if nvcc is not installed
 ```
 
-```bash
-./craftax sweep                  # env SPS sweep: env counts x obs x reset modes
-./craftax bench 1048576 1000 1 1 # one config: envs iters obs_mode reset_mode
-./craftax mega 262144 128        # fused env+policy rollouts
-./craftax megasweep 128          # rollout sweep, megakernel vs per-step kernels
-./craftax hash 2048 500          # env validation suite
-./craftax verify 2048 300        # NN fusion + rollout validation suite
+CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 
-./craftax_c 32768 5000           # CPU bench: libgomp / thread pool / world pool
+```bash
+./craftax bench --envs 1048576 --iters 1000 --obs-mode 1 --reset-mode 1
+./craftax bench --backend cpu --envs 32768 --iters 5000
+./craftax sweep                    # env SPS sweep: env counts x obs x reset modes
+./craftax mega --envs 262144 --horizon 128   # fused env+policy rollouts
+./craftax megasweep                # rollout sweep, megakernel vs per-step kernels
+./craftax hash --envs 2048 --steps 500       # env validation suite
+./craftax verify --envs 2048 --steps 300     # NN fusion + rollout validation suite
 ```
 
 ## Verification

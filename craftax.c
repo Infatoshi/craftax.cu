@@ -1584,9 +1584,7 @@ void craftax_step_batch_compact_pool_tp(struct ThreadPool* tp, WorldPool* pool,
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 
-int main(int argc, char** argv) {
-    int NE    = argc>1 ? atoi(argv[1]) : 32768;
-    int ITERS = argc>2 ? atoi(argv[2]) : 5000;
+int craftax_cpu_main(int NE, int ITERS) {
 
     EnvState* st = aligned_alloc(64, sizeof(EnvState)*(size_t)NE);
     uint8_t*  ob = aligned_alloc(64, (size_t)NE*OBS_DIM_COMPACT);
@@ -1648,3 +1646,26 @@ int main(int argc, char** argv) {
     return 0;
 }
 
+
+#ifdef CRAFTAX_STANDALONE
+int main(int argc, char** argv) {
+    int envs = 32768, iters = 5000;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--envs") && i + 1 < argc) envs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "cpu") != 0) {
+                fprintf(stderr, "this build is CPU-only (no nvcc at compile time)\n");
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "bench")) {}  // only mode on CPU
+        else {
+            fprintf(stderr, "usage: %s [bench] [--envs N] [--iters N]\n", argv[0]);
+            return 1;
+        }
+    }
+    return craftax_cpu_main(envs, iters);
+}
+#endif

@@ -491,48 +491,84 @@ static int run_verify(int num_envs, int steps) {
 }
 
 
+extern "C" int craftax_cpu_main(int num_envs, int iters);
+
+static void usage(const char* prog) {
+    fprintf(stderr,
+        "usage: %s <mode> [flags]\n"
+        "modes:\n"
+        "  bench      env-only SPS            (--envs --iters --obs-mode --reset-mode)\n"
+        "  sweep      env-only sweep over env counts x obs x reset modes\n"
+        "  hash       env validation suite    (--envs --steps)\n"
+        "  mega       fused env+policy rollout SPS   (--envs --horizon --iters)\n"
+        "  split      same rollout via per-step kernels\n"
+        "  megasweep  rollout sweep, mega vs split   (--horizon)\n"
+        "  verify     NN fusion + rollout validation (--envs --steps)\n"
+        "flags:\n"
+        "  --backend cuda|cpu   (default cuda; cpu supports bench only)\n"
+        "  --envs N  --iters N  --steps N  --horizon N  --obs-mode 0|1  --reset-mode 0|1\n",
+        prog);
+}
+
 int main(int argc, char** argv) {
-    const char* mode = (argc > 1) ? argv[1] : "bench";
+    const char* mode = "bench";
+    const char* backend = "cuda";
+    int envs = -1, iters = -1, steps = -1, horizon = 128;
+    int obs_mode = 0, reset_mode = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
+        else if (!strcmp(argv[i], "--envs") && i + 1 < argc) envs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--horizon") && i + 1 < argc) horizon = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--obs-mode") && i + 1 < argc) obs_mode = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--reset-mode") && i + 1 < argc) reset_mode = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
+        else if (argv[i][0] != '-') mode = argv[i];
+        else { usage(argv[0]); return 1; }
+    }
+
+    if (strcmp(backend, "cpu") == 0) {
+        if (strcmp(mode, "bench") != 0) {
+            fprintf(stderr, "cpu backend supports only: bench\n");
+            return 1;
+        }
+        return craftax_cpu_main(envs < 0 ? 32768 : envs, iters < 0 ? 5000 : iters);
+    }
+    if (strcmp(backend, "cuda") != 0) { usage(argv[0]); return 1; }
+
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("device: %s\n", prop.name);
 
-    if (strcmp(mode, "hash") == 0) {
-        int envs = (argc > 2) ? atoi(argv[2]) : 2048;
-        int steps = (argc > 3) ? atoi(argv[3]) : 500;
-        return run_hash(envs, steps);
-    }
+    if (strcmp(mode, "hash") == 0)
+        return run_hash(envs < 0 ? 2048 : envs, steps < 0 ? 500 : steps);
+    if (strcmp(mode, "verify") == 0)
+        return run_verify(envs < 0 ? 2048 : envs, steps < 0 ? 300 : steps);
     if (strcmp(mode, "sweep") == 0) {
         int sizes[] = {4096, 16384, 65536, 262144, 1048576};
-        for (int reset_mode = 0; reset_mode <= 1; reset_mode++)
-            for (int obs_mode = 0; obs_mode <= 1; obs_mode++)
+        for (int rm = 0; rm <= 1; rm++)
+            for (int om = 0; om <= 1; om++)
                 for (int i = 0; i < 5; i++)
-                    run_bench(sizes[i], 1000, obs_mode, reset_mode);
+                    run_bench(sizes[i], iters < 0 ? 1000 : iters, om, rm);
         return 0;
     }
-    if (strcmp(mode, "verify") == 0) {
-        int envs = (argc > 2) ? atoi(argv[2]) : 2048;
-        int steps = (argc > 3) ? atoi(argv[3]) : 300;
-        return run_verify(envs, steps);
-    }
     if (strcmp(mode, "megasweep") == 0) {
-        int T = (argc > 2) ? atoi(argv[2]) : 128;
         int sizes[] = {4096, 16384, 65536, 262144, 1048576};
-        for (int i = 0; i < 5; i++) run_bench_rollout(sizes[i], T, 10, false);
-        for (int i = 0; i < 5; i++) run_bench_rollout(sizes[i], T, 10, true);
+        for (int i = 0; i < 5; i++) run_bench_rollout(sizes[i], horizon, iters < 0 ? 10 : iters, false);
+        for (int i = 0; i < 5; i++) run_bench_rollout(sizes[i], horizon, iters < 0 ? 10 : iters, true);
         return 0;
     }
     if (strcmp(mode, "mega") == 0 || strcmp(mode, "split") == 0) {
-        int envs = (argc > 2) ? atoi(argv[2]) : 262144;
-        int T = (argc > 3) ? atoi(argv[3]) : 128;
-        int iters = (argc > 4) ? atoi(argv[4]) : 10;
-        run_bench_rollout(envs, T, iters, strcmp(mode, "mega") == 0);
+        run_bench_rollout(envs < 0 ? 262144 : envs, horizon,
+                          iters < 0 ? 10 : iters, strcmp(mode, "mega") == 0);
         return 0;
     }
-    int envs = (argc > 2) ? atoi(argv[2]) : 65536;
-    int iters = (argc > 3) ? atoi(argv[3]) : 1000;
-    int obs_mode = (argc > 4) ? atoi(argv[4]) : 0;
-    int reset_mode = (argc > 5) ? atoi(argv[5]) : 1;
-    run_bench(envs, iters, obs_mode, reset_mode);
-    return 0;
+    if (strcmp(mode, "bench") == 0) {
+        run_bench(envs < 0 ? 65536 : envs, iters < 0 ? 1000 : iters, obs_mode, reset_mode);
+        return 0;
+    }
+    usage(argv[0]);
+    return 1;
 }

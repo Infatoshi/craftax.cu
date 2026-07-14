@@ -1,20 +1,24 @@
-NVCC      ?= nvcc
-CC        ?= gcc
+# Builds ./craftax with whatever toolchains are available:
+#   nvcc found   -> unified binary, both backends (--backend cuda|cpu)
+#   nvcc missing -> CPU-only binary, same CLI (bench mode only)
+CC        := gcc
+NVCC      := $(shell command -v nvcc 2>/dev/null)
 NVCCFLAGS ?= -O3 -arch=native --expt-relaxed-constexpr --use_fast_math
-CFLAGS    ?= -O3 -march=native -mtune=native -ffast-math -fno-math-errno \
-             -funroll-loops -flto -fopenmp
+CPUFLAGS  ?= -O3 -march=native -mtune=native -ffast-math -fno-math-errno \
+             -funroll-loops -fopenmp
 
-all: cuda cpu
+ifneq ($(NVCC),)
+craftax: main.cu craftax.cu craftax_cpu.o
+	$(NVCC) $(NVCCFLAGS) main.cu craftax_cpu.o -o $@ -Xcompiler -fopenmp -lpthread
 
-cuda: craftax
-craftax: main.cu craftax.cu
-	$(NVCC) $(NVCCFLAGS) main.cu -o $@
-
-cpu: craftax_c
-craftax_c: craftax.c
-	$(CC) $(CFLAGS) craftax.c -o $@ -lpthread -lm
+craftax_cpu.o: craftax.c
+	$(CC) $(CPUFLAGS) -c craftax.c -o $@
+else
+craftax: craftax.c
+	$(CC) $(CPUFLAGS) -DCRAFTAX_STANDALONE craftax.c -o $@ -lpthread -lm
+endif
 
 clean:
-	rm -f craftax craftax_c
+	rm -f craftax craftax_c craftax_cpu.o
 
-.PHONY: all cuda cpu clean
+.PHONY: clean
