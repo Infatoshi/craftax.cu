@@ -4,3 +4,7 @@ dist/
 *.so
 __pycache__/
 *.pyc
+bench_main
+megakernel
+.venv/
+uv.lock

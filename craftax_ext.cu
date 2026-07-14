@@ -3,50 +3,63 @@
 #include "craftax.cuh"
 
 // Forward declare kernels
-extern "C" __global__ void reset_kernel(EnvState* states, float* obs, int num_envs, uint64_t seed);
-extern "C" __global__ void step_kernel(EnvState* states, const int32_t* actions, float* obs, float* rewards, int8_t* dones, int num_envs, uint64_t reset_seed);
-extern "C" __global__ void step_only_kernel(EnvState* states, const int32_t* actions, float* rewards, int8_t* dones, int num_envs);
-extern "C" __global__ void autoreset_obs_kernel(EnvState* states, const int8_t* dones, float* obs, int num_envs, uint64_t reset_seed);
+extern "C" __global__ void reset_kernel(EnvSoA g, float* obs, uint8_t* obs_compact, int obs_mode, int num_envs, uint64_t seed);
+extern "C" __global__ void step_kernel(EnvSoA g, const int32_t* actions, float* obs, uint8_t* obs_compact, int obs_mode, float* rewards, int8_t* dones, int num_envs, uint64_t reset_seed);
+extern "C" __global__ void step_only_kernel(EnvSoA g, const int32_t* actions, float* rewards, int8_t* dones, int num_envs);
+extern "C" __global__ void autoreset_obs_kernel(EnvSoA g, const int8_t* dones, float* obs, uint8_t* obs_compact, int obs_mode, int num_envs, uint64_t reset_seed);
+extern "C" __global__ void expand_obs_kernel(const uint8_t* compact, float* obs, int num_envs);
 
 #include "craftax.cu"
 
-static_assert(sizeof(EnvState) < 16384, "EnvState too large");
-
 class CraftaxEnv {
 public:
-    torch::Tensor states;
-    torch::Tensor obs;
+    torch::Tensor states;      // SoA arena (uint8 blob)
+    torch::Tensor obs;         // float obs [n, OBS_DIM] (obs_mode 0 or 2)
+    torch::Tensor obs_compact; // uint8 obs [n, OBS_DIM_COMPACT] (obs_mode 1 or 2)
     torch::Tensor rewards;
     torch::Tensor dones;
+    EnvSoA soa;
     int num_envs;
     uint64_t seed;
     uint64_t step_count;
     bool use_split_kernels;
+    // 0 = float obs, 1 = compact uint8 obs, 2 = both (for exactness tests)
+    int obs_mode;
 
-    CraftaxEnv(int num_envs_, uint64_t seed_)
-        : num_envs(num_envs_), seed(seed_), step_count(0), use_split_kernels(true) {
+    CraftaxEnv(int num_envs_, uint64_t seed_, int obs_mode_ = 0)
+        : num_envs(num_envs_), seed(seed_), step_count(0),
+          use_split_kernels(true), obs_mode(obs_mode_) {
 
         auto opts_byte = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
         auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
         auto opts_i8 = torch::TensorOptions().dtype(torch::kInt8).device(torch::kCUDA);
 
-        int state_bytes = sizeof(EnvState) * num_envs;
-        states = torch::zeros({state_bytes}, opts_byte);
-        obs = torch::zeros({num_envs, OBS_DIM}, opts_f32);
+        states = torch::zeros({(int64_t)soa_bytes(num_envs)}, opts_byte);
+        soa = carve_soa(states.data_ptr<uint8_t>(), num_envs);
+
+        if (obs_mode != 1)
+            obs = torch::zeros({num_envs, OBS_DIM}, opts_f32);
+        else
+            obs = torch::zeros({0}, opts_f32);
+        if (obs_mode >= 1)
+            obs_compact = torch::zeros({num_envs, OBS_DIM_COMPACT}, opts_byte);
+        else
+            obs_compact = torch::zeros({0}, opts_byte);
         rewards = torch::zeros({num_envs}, opts_f32);
         dones = torch::zeros({num_envs}, opts_i8);
     }
+
+    float* obs_ptr() { return obs_mode != 1 ? obs.data_ptr<float>() : nullptr; }
+    uint8_t* obs_compact_ptr() { return obs_mode >= 1 ? obs_compact.data_ptr<uint8_t>() : nullptr; }
 
     torch::Tensor reset() {
         int block = 256;
         int grid = (num_envs + block - 1) / block;
         reset_kernel<<<grid, block>>>(
-            (EnvState*)states.data_ptr(),
-            obs.data_ptr<float>(),
-            num_envs, seed
+            soa, obs_ptr(), obs_compact_ptr(), obs_mode, num_envs, seed
         );
         step_count = 0;
-        return obs;
+        return obs_mode == 1 ? obs_compact : obs;
     }
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> step(torch::Tensor actions) {
@@ -57,55 +70,69 @@ public:
         int block = 256;
         int grid = (num_envs + block - 1) / block;
         uint64_t reset_seed = seed + step_count * 1000000ULL;
-        
+
         if (use_split_kernels) {
             // Split: step logic first (uniform work), then autoreset+obs (divergent)
             step_only_kernel<<<grid, block>>>(
-                (EnvState*)states.data_ptr(),
-                actions.data_ptr<int32_t>(),
-                rewards.data_ptr<float>(),
-                dones.data_ptr<int8_t>(),
-                num_envs
+                soa, actions.data_ptr<int32_t>(),
+                rewards.data_ptr<float>(), dones.data_ptr<int8_t>(), num_envs
             );
             autoreset_obs_kernel<<<grid, block>>>(
-                (EnvState*)states.data_ptr(),
-                dones.data_ptr<int8_t>(),
-                obs.data_ptr<float>(),
-                num_envs, reset_seed
+                soa, dones.data_ptr<int8_t>(),
+                obs_ptr(), obs_compact_ptr(), obs_mode, num_envs, reset_seed
             );
         } else {
             step_kernel<<<grid, block>>>(
-                (EnvState*)states.data_ptr(),
-                actions.data_ptr<int32_t>(),
-                obs.data_ptr<float>(),
-                rewards.data_ptr<float>(),
-                dones.data_ptr<int8_t>(),
+                soa, actions.data_ptr<int32_t>(),
+                obs_ptr(), obs_compact_ptr(), obs_mode,
+                rewards.data_ptr<float>(), dones.data_ptr<int8_t>(),
                 num_envs, reset_seed
             );
         }
-        return {obs, rewards, dones};
+        return {obs_mode == 1 ? obs_compact : obs, rewards, dones};
     }
 
-    int get_obs_dim() { return OBS_DIM; }
+    // Expand a compact uint8 obs batch to the exact float observation.
+    torch::Tensor expand(torch::Tensor compact) {
+        TORCH_CHECK(compact.device().is_cuda(), "compact obs must be on CUDA");
+        TORCH_CHECK(compact.dtype() == torch::kUInt8, "compact obs must be uint8");
+        TORCH_CHECK(compact.size(-1) == OBS_DIM_COMPACT, "wrong compact obs dim");
+        int n = compact.numel() / OBS_DIM_COMPACT;
+        auto out = torch::empty({n, OBS_DIM},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+        int block = 256;
+        int grid = (n + block - 1) / block;
+        expand_obs_kernel<<<grid, block>>>(
+            compact.contiguous().data_ptr<uint8_t>(), out.data_ptr<float>(), n);
+        return out;
+    }
+
+    int get_obs_dim() { return obs_mode == 1 ? OBS_DIM_COMPACT : OBS_DIM; }
     int get_num_actions() { return NUM_ACTIONS; }
     int get_num_envs() { return num_envs; }
-    int get_state_size() { return (int)sizeof(EnvState); }
+    int get_state_size() { return (int)(soa_bytes(num_envs) / num_envs); }
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "craftax.cu: CUDA Craftax-Classic (17 actions, 22 achievements, "
               "single 64x64 map). This is Craftax-Classic, NOT Craftax-Full.";
     pybind11::class_<CraftaxEnv>(m, "CraftaxEnv",
-        "Batched CUDA Craftax-Classic environment. Classic, not Full: 17 actions, "
-        "22 achievements, single 64x64 map, no dungeon floors/potions/enchant/bosses.")
-        .def(pybind11::init<int, uint64_t>(), pybind11::arg("num_envs") = 4096, pybind11::arg("seed") = 42)
+        "Batched CUDA Craftax-Classic environment (SoA state layout). Classic, not "
+        "Full: 17 actions, 22 achievements, single 64x64 map. obs_mode: 0=float "
+        "one-hot (1345), 1=compact uint8 (148, expand() reproduces float obs "
+        "bit-exactly), 2=both (testing).")
+        .def(pybind11::init<int, uint64_t, int>(),
+             pybind11::arg("num_envs") = 4096, pybind11::arg("seed") = 42,
+             pybind11::arg("obs_mode") = 0)
         .def("reset", &CraftaxEnv::reset)
         .def("step", &CraftaxEnv::step)
+        .def("expand", &CraftaxEnv::expand)
         .def("get_obs_dim", &CraftaxEnv::get_obs_dim)
         .def("get_num_actions", &CraftaxEnv::get_num_actions)
         .def("get_num_envs", &CraftaxEnv::get_num_envs)
         .def("get_state_size", &CraftaxEnv::get_state_size)
         .def_readonly("obs", &CraftaxEnv::obs)
+        .def_readonly("obs_compact", &CraftaxEnv::obs_compact)
         .def_readonly("rewards", &CraftaxEnv::rewards)
         .def_readonly("dones", &CraftaxEnv::dones)
         .def_readwrite("use_split_kernels", &CraftaxEnv::use_split_kernels);
