@@ -371,7 +371,7 @@ static void run_bench_rollout(int num_envs, int T, int iters, bool mega) {
     CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
     if (need + (512ull << 20) > free_b) {
         printf("NE=%8d T=%d %s: skipped (needs %.1f GB, %.1f GB free)\n",
-               num_envs, T, mega ? "mega " : "split", need / 1e9, free_b / 1e9);
+               num_envs, T, mega ? "run  " : "split", need / 1e9, free_b / 1e9);
         return;
     }
     Rollout r(num_envs, T, 42);
@@ -384,7 +384,7 @@ static void run_bench_rollout(int num_envs, int T, int iters, bool mega) {
     double dt = now_s() - t0;
     double sps = (double)num_envs * T * iters / dt;
     printf("NE=%8d T=%d %s: %8.1f M SPS  (%.1f us/env-step-row)\n",
-           num_envs, T, mega ? "mega " : "split", sps / 1e6, dt / (iters * (double)T) * 1e6);
+           num_envs, T, mega ? "run  " : "split", sps / 1e6, dt / (iters * (double)T) * 1e6);
 }
 
 static uint64_t rollout_hash(Rollout& r) {
