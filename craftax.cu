@@ -1567,7 +1567,10 @@ __device__ void write_compact_obs(
 // step0 is the global step count at entry (sampler stream offset
 // and reset-seed schedule stay aligned with the split path).
 // ============================================================
-extern "C" __global__ void rollout_kernel(
+#ifndef ROLLOUT_MIN_BLOCKS
+#define ROLLOUT_MIN_BLOCKS 4
+#endif
+extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rollout_kernel(
     EnvSoA g, Weights w, float* __restrict__ h_state,
     uint8_t* __restrict__ r_obs, int32_t* __restrict__ r_act,
     float* __restrict__ r_logprob, float* __restrict__ r_value,

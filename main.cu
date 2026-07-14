@@ -335,6 +335,11 @@ struct Rollout {
         step_count += T;
     }
 
+    void run_rollout(int kind) {  // 0 split, 1 mega
+        if (kind == 1) run_mega();
+        else run_split();
+    }
+
     // Same rollout via per-step kernels (forward, step+mark, warp reset).
     void run_split() {
         int block = 256, grid = (n + block - 1) / block;
@@ -363,7 +368,9 @@ struct Rollout {
     }
 };
 
-static void run_bench_rollout(int num_envs, int T, int iters, bool mega) {
+static const char* ROLLOUT_NAMES[2] = {"split", "run  "};
+
+static void run_bench_rollout(int num_envs, int T, int iters, int kind) {
     // Rollout buffers are n*T*(148+13+4) bytes plus env state; skip
     // configs that do not fit.
     size_t need = (size_t)num_envs * T * (OBS_DIM_COMPACT + 17) + soa_bytes(num_envs);
@@ -371,20 +378,20 @@ static void run_bench_rollout(int num_envs, int T, int iters, bool mega) {
     CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
     if (need + (512ull << 20) > free_b) {
         printf("NE=%8d T=%d %s: skipped (needs %.1f GB, %.1f GB free)\n",
-               num_envs, T, mega ? "run  " : "split", need / 1e9, free_b / 1e9);
+               num_envs, T, ROLLOUT_NAMES[kind], need / 1e9, free_b / 1e9);
         return;
     }
     Rollout r(num_envs, T, 42);
     r.reset();
-    for (int i = 0; i < 3; i++) mega ? r.run_mega() : r.run_split();
+    for (int i = 0; i < 3; i++) r.run_rollout(kind);
     CUDA_CHECK(cudaDeviceSynchronize());
     double t0 = now_s();
-    for (int i = 0; i < iters; i++) mega ? r.run_mega() : r.run_split();
+    for (int i = 0; i < iters; i++) r.run_rollout(kind);
     CUDA_CHECK(cudaDeviceSynchronize());
     double dt = now_s() - t0;
     double sps = (double)num_envs * T * iters / dt;
     printf("NE=%8d T=%d %s: %8.1f M SPS  (%.1f us/env-step-row)\n",
-           num_envs, T, mega ? "run  " : "split", sps / 1e6, dt / (iters * (double)T) * 1e6);
+           num_envs, T, ROLLOUT_NAMES[kind], sps / 1e6, dt / (iters * (double)T) * 1e6);
 }
 
 static uint64_t rollout_hash(Rollout& r) {
@@ -473,14 +480,14 @@ static int run_verify(int num_envs, int steps) {
         cudaFree(act_ref); cudaFree(lp_ref); cudaFree(val_ref);
     }
 
-    // Check 2: megakernel rollout == split-path rollout, bitwise.
+    // Check 2: megakernel, smem-map, and split-path rollouts, all bitwise equal.
     {
         Rollout a(num_envs, steps, 42), b(num_envs, steps, 42);
         a.reset(); b.reset();
         a.run_mega(); b.run_split();
         CUDA_CHECK(cudaDeviceSynchronize());
         uint64_t ha = rollout_hash(a), hb = rollout_hash(b);
-        printf("mega rollout hash:  %016llx\n", (unsigned long long)ha);
+        printf("run rollout hash:   %016llx\n", (unsigned long long)ha);
         printf("split rollout hash: %016llx  (%s)\n", (unsigned long long)hb,
                ha == hb ? "MATCH" : "MISMATCH");
         if (ha != hb) fail = 1;
@@ -556,13 +563,14 @@ int main(int argc, char** argv) {
     }
     if (strcmp(mode, "runsweep") == 0) {
         int sizes[] = {4096, 16384, 65536, 262144, 1048576};
-        for (int i = 0; i < 5; i++) run_bench_rollout(sizes[i], horizon, iters < 0 ? 10 : iters, false);
-        for (int i = 0; i < 5; i++) run_bench_rollout(sizes[i], horizon, iters < 0 ? 10 : iters, true);
+        for (int k = 0; k < 2; k++)
+            for (int i = 0; i < 5; i++)
+                run_bench_rollout(sizes[i], horizon, iters < 0 ? 10 : iters, k);
         return 0;
     }
     if (strcmp(mode, "run") == 0 || strcmp(mode, "split") == 0) {
         run_bench_rollout(envs < 0 ? 262144 : envs, horizon,
-                          iters < 0 ? 10 : iters, strcmp(mode, "run") == 0);
+                          iters < 0 ? 10 : iters, strcmp(mode, "run") == 0 ? 1 : 0);
         return 0;
     }
     if (strcmp(mode, "bench") == 0) {
