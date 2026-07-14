@@ -1,24 +1,32 @@
-# Builds ./craftax with whatever toolchains are available:
-#   nvcc found   -> unified binary, both backends (--backend cuda|cpu)
-#   nvcc missing -> CPU-only binary, same CLI (bench mode only)
+# Grid of Craftax implementations: {classic, full} x {C, CUDA}.
+#   make classic  -> ./craftax_classic  (unified CUDA+CPU binary; CPU-only without nvcc)
+#   make full     -> ./craftax_full     (CPU; CUDA port pending)
+#   make          -> everything buildable with the toolchains present
 CC        := gcc
 NVCC      := $(shell command -v nvcc 2>/dev/null)
 NVCCFLAGS ?= -O3 -arch=native --expt-relaxed-constexpr --use_fast_math
 CPUFLAGS  ?= -O3 -march=native -mtune=native -ffast-math -fno-math-errno \
              -funroll-loops -fopenmp
 
-ifneq ($(NVCC),)
-craftax: main.cu craftax.cu craftax_cpu.o
-	$(NVCC) $(NVCCFLAGS) main.cu craftax_cpu.o -o $@ -Xcompiler -fopenmp -lpthread
+all: classic full
+classic: craftax_classic
+full: craftax_full
 
-craftax_cpu.o: craftax.c
-	$(CC) $(CPUFLAGS) -c craftax.c -o $@
+ifneq ($(NVCC),)
+craftax_classic: main_classic.cu craftax_classic.cu craftax_classic_cpu.o
+	$(NVCC) $(NVCCFLAGS) main_classic.cu craftax_classic_cpu.o -o $@ -Xcompiler -fopenmp -lpthread
+
+craftax_classic_cpu.o: craftax_classic.c
+	$(CC) $(CPUFLAGS) -c craftax_classic.c -o $@
 else
-craftax: craftax.c
-	$(CC) $(CPUFLAGS) -DCRAFTAX_STANDALONE craftax.c -o $@ -lpthread -lm
+craftax_classic: craftax_classic.c
+	$(CC) $(CPUFLAGS) -DCRAFTAX_STANDALONE craftax_classic.c -o $@ -lpthread -lm
 endif
 
-clean:
-	rm -f craftax craftax_c craftax_cpu.o
+craftax_full: craftax_full.c
+	$(CC) $(CPUFLAGS) craftax_full.c -o $@ -lpthread -lm
 
-.PHONY: clean
+clean:
+	rm -f craftax_classic craftax_full craftax_classic_cpu.o
+
+.PHONY: all classic full clean

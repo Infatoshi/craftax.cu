@@ -1,14 +1,23 @@
 # craftax.cu
 
-CUDA and C (AVX-512) implementations of [Craftax-Classic](https://github.com/MichaelTMatthews/Craftax) (Matthews et al. 2024) for high-throughput RL.
+CUDA and C (AVX-512) implementations of [Craftax](https://github.com/MichaelTMatthews/Craftax) (Matthews et al. 2024) for high-throughput RL, as a grid of {classic, full} x {C, CUDA}:
 
-> Craftax-Classic, not Craftax-Full: 17 actions, 22 achievements, one 64x64 map. For the full game see [PufferLib's `ocean/craftax`](https://github.com/PufferAI/PufferLib/tree/4.0/ocean/craftax).
+| | C (CPU) | CUDA |
+|---|---|---|
+| Classic (17 actions, one 64x64 map) | `craftax_classic.c` | `craftax_classic.cu` |
+| Full (43 actions, multi-floor dungeons) | `craftax_full.c` (in progress) | planned |
+
+The classic CUDA path is the most developed: fused env+policy rollout
+megakernel plus fully on-device PPO training. The full game starts from
+[PufferLib's `ocean/craftax`](https://github.com/PufferAI/PufferLib/tree/4.0/ocean/craftax)
+C port (parity-verified against the JAX original) and follows the same
+optimization ladder: C first, then CUDA, then a megakernel.
 
 <p align="center">
   <img src="gameplay.gif" alt="Trained agent gameplay" width="300">
 </p>
 
-## Results
+## Results (classic)
 
 Env steps per second:
 
@@ -27,21 +36,22 @@ launch/sync overhead roughly pays for a hidden-32 policy.
 ## Build
 
 ```bash
-make    # -> ./craftax with both backends; CPU-only if nvcc is not installed
+make classic   # -> ./craftax_classic, CUDA+CPU backends; CPU-only without nvcc
+make full      # -> ./craftax_full (CPU)
 ```
 
-CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
+The classic CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 
 ```bash
-./craftax bench --envs 1048576 --iters 1000 --obs-mode 1 --reset-mode 1
-./craftax bench --backend cpu --envs 32768 --iters 5000
-./craftax sweep                    # env SPS sweep: env counts x obs x reset modes
-./craftax run --envs 262144 --horizon 128    # fused env+policy rollouts
-./craftax runsweep                 # rollout sweep, fused vs per-step kernels
-./craftax hash --envs 2048 --steps 500       # env validation suite
-./craftax verify --envs 2048 --steps 300     # NN fusion + rollout validation suite
-./craftax train --envs 262144 --horizon 128 --iters 200   # on-device PPO training
-./craftax gradcheck                          # analytic grads vs finite differences
+./craftax_classic bench --envs 1048576 --iters 1000 --obs-mode 1 --reset-mode 1
+./craftax_classic bench --backend cpu --envs 32768 --iters 5000
+./craftax_classic sweep                    # env SPS sweep: env counts x obs x reset modes
+./craftax_classic run --envs 262144 --horizon 128    # fused env+policy rollouts
+./craftax_classic runsweep                 # rollout sweep, fused vs per-step kernels
+./craftax_classic hash --envs 2048 --steps 500       # env validation suite
+./craftax_classic verify --envs 2048 --steps 300     # NN fusion + rollout validation suite
+./craftax_classic train --envs 262144 --horizon 128 --iters 200   # on-device PPO training
+./craftax_classic gradcheck                          # analytic grads vs finite differences
 ```
 
 ## Verification
@@ -54,13 +64,13 @@ design, so it is guarded distributionally: block histograms match the
 original, full-map diversity is 100%, and the serial and warp generators are
 bit-identical to each other. The fused policy forward is bit-exact vs a dense
 reference, and megakernel rollouts are bitwise identical to the per-step
-path. `./craftax hash` and `./craftax verify` run all of it; during
+path. `./craftax_classic hash` and `./craftax_classic verify` run all of it; during
 development 33/33 structural tests also passed against a JAX reference
 trajectory.
 
 ## Design notes
 
-CUDA (`craftax.cu` device code, `main.cu` launcher):
+Classic CUDA (`craftax_classic.cu` device code, `main_classic.cu` launcher):
 
 - SoA state: one thread steps one env; per-field arrays make warp lanes
   coalesce (store efficiency 11% -> 47%)
@@ -76,14 +86,14 @@ CUDA (`craftax.cu` device code, `main.cu` launcher):
   warp-cooperatively so a straggler stalls only its own warp; the
   one-hot-dominated encoder collapses to a weight-column gather
 
-CPU (`craftax.c`, single file): OpenMP or custom spin-barrier thread pool
+Classic CPU (`craftax_classic.c`, single file): OpenMP or custom spin-barrier thread pool
 over envs, AVX-512 Perlin via `permutexvar`, pipelined world-gen pool
 (producer threads pre-generate reset maps on one CCD, consumers step envs on
 the V-Cache CCD). Progression at 32k envs: 5.6M naive -> 47.8M.
 
 ## Training
 
-`./craftax train` runs PPO (1 epoch, full batch) entirely on device: fused
+`./craftax_classic train` runs PPO (1 epoch, full batch) entirely on device: fused
 rollout, bootstrap value, GAE, advantage normalization, backward, and Adam,
 with no tensor round-trips to the host inside an iteration. The 1345-float
 observation is never materialized for training either: the backward pass
@@ -92,7 +102,7 @@ per-step recurrent state (for BPTT through the MinGRU, truncated at episode
 boundaries), and the encoder gradient is a sparse scatter-add into the ~70
 active one-hot columns per sample. Gradients accumulate into per-block
 copies in L2/HBM (block-level data parallelism, the single-GPU analogue of
-an all-reduce) that the Adam kernel reduces. `./craftax gradcheck` verifies
+an all-reduce) that the Adam kernel reduces. `./craftax_classic gradcheck` verifies
 every parameter segment against central finite differences of the actual
 PPO loss.
 
