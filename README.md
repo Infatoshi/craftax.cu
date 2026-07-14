@@ -33,6 +33,8 @@ Full game (env only, random actions, auto-reset included):
 |---|---|---:|
 | C, 8192 envs, 32T | Ryzen 9 9950X3D | 5.6M |
 | C, 1024 envs, 1T | Ryzen 9 9950X3D | 750K |
+| CUDA, 262k envs, compact obs | RTX PRO 6000 Blackwell | 68.2M |
+| CUDA, 65k envs | RTX PRO 6000 Blackwell | 61.9M |
 | CUDA, 65k envs, compact obs | RTX 3090 | 18.8M |
 | CUDA, 65k envs | RTX 3090 | 18.3M |
 | CUDA (naive port, milestone 1), 65k envs | RTX 3090 | 454K |
