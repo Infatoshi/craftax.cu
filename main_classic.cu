@@ -522,6 +522,7 @@ static int run_verify(int num_envs, int steps) {
 struct PPOConfig {
     float lr = 3e-4f, gamma = 0.99f, lam = 0.95f;
     float clip = 0.2f, ent = 0.01f, vf = 0.5f;
+    int epochs = 1;  // backward+adam passes per collected batch
 };
 
 struct Trainer {
@@ -595,7 +596,10 @@ struct Trainer {
         CUDA_CHECK(cudaGetLastError());
     }
 
-    void update() { collect(); backward(); adam(); }
+    void update() {
+        collect();
+        for (int e = 0; e < cfg.epochs; e++) { backward(); adam(); }
+    }
 
     // Total PPO loss over the stored rollout at the current params
     // (recomputes the recurrent forward; used by gradcheck FD).
@@ -621,8 +625,8 @@ static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
     Rollout r(num_envs, T, 42);
     Trainer tr(r, cfg);
     r.reset();
-    printf("train: envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g\n",
-           num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf);
+    printf("train: envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g epochs=%d\n",
+           num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf, cfg.epochs);
 
     static const char* ach_names[22] = {
         "collect_wood", "place_table", "eat_cow", "collect_sapling",
@@ -768,7 +772,7 @@ static void usage(const char* prog) {
         "flags:\n"
         "  --backend cuda|cpu   (default cuda; cpu supports bench only)\n"
         "  --envs N  --iters N  --steps N  --horizon N  --obs-mode 0|1  --reset-mode 0|1\n"
-        "  --lr F  --gamma F  --gae-lambda F  --clip F  --ent F  --vf F\n",
+        "  --lr F  --gamma F  --gae-lambda F  --clip F  --ent F  --vf F  --epochs N\n",
         prog);
 }
 
@@ -793,6 +797,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--clip") && i + 1 < argc) cfg.clip = atof(argv[++i]);
         else if (!strcmp(argv[i], "--ent") && i + 1 < argc) cfg.ent = atof(argv[++i]);
         else if (!strcmp(argv[i], "--vf") && i + 1 < argc) cfg.vf = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--epochs") && i + 1 < argc) cfg.epochs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else if (argv[i][0] != '-') mode = argv[i];
         else { usage(argv[0]); return 1; }

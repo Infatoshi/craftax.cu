@@ -5,7 +5,7 @@ CUDA and C (AVX-512) implementations of [Craftax](https://github.com/MichaelTMat
 | | C (CPU) | CUDA |
 |---|---|---|
 | Classic (17 actions, one 64x64 map) | `craftax_classic.c` | `craftax_classic.cu` |
-| Full (43 actions, multi-floor dungeons) | `craftax_full.c` (in progress) | planned |
+| Full (43 actions, multi-floor dungeons) | `craftax_full.c` | planned |
 
 The classic CUDA path is the most developed: fused env+policy rollout
 megakernel plus fully on-device PPO training. The full game starts from
@@ -26,6 +26,13 @@ Env steps per second:
 | CUDA, 1M envs | RTX PRO 6000 Blackwell | 312.4M | 306.9M |
 | CUDA, 1M envs | RTX 3090 | 127.9M | 116.2M @ 262k |
 | C, 32k envs | Ryzen 9 9950X3D | 47.8M | - |
+
+Full game (env only, random actions, auto-reset included):
+
+| Backend | Hardware | SPS |
+|---|---|---:|
+| C, 8192 envs, 32T | Ryzen 9 9950X3D | 5.6M |
+| C, 1024 envs, 1T | Ryzen 9 9950X3D | 750K |
 
 "Env + policy" is a rollout megakernel: the PufferLib default craftax policy
 (Linear 1345->32 encoder, MinGRU, actor/critic heads), categorical sampling,
@@ -52,6 +59,8 @@ The classic CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 ./craftax_classic verify --envs 2048 --steps 300     # NN fusion + rollout validation suite
 ./craftax_classic train --envs 262144 --horizon 128 --iters 200   # on-device PPO training
 ./craftax_classic gradcheck                          # analytic grads vs finite differences
+./craftax_full bench --envs 8192 --iters 2048 --threads 32   # full game, random actions
+./craftax_full hash --envs 64 --steps 2000           # full-game determinism anchor
 ```
 
 ## Verification
@@ -115,6 +124,15 @@ dh_enc vectors in shared memory and walks its samples together, so
 every feature update is one coalesced line-atomic instead of 32
 scattered ones. The remaining gap to rollout speed is the ~70
 irreducible encoder column atomics per sample.
+
+Learning was validated against PufferLib's PPO on craftax_classic at
+matched hyperparameters (8192 envs, horizon 128, full-batch updates,
+lr 3e-4, 200M steps): this trainer reaches episodic return 3.7 vs 1.1
+for PuffeRL forced into the same single-update regime. With more
+optimization pressure per batch (`--epochs 16 --lr 2e-3`) it reaches
+13.1, approaching PufferLib's tuned-default recipe (15.8, which uses
+128 minibatch updates per batch, annealed lr 0.015, and a hidden-128
+policy). Closing the rest is minibatched updates -- future work.
 
 ## Citation
 
