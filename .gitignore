@@ -4,7 +4,6 @@ dist/
 *.so
 __pycache__/
 *.pyc
-bench_main
-megakernel
+craftax
 .venv/
 uv.lock

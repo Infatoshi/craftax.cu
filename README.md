@@ -35,8 +35,8 @@ once per-step launch/sync overhead is fused away, a hidden-32 policy is free.
 At small batch (4096 envs) the megakernel is 2.4x the split path.
 
 Correctness is enforced at three levels:
-- 33/33 structural validation tests against a JAX reference trajectory
-  (`validate.py`).
+- During development, 33/33 structural validation tests passed against a JAX
+  reference trajectory (obs format, mechanics timing, terminal conditions).
 - Layout changes (SoA, compact obs) were verified bit-exact against the
   original by FNV trajectory hash over (obs, rewards, dones); the compact
   observation expands back to the 1345-float obs bit-for-bit.
@@ -48,66 +48,40 @@ Correctness is enforced at three levels:
   full-map diversity is 100%, and the serial and warp generators are verified
   bit-identical to each other. The fused NN forward is bit-exact vs a dense
   reference, and megakernel rollouts are bitwise identical to the per-step
-  path (`bench_main hash`, `megakernel verify`).
+  path. All of this runs in `./craftax hash` and `./craftax verify`.
 
-Earlier torch-based training comparison (RTX 3090, 4096 envs, matched PPO
-hyperparameters): 7.4x faster than the JAX original end-to-end, converging to
-the same mean return (5.48 vs 4.76 at 10M steps).
+An earlier torch-based training comparison (RTX 3090, 4096 envs, matched PPO
+hyperparameters) was 7.4x faster than the JAX original end-to-end, converging
+to the same mean return (5.48 vs 4.76 at 10M steps).
 
-## Pure CUDA benchmark and validation (no Python)
+## Build and run
 
-```bash
-nvcc -O3 -arch=native --expt-relaxed-constexpr --use_fast_math bench_main.cu -o bench_main
-./bench_main sweep                 # SPS sweep: env counts x obs modes x reset modes
-./bench_main hash 2048 500         # validation: worldgen exactness, trajectory
-                                   # hash, obs expansion, map diversity, histogram
-./bench_main bench 1048576 1000 1 1  # single config: envs iters obs_mode reset_mode
-
-nvcc -O3 -arch=native --expt-relaxed-constexpr --use_fast_math megakernel.cu -o megakernel
-./megakernel sweep 128             # fused env+NN rollouts, mega vs split
-./megakernel verify 2048 300       # bitwise NN fusion + rollout verification
-```
-
-## PyTorch interface (optional)
-
-Requires a CUDA toolkit version that matches your PyTorch install:
+Two source files, no dependencies beyond the CUDA toolkit:
 
 ```bash
-uv venv && uv pip install torch --index-url https://download.pytorch.org/whl/cu128
-uv pip install --no-build-isolation -e .
-```
+nvcc -O3 -arch=native --expt-relaxed-constexpr --use_fast_math main.cu -o craftax
 
-```python
-import torch
-import craftax_cuda
-
-env = craftax_cuda.CraftaxEnv(num_envs=4096, seed=42)
-obs = env.reset()                    # (4096, 1345) float32 on GPU
-actions = torch.randint(0, 17, (4096,), dtype=torch.int32, device='cuda')
-obs, rewards, dones = env.step(actions)
-
-# compact observations: obs_mode=1 -> (n, 148) uint8; env.expand() reproduces
-# the float obs bit-exactly on GPU
-```
-
-```bash
-uv run bench.py       # env-only + PPO training benchmark
-uv run validate.py    # 33 tests against JAX reference
+./craftax sweep                  # env-only SPS sweep: env counts x obs x reset modes
+./craftax bench 1048576 1000 1 1 # single config: envs iters obs_mode reset_mode
+./craftax hash 2048 500          # env validation: worldgen exactness, trajectory
+                                 # hash, obs expansion, map diversity, histogram
+./craftax mega 262144 128        # fused env+policy rollout SPS
+./craftax megasweep 128          # rollout sweep, megakernel vs per-step kernels
+./craftax verify 2048 300        # bitwise NN fusion + rollout verification
 ```
 
 ## Architecture
 
-Everything lives on GPU. No CPU-GPU copies in the hot path.
+Everything lives on GPU. No CPU-GPU copies in the hot path. Two files:
 
-- **`craftax.cuh`** -- SoA env state arena (per-field arrays over envs so warp
-  lanes coalesce), 4-bit packed maps, compact obs layout, device helpers
-- **`craftax.cu`** -- game logic (crafting, combat, mob AI, intrinsics),
-  offset-Philox worldgen (serial + warp-cooperative, bit-identical), obs
-  builders, all kernels
-- **`bench_main.cu`** -- pure C/CUDA harness: benchmarks + validation suite
-- **`megakernel.cu`** -- fused env + policy rollout kernel (PufferLib default
-  policy: Linear 1345->32 encoder, MinGRU, actor/critic heads)
-- **`craftax_ext.cu`** -- optional PyTorch extension (pybind11)
+- **`craftax.cu`** -- all device code: SoA env state arena (per-field arrays
+  over envs so warp lanes coalesce), 4-bit packed maps, game logic (crafting,
+  combat, mob AI, intrinsics), offset-Philox worldgen (serial +
+  warp-cooperative, bit-identical), obs builders, the policy (Linear 1345->32
+  encoder, MinGRU, actor/critic heads -- PufferLib's default craftax policy),
+  and every kernel including the rollout megakernel
+- **`main.cu`** -- the launcher: benchmarks, validation suite, rollout
+  harness, all subcommands
 
 Key design choices:
 
@@ -136,22 +110,6 @@ Key design choices:
 A procedurally generated survival game used as an RL benchmark. The agent spawns on a 64x64 tile map with resources, mobs, and crafting. 17 actions (move, mine, craft, place, sleep), 22 achievements to unlock. Episodes run for 10k timesteps. The observation is a 7x9 local view + inventory + stats = 1345-dim vector.
 
 Originally implemented in JAX by [Matthews et al.](https://github.com/MichaelTMatthews/Craftax) for fully-GPU training with `jax.lax.scan`.
-
-## File structure
-
-```
-craftax.cuh          # Constants, SoA state arena, device helpers
-craftax.cu           # Full game logic + CUDA kernels
-bench_main.cu        # Pure C/CUDA benchmark + validation harness
-megakernel.cu        # Fused env + policy rollout megakernel
-craftax_ext.cu       # Optional PyTorch extension binding
-setup.py             # Torch extension build (auto-detects GPU arch)
-bench.py             # Torch benchmark script (env-only + PPO training)
-validate.py          # 33-test validation suite
-gen_reference.py     # Generates JAX reference data
-reference_data.npz   # JAX reference trajectory (seed=42, 100 steps)
-render_gif.py        # Train agent + render gameplay GIF
-```
 
 ## Citation
 
