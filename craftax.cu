@@ -1741,6 +1741,7 @@ extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rol
     uint8_t* __restrict__ r_obs, int32_t* __restrict__ r_act,
     float* __restrict__ r_logprob, float* __restrict__ r_value,
     float* __restrict__ r_reward, int8_t* __restrict__ r_done,
+    float* __restrict__ r_state,  // optional [T][HIDDEN][n]: recurrent state input per step (for BPTT)
     int num_envs, int T, uint64_t seed, uint64_t step0
 ) {
     __shared__ NNShared snn;
@@ -1768,6 +1769,11 @@ extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rol
         if (was_done) {
             #pragma unroll
             for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
+        }
+        if (r_state) {
+            #pragma unroll
+            for (int i = 0; i < HIDDEN; i++)
+                r_state[((size_t)t * HIDDEN + i) * num_envs + e] = state[i];
         }
         float h_enc[HIDDEN], logits[NUM_ACTIONS], value, logprob;
         fused_encoder(g, e, VIEW_ARGS, w, snn, h_enc);
@@ -1884,3 +1890,490 @@ extern "C" __global__ void ref_forward_kernel(
     for (int i = 0; i < HIDDEN; i++) h_state[(size_t)i * num_envs + e] = state[i];
 }
 
+
+// ============================================================
+// Training: PPO backward + Adam, entirely on device.
+//
+// Parameters live in ONE flat arena so gradients, Adam moments,
+// and finite-difference perturbation all index the same layout.
+// The order must match how main.cu carves Weights from the arena.
+// ============================================================
+#define PARAM_W_ENC 0
+#define PARAM_B_ENC (OBS_DIM * HIDDEN)
+#define PARAM_W_GRU (PARAM_B_ENC + HIDDEN)
+#define PARAM_W_A   (PARAM_W_GRU + GRU_OUT * HIDDEN)
+#define PARAM_B_A   (PARAM_W_A + NUM_ACTIONS * HIDDEN)
+#define PARAM_W_V   (PARAM_B_A + NUM_ACTIONS)
+#define PARAM_B_V   (PARAM_W_V + HIDDEN)
+#define PARAM_COUNT (PARAM_B_V + 1)
+
+// Encoder forward from a stored compact obs (the env has moved on by
+// training time). Feature order and fmaf order match fused_encoder /
+// expand_obs_kernel exactly, so h_enc is bit-identical to the value
+// the rollout computed.
+__device__ void encoder_from_compact(
+    const uint8_t* __restrict__ obs, const Weights& w, const NNShared& s,
+    float* h  // h[HIDDEN]
+) {
+    #pragma unroll
+    for (int i = 0; i < HIDDEN; i++) h[i] = s.b_enc[i];
+
+    for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
+        int f = cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obs[cell];
+        const float* col = w.W_enc + (size_t)f * HIDDEN;
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, col[i], h[i]);
+        uint8_t m = obs[OBS_MAP_CELLS + cell];
+        int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+        for (int k = 0; k < 4; k++) {
+            if (m & (1 << k)) {
+                const float* mc = w.W_enc + (size_t)(fm + k) * HIDDEN;
+                #pragma unroll
+                for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, mc[i], h[i]);
+            }
+        }
+    }
+
+    int idx = 2 * OBS_MAP_CELLS;
+    int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
+    for (int j = 0; j < NUM_INVENTORY + 4; j++, f++) {
+        float x = (float)(int8_t)obs[idx++] / 10.0f;
+        const float* col = w.W_enc + (size_t)f * HIDDEN;
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
+    }
+    int8_t dir = (int8_t)obs[idx++];
+    for (int d = 1; d <= 4; d++, f++) {
+        float x = (dir == d) ? 1.0f : 0.0f;
+        const float* col = w.W_enc + (size_t)f * HIDDEN;
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
+    }
+    uint8_t sleeping = obs[idx++];
+    float light;
+    memcpy(&light, obs + idx, sizeof(float));
+    {
+        const float* col = w.W_enc + (size_t)f * HIDDEN; f++;
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(light, col[i], h[i]);
+    }
+    {
+        const float* col = w.W_enc + (size_t)f * HIDDEN;
+        float x = sleeping ? 1.0f : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
+    }
+}
+
+// Value of the current (post-rollout) env state: V(s_T) for the GAE
+// bootstrap. Envs that finished on the last step get masked by
+// (1 - done) in the GAE scan, so their (reset-state) value is unused.
+extern "C" __global__ void bootstrap_value_kernel(
+    EnvSoA g, Weights w, const float* __restrict__ h_state,
+    const int8_t* __restrict__ last_dones, float* __restrict__ v_boot,
+    int num_envs
+) {
+    __shared__ NNShared snn;
+    load_nn_shared(snn, w);
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+
+    VIEW_DECL_GATHER(g, e);
+    float h_enc[HIDDEN], state[HIDDEN];
+    fused_encoder(g, e, VIEW_ARGS, w, snn, h_enc);
+    if (last_dones[e]) {
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++) state[i] = h_state[(size_t)i * num_envs + e];
+    }
+    float logits[NUM_ACTIONS], value;
+    nn_head(h_enc, state, snn, logits, value);
+    v_boot[e] = value;
+}
+
+// GAE scan, one thread per env, t = T-1 .. 0.
+extern "C" __global__ void gae_kernel(
+    const float* __restrict__ values, const float* __restrict__ rewards,
+    const int8_t* __restrict__ dones, const float* __restrict__ v_boot,
+    float* __restrict__ adv, float* __restrict__ ret,
+    int num_envs, int T, float gamma, float lam
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+    float A = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        size_t o = (size_t)t * num_envs + e;
+        float vnext = (t == T - 1) ? v_boot[e] : values[o + num_envs];
+        float nonterm = dones[o] ? 0.0f : 1.0f;
+        float delta = rewards[o] + gamma * vnext * nonterm - values[o];
+        A = delta + gamma * lam * nonterm * A;
+        adv[o] = A;
+        ret[o] = A + values[o];
+    }
+}
+
+// Sum and sum-of-squares of adv (for batch advantage normalization).
+extern "C" __global__ void adv_stats_kernel(
+    const float* __restrict__ adv, size_t count, double* __restrict__ stats  // [2]: sum, sumsq
+) {
+    __shared__ double s_sum[256], s_sq[256];
+    double sum = 0.0, sq = 0.0;
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += (size_t)gridDim.x * blockDim.x) {
+        double a = adv[i];
+        sum += a; sq += a * a;
+    }
+    s_sum[threadIdx.x] = sum; s_sq[threadIdx.x] = sq;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + w];
+            s_sq[threadIdx.x] += s_sq[threadIdx.x + w];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&stats[0], s_sum[0]);
+        atomicAdd(&stats[1], s_sq[0]);
+    }
+}
+
+__device__ __forceinline__ float dg_mingru(float x) {  // d/dx of mingru_g
+    if (x >= 0.0f) return 1.0f;
+    float s = sigmoidf_(x);
+    return s * (1.0f - s);
+}
+
+// PPO loss on stored rollout data (actions/old-logprobs/adv/ret fixed),
+// recomputing the recurrent forward from the stored initial state so
+// the loss is a pure function of the parameters. Double accumulators:
+// this is the reference for finite-difference gradient checking.
+// losses[0] += policy loss, [1] += 0.5*(v-ret)^2, [2] += entropy
+// (all sums; host divides by n*T and applies coefficients).
+extern "C" __global__ void ppo_loss_kernel(
+    Weights w,
+    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob, const int8_t* __restrict__ r_done,
+    const float* __restrict__ r_state0,  // [HIDDEN][n] state input at t=0
+    const float* __restrict__ adv, const float* __restrict__ ret,
+    double* __restrict__ losses,
+    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the batch
+    int num_envs, int T, float clip_eps
+) {
+    __shared__ NNShared snn;
+    load_nn_shared(snn, w);
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+
+    double inv_count = 1.0 / ((double)num_envs * T);
+    float adv_mean = (float)(adv_stats[0] * inv_count);
+    double var = adv_stats[1] * inv_count - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
+    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+
+    float state[HIDDEN];
+    #pragma unroll
+    for (int i = 0; i < HIDDEN; i++) state[i] = r_state0[(size_t)i * num_envs + e];
+
+    double pg_sum = 0.0, v_sum = 0.0, ent_sum = 0.0;
+    for (int t = 0; t < T; t++) {
+        size_t o = (size_t)t * num_envs + e;
+        if (t > 0 && r_done[o - num_envs]) {
+            #pragma unroll
+            for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
+        }
+        float h_enc[HIDDEN], logits[NUM_ACTIONS], value;
+        encoder_from_compact(r_obs + o * OBS_DIM_COMPACT, w, snn, h_enc);
+        nn_head(h_enc, state, snn, logits, value);
+
+        float mx = logits[0];
+        for (int a = 1; a < NUM_ACTIONS; a++) mx = fmaxf(mx, logits[a]);
+        float total = 0.0f;
+        for (int a = 0; a < NUM_ACTIONS; a++) total += expf(logits[a] - mx);
+        float lse = mx + logf(total);
+
+        float logp_new = logits[r_act[o]] - lse;
+        float ratio = expf(logp_new - r_logprob[o]);
+        float A = (adv[o] - adv_mean) * adv_inv_std;
+        float u1 = ratio * A;
+        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+        pg_sum += -fminf(u1, u2);
+
+        float dv = value - ret[o];
+        v_sum += 0.5 * (double)dv * (double)dv;
+
+        float H = 0.0f;
+        for (int a = 0; a < NUM_ACTIONS; a++) {
+            float lp = logits[a] - lse;
+            H -= expf(lp) * lp;
+        }
+        ent_sum += H;
+    }
+    atomicAdd(&losses[0], pg_sum);
+    atomicAdd(&losses[1], v_sum);
+    atomicAdd(&losses[2], ent_sum);
+}
+
+// PPO backward: one thread per env walks its trajectory t = T-1 .. 0,
+// recomputing the forward at each step from the stored compact obs and
+// stored per-step recurrent state (bit-identical to the rollout), then
+// backpropagating through heads, MinGRU (BPTT across the horizon, cut
+// at done boundaries), and the encoder. Encoder backward is a
+// scatter-add into the ~70 active feature columns per sample; the
+// dense 1345-float obs never exists.
+//
+// Gradients accumulate via atomicAdd into per-block copies
+// (grads + (blockIdx.x % grad_copies) * PARAM_COUNT); adam_kernel
+// reduces the copies. loss_acc[0..2] accumulates pg/v/ent sums (fp32,
+// logging only).
+extern "C" __global__ void ppo_backward_kernel(
+    Weights w,
+    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob, const int8_t* __restrict__ r_done,
+    const float* __restrict__ r_state,   // [T][HIDDEN][n]
+    const float* __restrict__ adv, const float* __restrict__ ret,
+    float* __restrict__ grads, int grad_copies,
+    float* __restrict__ loss_acc,        // [3] or nullptr
+    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the batch
+    int num_envs, int T,
+    float clip_eps, float vf_coef, float ent_coef
+) {
+    __shared__ NNShared snn;
+    load_nn_shared(snn, w);
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+
+    double inv_count = 1.0 / ((double)num_envs * T);
+    float inv_batch = (float)inv_count;
+    float adv_mean = (float)(adv_stats[0] * inv_count);
+    double var = adv_stats[1] * inv_count - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
+    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+
+    float* gr = grads + (size_t)(blockIdx.x % grad_copies) * PARAM_COUNT;
+
+    float dstate[HIDDEN];  // dL/d(state output of step t), carried backward
+    #pragma unroll
+    for (int i = 0; i < HIDDEN; i++) dstate[i] = 0.0f;
+
+    float pg_sum = 0.0f, v_sum = 0.0f, ent_sum = 0.0f;
+
+    for (int t = T - 1; t >= 0; t--) {
+        size_t o = (size_t)t * num_envs + e;
+        const uint8_t* obs = r_obs + o * OBS_DIM_COMPACT;
+
+        // ---- Recompute forward at step t ----
+        float h_enc[HIDDEN], s_in[HIDDEN];
+        encoder_from_compact(obs, w, snn, h_enc);
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++)
+            s_in[i] = r_state[((size_t)t * HIDDEN + i) * num_envs + e];
+
+        float zh[HIDDEN], zg[HIDDEN], zp[HIDDEN], out[HIDDEN], hout[HIDDEN];
+        #pragma unroll
+        for (int k = 0; k < HIDDEN; k++) {
+            float ah = 0.0f, ag = 0.0f, ap = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < HIDDEN; j++) {
+                ah = fmaf(snn.W_gru[k * HIDDEN + j], h_enc[j], ah);
+                ag = fmaf(snn.W_gru[(HIDDEN + k) * HIDDEN + j], h_enc[j], ag);
+                ap = fmaf(snn.W_gru[(2 * HIDDEN + k) * HIDDEN + j], h_enc[j], ap);
+            }
+            zh[k] = ah; zg[k] = ag; zp[k] = ap;
+            float sg = sigmoidf_(ag);
+            float o_k = s_in[k] + sg * (mingru_g(ah) - s_in[k]);
+            float p = sigmoidf_(ap);
+            out[k] = o_k;
+            hout[k] = p * o_k + (1.0f - p) * h_enc[k];
+        }
+
+        float logits[NUM_ACTIONS], value;
+        for (int a = 0; a < NUM_ACTIONS; a++) {
+            float z = snn.b_a[a];
+            #pragma unroll
+            for (int j = 0; j < HIDDEN; j++) z = fmaf(snn.W_a[a * HIDDEN + j], hout[j], z);
+            logits[a] = z;
+        }
+        {
+            float z = snn.b_v;
+            #pragma unroll
+            for (int j = 0; j < HIDDEN; j++) z = fmaf(snn.W_v[j], hout[j], z);
+            value = z;
+        }
+
+        // ---- Loss gradients at the heads ----
+        float mx = logits[0];
+        for (int a = 1; a < NUM_ACTIONS; a++) mx = fmaxf(mx, logits[a]);
+        float total = 0.0f, pi[NUM_ACTIONS];
+        for (int a = 0; a < NUM_ACTIONS; a++) { pi[a] = expf(logits[a] - mx); total += pi[a]; }
+        float inv_total = 1.0f / total;
+        for (int a = 0; a < NUM_ACTIONS; a++) pi[a] *= inv_total;
+        float lse = mx + logf(total);
+
+        int act = r_act[o];
+        float logp_new = logits[act] - lse;
+        float ratio = expf(logp_new - r_logprob[o]);
+        float A = (adv[o] - adv_mean) * adv_inv_std;
+        float u1 = ratio * A;
+        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+        // d(-min(u1,u2))/dlogp_new: if min picks u1, -A*ratio; else the
+        // clamp is active (u2 < u1 requires ratio outside the clip
+        // window) and the gradient is blocked.
+        float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
+
+        float H = 0.0f;
+        for (int a = 0; a < NUM_ACTIONS; a++) {
+            float lp = logits[a] - lse;
+            H -= pi[a] * lp;
+        }
+
+        float dvalue = inv_batch * vf_coef * (value - ret[o]);
+        float dlogits[NUM_ACTIONS];
+        for (int a = 0; a < NUM_ACTIONS; a++) {
+            float d = dlogp * (((a == act) ? 1.0f : 0.0f) - pi[a]);  // policy term
+            d += ent_coef * pi[a] * ((logits[a] - lse) + H);         // d(-ent_coef*H)
+            dlogits[a] = d * inv_batch;
+        }
+
+        pg_sum += -fminf(u1, u2);
+        v_sum += 0.5f * (value - ret[o]) * (value - ret[o]);
+        ent_sum += H;
+
+        // ---- Heads backward ----
+        float dhout[HIDDEN];
+        #pragma unroll
+        for (int j = 0; j < HIDDEN; j++) dhout[j] = dvalue * snn.W_v[j];
+        for (int a = 0; a < NUM_ACTIONS; a++) {
+            float da = dlogits[a];
+            #pragma unroll
+            for (int j = 0; j < HIDDEN; j++) {
+                dhout[j] = fmaf(da, snn.W_a[a * HIDDEN + j], dhout[j]);
+                atomicAdd(&gr[PARAM_W_A + a * HIDDEN + j], da * hout[j]);
+            }
+            atomicAdd(&gr[PARAM_B_A + a], da);
+        }
+        #pragma unroll
+        for (int j = 0; j < HIDDEN; j++)
+            atomicAdd(&gr[PARAM_W_V + j], dvalue * hout[j]);
+        atomicAdd(&gr[PARAM_B_V], dvalue);
+
+        // ---- MinGRU backward ----
+        bool done_t = r_done[o] != 0;  // done at t: step t+1's state input was zeroed
+        float dh_enc[HIDDEN];
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++) dh_enc[i] = 0.0f;
+
+        float ds_prev[HIDDEN];
+        #pragma unroll
+        for (int k = 0; k < HIDDEN; k++) {
+            float p = sigmoidf_(zp[k]);
+            float sg = sigmoidf_(zg[k]);
+            float gh = mingru_g(zh[k]);
+
+            float dout = dhout[k] * p + (done_t ? 0.0f : dstate[k]);
+            float dp = dhout[k] * (out[k] - h_enc[k]);
+            float dzp_k = dp * p * (1.0f - p);
+            dh_enc[k] += dhout[k] * (1.0f - p);
+
+            ds_prev[k] = dout * (1.0f - sg);
+            float dsg = dout * (gh - s_in[k]);
+            float dzg_k = dsg * sg * (1.0f - sg);
+            float dzh_k = dout * sg * dg_mingru(zh[k]);
+
+            #pragma unroll
+            for (int j = 0; j < HIDDEN; j++) {
+                dh_enc[j] = fmaf(dzh_k, snn.W_gru[k * HIDDEN + j], dh_enc[j]);
+                dh_enc[j] = fmaf(dzg_k, snn.W_gru[(HIDDEN + k) * HIDDEN + j], dh_enc[j]);
+                dh_enc[j] = fmaf(dzp_k, snn.W_gru[(2 * HIDDEN + k) * HIDDEN + j], dh_enc[j]);
+                atomicAdd(&gr[PARAM_W_GRU + k * HIDDEN + j], dzh_k * h_enc[j]);
+                atomicAdd(&gr[PARAM_W_GRU + (HIDDEN + k) * HIDDEN + j], dzg_k * h_enc[j]);
+                atomicAdd(&gr[PARAM_W_GRU + (2 * HIDDEN + k) * HIDDEN + j], dzp_k * h_enc[j]);
+            }
+        }
+        #pragma unroll
+        for (int k = 0; k < HIDDEN; k++) dstate[k] = ds_prev[k];
+
+        // ---- Encoder backward: scatter dh_enc into active columns ----
+        #pragma unroll
+        for (int i = 0; i < HIDDEN; i++)
+            atomicAdd(&gr[PARAM_B_ENC + i], dh_enc[i]);
+
+        for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
+            int f = cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obs[cell];
+            #pragma unroll
+            for (int i = 0; i < HIDDEN; i++)
+                atomicAdd(&gr[PARAM_W_ENC + f * HIDDEN + i], dh_enc[i]);
+            uint8_t m = obs[OBS_MAP_CELLS + cell];
+            int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+            for (int k = 0; k < 4; k++) {
+                if (m & (1 << k)) {
+                    #pragma unroll
+                    for (int i = 0; i < HIDDEN; i++)
+                        atomicAdd(&gr[PARAM_W_ENC + (fm + k) * HIDDEN + i], dh_enc[i]);
+                }
+            }
+        }
+        {
+            int idx = 2 * OBS_MAP_CELLS;
+            int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
+            for (int j = 0; j < NUM_INVENTORY + 4; j++, f++) {
+                float x = (float)(int8_t)obs[idx++] / 10.0f;
+                if (x != 0.0f) {
+                    #pragma unroll
+                    for (int i = 0; i < HIDDEN; i++)
+                        atomicAdd(&gr[PARAM_W_ENC + f * HIDDEN + i], x * dh_enc[i]);
+                }
+            }
+            int8_t dir = (int8_t)obs[idx++];
+            if (dir >= 1 && dir <= 4) {
+                int fd = f + dir - 1;
+                #pragma unroll
+                for (int i = 0; i < HIDDEN; i++)
+                    atomicAdd(&gr[PARAM_W_ENC + fd * HIDDEN + i], dh_enc[i]);
+            }
+            f += 4;
+            uint8_t sleeping = obs[idx++];
+            float light;
+            memcpy(&light, obs + idx, sizeof(float));
+            if (light != 0.0f) {
+                #pragma unroll
+                for (int i = 0; i < HIDDEN; i++)
+                    atomicAdd(&gr[PARAM_W_ENC + f * HIDDEN + i], light * dh_enc[i]);
+            }
+            f++;
+            if (sleeping) {
+                #pragma unroll
+                for (int i = 0; i < HIDDEN; i++)
+                    atomicAdd(&gr[PARAM_W_ENC + f * HIDDEN + i], dh_enc[i]);
+            }
+        }
+    }
+
+    if (loss_acc) {
+        atomicAdd(&loss_acc[0], pg_sum);
+        atomicAdd(&loss_acc[1], v_sum);
+        atomicAdd(&loss_acc[2], ent_sum);
+    }
+}
+
+// Reduce per-block gradient copies, Adam-update the flat params, and
+// zero the copies for the next iteration. One thread per parameter.
+extern "C" __global__ void adam_kernel(
+    float* __restrict__ params, float* __restrict__ grads, int grad_copies,
+    float* __restrict__ m, float* __restrict__ v,
+    int step, float lr, float beta1, float beta2, float eps
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= PARAM_COUNT) return;
+    float gsum = 0.0f;
+    for (int c = 0; c < grad_copies; c++) {
+        gsum += grads[(size_t)c * PARAM_COUNT + i];
+        grads[(size_t)c * PARAM_COUNT + i] = 0.0f;
+    }
+    float mi = beta1 * m[i] + (1.0f - beta1) * gsum;
+    float vi = beta2 * v[i] + (1.0f - beta2) * gsum * gsum;
+    m[i] = mi; v[i] = vi;
+    float mhat = mi / (1.0f - powf(beta1, (float)step));
+    float vhat = vi / (1.0f - powf(beta2, (float)step));
+    params[i] -= lr * mhat / (sqrtf(vhat) + eps);
+}

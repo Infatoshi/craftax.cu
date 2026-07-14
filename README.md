@@ -40,6 +40,8 @@ CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 ./craftax runsweep                 # rollout sweep, fused vs per-step kernels
 ./craftax hash --envs 2048 --steps 500       # env validation suite
 ./craftax verify --envs 2048 --steps 300     # NN fusion + rollout validation suite
+./craftax train --envs 262144 --horizon 128 --iters 200   # on-device PPO training
+./craftax gradcheck                          # analytic grads vs finite differences
 ```
 
 ## Verification
@@ -78,6 +80,25 @@ CPU (`craftax.c`, single file): OpenMP or custom spin-barrier thread pool
 over envs, AVX-512 Perlin via `permutexvar`, pipelined world-gen pool
 (producer threads pre-generate reset maps on one CCD, consumers step envs on
 the V-Cache CCD). Progression at 32k envs: 5.6M naive -> 47.8M.
+
+## Training
+
+`./craftax train` runs PPO (1 epoch, full batch) entirely on device: fused
+rollout, bootstrap value, GAE, advantage normalization, backward, and Adam,
+with no tensor round-trips to the host inside an iteration. The 1345-float
+observation is never materialized for training either: the backward pass
+recomputes activations from the stored 148-byte compact obs plus a stored
+per-step recurrent state (for BPTT through the MinGRU, truncated at episode
+boundaries), and the encoder gradient is a sparse scatter-add into the ~70
+active one-hot columns per sample. Gradients accumulate into per-block
+copies in L2/HBM (block-level data parallelism, the single-GPU analogue of
+an all-reduce) that the Adam kernel reduces. `./craftax gradcheck` verifies
+every parameter segment against central finite differences of the actual
+PPO loss.
+
+Current training throughput is ~15M SPS at 262k envs on the RTX PRO 6000
+(vs 306.9M rollout-only): the backward's gradient scatter-add atomics
+dominate and are the next optimization target.
 
 ## Citation
 

@@ -9,10 +9,13 @@
 //   ./craftax hash   [envs] [steps]          env validation: worldgen exactness,
 //                                            trajectory hash, obs expansion,
 //                                            map diversity, block histogram
-//   ./craftax mega   [envs] [T] [iters]      fused env+policy rollout SPS
+//   ./craftax run    [envs] [T] [iters]      fused env+policy rollout SPS
 //   ./craftax split  [envs] [T] [iters]      same rollout via per-step kernels
-//   ./craftax megasweep [T]                  rollout sweep, mega vs split
+//   ./craftax runsweep [T]                   rollout sweep, fused vs per-step
 //   ./craftax verify [envs] [steps]          bitwise NN fusion + rollout checks
+//   ./craftax train  [envs] [T] [iters]      on-device PPO training (rollout +
+//                                            GAE + backward + Adam, no host sync)
+//   ./craftax gradcheck                      analytic grads vs finite differences
 //
 // obs_mode: 0 = float one-hot obs (1345), 1 = compact uint8 obs (148)
 // reset_mode: 0 = fused serial autoreset, 1 = split warp-cooperative reset
@@ -23,6 +26,7 @@
 #include <set>
 #include <vector>
 #include <chrono>
+#include <algorithm>
 
 #include "craftax.cu"
 
@@ -250,18 +254,16 @@ static int run_hash(int num_envs, int steps) {
     return fail;
 }
 
-static float* alloc_weights(int count, float bound, uint64_t seed, int subseq) {
-    float* w;
-    CUDA_CHECK(cudaMalloc(&w, (size_t)count * sizeof(float)));
-    init_weights_kernel<<<(count + 255) / 256, 256>>>(w, count, bound, seed, subseq);
+static void init_weight_seg(float* p, int count, float bound, uint64_t seed, int subseq) {
+    init_weights_kernel<<<(count + 255) / 256, 256>>>(p, count, bound, seed, subseq);
     CUDA_CHECK(cudaGetLastError());
-    return w;
 }
 
 struct Rollout {
     EnvSoA g;
     uint8_t* arena;
     Weights w;
+    float* params;   // flat [PARAM_COUNT] arena the Weights pointers carve
     float* h_state;
     uint8_t* r_obs;
     int32_t* r_act;
@@ -269,6 +271,7 @@ struct Rollout {
     float* r_value;
     float* r_reward;
     int8_t* r_done;
+    float* r_state = nullptr;  // optional [T][HIDDEN][n] for training
     int32_t* reset_list;
     int32_t* reset_ctrl;
     int n, T;
@@ -284,15 +287,26 @@ struct Rollout {
         CUDA_CHECK(cudaMemset(arena, 0, soa_bytes(n)));
         g = carve_soa(arena, n);
 
+        // One flat parameter arena (training indexes it by PARAM_*
+        // offsets); per-segment init matches the old separate
+        // allocations bit-for-bit (same seed/subsequence/bounds).
+        CUDA_CHECK(cudaMalloc(&params, PARAM_COUNT * sizeof(float)));
         float be = 1.0f / sqrtf((float)OBS_DIM);
         float bh = 1.0f / sqrtf((float)HIDDEN);
-        w.W_enc = alloc_weights(OBS_DIM * HIDDEN, be, 1234, 0);
-        w.b_enc = alloc_weights(HIDDEN, be, 1234, 1);
-        w.W_gru = alloc_weights(GRU_OUT * HIDDEN, bh, 1234, 2);
-        w.W_a   = alloc_weights(NUM_ACTIONS * HIDDEN, bh, 1234, 3);
-        w.b_a   = alloc_weights(NUM_ACTIONS, bh, 1234, 4);
-        w.W_v   = alloc_weights(HIDDEN, bh, 1234, 5);
-        w.b_v   = alloc_weights(1, bh, 1234, 6);
+        init_weight_seg(params + PARAM_W_ENC, OBS_DIM * HIDDEN, be, 1234, 0);
+        init_weight_seg(params + PARAM_B_ENC, HIDDEN, be, 1234, 1);
+        init_weight_seg(params + PARAM_W_GRU, GRU_OUT * HIDDEN, bh, 1234, 2);
+        init_weight_seg(params + PARAM_W_A, NUM_ACTIONS * HIDDEN, bh, 1234, 3);
+        init_weight_seg(params + PARAM_B_A, NUM_ACTIONS, bh, 1234, 4);
+        init_weight_seg(params + PARAM_W_V, HIDDEN, bh, 1234, 5);
+        init_weight_seg(params + PARAM_B_V, 1, bh, 1234, 6);
+        w.W_enc = params + PARAM_W_ENC;
+        w.b_enc = params + PARAM_B_ENC;
+        w.W_gru = params + PARAM_W_GRU;
+        w.W_a   = params + PARAM_W_A;
+        w.b_a   = params + PARAM_B_A;
+        w.W_v   = params + PARAM_W_V;
+        w.b_v   = params + PARAM_B_V;
 
         CUDA_CHECK(cudaMalloc(&h_state, (size_t)HIDDEN * n * sizeof(float)));
         CUDA_CHECK(cudaMemset(h_state, 0, (size_t)HIDDEN * n * sizeof(float)));
@@ -309,13 +323,15 @@ struct Rollout {
         CUDA_CHECK(cudaMalloc(&reset_ctrl, 2 * sizeof(int32_t)));
     }
     ~Rollout() {
-        cudaFree(arena); cudaFree(h_state);
-        cudaFree((void*)w.W_enc); cudaFree((void*)w.b_enc); cudaFree((void*)w.W_gru);
-        cudaFree((void*)w.W_a); cudaFree((void*)w.b_a); cudaFree((void*)w.W_v);
-        cudaFree((void*)w.b_v);
+        cudaFree(arena); cudaFree(h_state); cudaFree(params);
         cudaFree(r_obs); cudaFree(r_act); cudaFree(r_logprob); cudaFree(r_value);
         cudaFree(r_reward); cudaFree(r_done);
+        if (r_state) cudaFree(r_state);
         cudaFree(reset_list); cudaFree(reset_ctrl);
+    }
+
+    void alloc_states() {
+        CUDA_CHECK(cudaMalloc(&r_state, (size_t)T * HIDDEN * n * sizeof(float)));
     }
 
     void reset() {
@@ -330,7 +346,7 @@ struct Rollout {
         int grid = (n + MEGA_BLOCK - 1) / MEGA_BLOCK;
         rollout_kernel<<<grid, MEGA_BLOCK>>>(
             g, w, h_state, r_obs, r_act, r_logprob, r_value, r_reward, r_done,
-            n, T, seed, step_count);
+            r_state, n, T, seed, step_count);
         CUDA_CHECK(cudaGetLastError());
         step_count += T;
     }
@@ -498,6 +514,215 @@ static int run_verify(int num_envs, int steps) {
 }
 
 
+// ============================================================
+// PPO training: rollout -> bootstrap -> GAE -> backward -> Adam,
+// everything resident on device; the loop syncs only to log.
+// ============================================================
+struct PPOConfig {
+    float lr = 3e-4f, gamma = 0.99f, lam = 0.95f;
+    float clip = 0.2f, ent = 0.01f, vf = 0.5f;
+};
+
+struct Trainer {
+    Rollout& r;
+    PPOConfig cfg;
+    float* grads;
+    int grad_copies;
+    float* adam_m;
+    float* adam_v;
+    float* v_boot;
+    float* adv;
+    float* ret;
+    float* loss_acc;   // [3] pg, v, ent sums (fp32, logging)
+    double* stats;     // [2] adv sum, sumsq
+    int adam_step = 0;
+
+    Trainer(Rollout& r_, PPOConfig cfg_) : r(r_), cfg(cfg_) {
+        r.alloc_states();
+        int grid = (r.n + 255) / 256;
+        grad_copies = grid < 512 ? grid : 512;
+        CUDA_CHECK(cudaMalloc(&grads, (size_t)grad_copies * PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMemset(grads, 0, (size_t)grad_copies * PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&adam_m, PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&adam_v, PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMemset(adam_m, 0, PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMemset(adam_v, 0, PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&v_boot, r.n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&adv, (size_t)r.n * r.T * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&ret, (size_t)r.n * r.T * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&loss_acc, 3 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&stats, 2 * sizeof(double)));
+    }
+    ~Trainer() {
+        cudaFree(grads); cudaFree(adam_m); cudaFree(adam_v);
+        cudaFree(v_boot); cudaFree(adv); cudaFree(ret);
+        cudaFree(loss_acc); cudaFree(stats);
+    }
+
+    // Rollout + advantage pipeline (no param update).
+    void collect() {
+        r.run_mega();
+        int block = 256, grid = (r.n + block - 1) / block;
+        bootstrap_value_kernel<<<grid, block>>>(
+            r.g, r.w, r.h_state, r.r_done + (size_t)(r.T - 1) * r.n, v_boot, r.n);
+        gae_kernel<<<grid, block>>>(
+            r.r_value, r.r_reward, r.r_done, v_boot, adv, ret,
+            r.n, r.T, cfg.gamma, cfg.lam);
+        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(double)));
+        adv_stats_kernel<<<256, 256>>>(adv, (size_t)r.n * r.T, stats);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    void backward() {
+        int block = 256, grid = (r.n + block - 1) / block;
+        CUDA_CHECK(cudaMemsetAsync(loss_acc, 0, 3 * sizeof(float)));
+        ppo_backward_kernel<<<grid, block>>>(
+            r.w, r.r_obs, r.r_act, r.r_logprob, r.r_done, r.r_state,
+            adv, ret, grads, grad_copies, loss_acc, stats,
+            r.n, r.T, cfg.clip, cfg.vf, cfg.ent);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    void adam() {
+        adam_step++;
+        adam_kernel<<<(PARAM_COUNT + 255) / 256, 256>>>(
+            r.params, grads, grad_copies, adam_m, adam_v,
+            adam_step, cfg.lr, 0.9f, 0.999f, 1e-8f);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    void update() { collect(); backward(); adam(); }
+
+    // Total PPO loss over the stored rollout at the current params
+    // (recomputes the recurrent forward; used by gradcheck FD).
+    double loss() {
+        double zero[3] = {0, 0, 0};
+        double* d_losses;
+        CUDA_CHECK(cudaMalloc(&d_losses, 3 * sizeof(double)));
+        CUDA_CHECK(cudaMemcpy(d_losses, zero, 24, cudaMemcpyHostToDevice));
+        int block = 256, grid = (r.n + block - 1) / block;
+        ppo_loss_kernel<<<grid, block>>>(
+            r.w, r.r_obs, r.r_act, r.r_logprob, r.r_done, r.r_state,
+            adv, ret, d_losses, stats, r.n, r.T, cfg.clip);
+        CUDA_CHECK(cudaGetLastError());
+        double h[3];
+        CUDA_CHECK(cudaMemcpy(h, d_losses, 24, cudaMemcpyDeviceToHost));
+        cudaFree(d_losses);
+        double count = (double)r.n * r.T;
+        return (h[0] + cfg.vf * h[1] - cfg.ent * h[2]) / count;
+    }
+};
+
+static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
+    Rollout r(num_envs, T, 42);
+    Trainer tr(r, cfg);
+    r.reset();
+    printf("train: envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g\n",
+           num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf);
+
+    double* rew_stats;
+    CUDA_CHECK(cudaMalloc(&rew_stats, 2 * sizeof(double)));
+    double t0 = now_s();
+    size_t steps_done = 0;
+    for (int it = 1; it <= iters; it++) {
+        tr.update();
+        steps_done += (size_t)num_envs * T;
+        if (it == 1 || it % 10 == 0 || it == iters) {
+            CUDA_CHECK(cudaMemsetAsync(rew_stats, 0, 16));
+            adv_stats_kernel<<<256, 256>>>(r.r_reward, (size_t)num_envs * T, rew_stats);
+            float h_loss[3];
+            double h_rew[2];
+            CUDA_CHECK(cudaMemcpy(h_loss, tr.loss_acc, 12, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_rew, rew_stats, 16, cudaMemcpyDeviceToHost));
+            double count = (double)num_envs * T;
+            double sps = steps_done / (now_s() - t0);
+            printf("iter %5d  %7.1f M SPS  pg %+.4f  vf %8.4f  ent %6.3f  rew/step %+.5f\n",
+                   it, sps / 1e6, h_loss[0] / count, h_loss[1] / count,
+                   h_loss[2] / count, h_rew[0] / count);
+        }
+    }
+    cudaFree(rew_stats);
+}
+
+// Analytic gradients vs central finite differences of the PPO loss on
+// a small fixed rollout. The loss treats actions, old logprobs, and
+// advantages as constants, so it is a pure function of the parameters
+// and FD is exact up to fp32 forward noise.
+static int run_gradcheck() {
+    const int n = 64, T = 8;
+    Rollout r(n, T, 42);
+    PPOConfig cfg;
+    Trainer tr(r, cfg);
+    r.reset();
+    tr.collect();
+    tr.backward();
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> g_all((size_t)tr.grad_copies * PARAM_COUNT);
+    CUDA_CHECK(cudaMemcpy(g_all.data(), tr.grads, g_all.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<double> g(PARAM_COUNT, 0.0);
+    for (int c = 0; c < tr.grad_copies; c++)
+        for (int i = 0; i < PARAM_COUNT; i++) g[i] += g_all[(size_t)c * PARAM_COUNT + i];
+
+    struct Seg { const char* name; int off, count; };
+    Seg segs[] = {
+        {"W_enc", PARAM_W_ENC, OBS_DIM * HIDDEN},
+        {"b_enc", PARAM_B_ENC, HIDDEN},
+        {"W_gru", PARAM_W_GRU, GRU_OUT * HIDDEN},
+        {"W_a",   PARAM_W_A,   NUM_ACTIONS * HIDDEN},
+        {"b_a",   PARAM_B_A,   NUM_ACTIONS},
+        {"W_v",   PARAM_W_V,   HIDDEN},
+        {"b_v",   PARAM_B_V,   1},
+    };
+    uint64_t rng = 0x12345678ULL;
+    int fail = 0;
+    for (const Seg& s : segs) {
+        double gnorm = 0.0;
+        for (int i = 0; i < s.count; i++) gnorm += fabs(g[s.off + i]);
+        double max_rel = 0.0, max_diff = 0.0;
+        // Check the 8 largest-|g| params (FD can resolve their relative
+        // error) plus 16 random ones (absolute agreement).
+        std::vector<int> idx(s.count);
+        for (int i = 0; i < s.count; i++) idx[i] = s.off + i;
+        std::partial_sort(idx.begin(), idx.begin() + (s.count < 8 ? s.count : 8), idx.end(),
+                          [&](int a, int b) { return fabs(g[a]) > fabs(g[b]); });
+        int checks = s.count < 24 ? s.count : 24;
+        for (int c = 0; c < checks; c++) {
+            int i;
+            if (c < 8 && c < s.count) i = idx[c];
+            else {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                i = s.off + (int)((rng >> 33) % s.count);
+            }
+            float theta;
+            CUDA_CHECK(cudaMemcpy(&theta, r.params + i, 4, cudaMemcpyDeviceToHost));
+            float h = 1e-3f * fmaxf(fabsf(theta), 0.1f);
+            float tp = theta + h, tm = theta - h;
+            CUDA_CHECK(cudaMemcpy(r.params + i, &tp, 4, cudaMemcpyHostToDevice));
+            double lp = tr.loss();
+            CUDA_CHECK(cudaMemcpy(r.params + i, &tm, 4, cudaMemcpyHostToDevice));
+            double lm = tr.loss();
+            CUDA_CHECK(cudaMemcpy(r.params + i, &theta, 4, cudaMemcpyHostToDevice));
+            double fd = (lp - lm) / (2.0 * (double)(tp - tm) * 0.5);
+            double diff = fabs(fd - g[i]);
+            double scale = fabs(fd) > fabs(g[i]) ? fabs(fd) : fabs(g[i]);
+            double rel = diff / (scale > 1e-8 ? scale : 1e-8);
+            if (diff > max_diff) max_diff = diff;
+            if (diff > 2e-4 && rel > max_rel) max_rel = rel;
+            if (diff > 2e-4 && rel > 3e-2) {
+                printf("  MISMATCH %s[%d]: analytic %.6e  fd %.6e\n",
+                       s.name, i - s.off, g[i], fd);
+                fail = 1;
+            }
+        }
+        printf("%-6s mean|g| %.3e  max |fd-g| %.3e  max rel err %.4f  (%d sampled)\n",
+               s.name, gnorm / s.count, max_diff, max_rel, checks);
+        if (gnorm == 0.0) { printf("  FAIL: all-zero gradient segment\n"); fail = 1; }
+    }
+    printf("gradcheck: envs=%d steps=%d  =>  %s\n", n, T, fail ? "FAIL" : "PASS");
+    return fail;
+}
+
 extern "C" int craftax_cpu_main(int num_envs, int iters);
 
 static void usage(const char* prog) {
@@ -511,9 +736,12 @@ static void usage(const char* prog) {
         "  split      same rollout via per-step kernels\n"
         "  runsweep   rollout sweep, run vs split    (--horizon)\n"
         "  verify     NN fusion + rollout validation (--envs --steps)\n"
+        "  train      on-device PPO training  (--envs --horizon --iters + PPO flags)\n"
+        "  gradcheck  analytic vs finite-difference gradients\n"
         "flags:\n"
         "  --backend cuda|cpu   (default cuda; cpu supports bench only)\n"
-        "  --envs N  --iters N  --steps N  --horizon N  --obs-mode 0|1  --reset-mode 0|1\n",
+        "  --envs N  --iters N  --steps N  --horizon N  --obs-mode 0|1  --reset-mode 0|1\n"
+        "  --lr F  --gamma F  --gae-lambda F  --clip F  --ent F  --vf F\n",
         prog);
 }
 
@@ -522,6 +750,7 @@ int main(int argc, char** argv) {
     const char* backend = "cuda";
     int envs = -1, iters = -1, steps = -1, horizon = 128;
     int obs_mode = 0, reset_mode = 1;
+    PPOConfig cfg;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
@@ -531,6 +760,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--horizon") && i + 1 < argc) horizon = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--obs-mode") && i + 1 < argc) obs_mode = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reset-mode") && i + 1 < argc) reset_mode = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--lr") && i + 1 < argc) cfg.lr = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gamma") && i + 1 < argc) cfg.gamma = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gae-lambda") && i + 1 < argc) cfg.lam = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--clip") && i + 1 < argc) cfg.clip = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--ent") && i + 1 < argc) cfg.ent = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--vf") && i + 1 < argc) cfg.vf = atof(argv[++i]);
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else if (argv[i][0] != '-') mode = argv[i];
         else { usage(argv[0]); return 1; }
@@ -549,6 +784,12 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("device: %s\n", prop.name);
 
+    if (strcmp(mode, "train") == 0) {
+        run_train(envs < 0 ? 262144 : envs, horizon, iters < 0 ? 200 : iters, cfg);
+        return 0;
+    }
+    if (strcmp(mode, "gradcheck") == 0)
+        return run_gradcheck();
     if (strcmp(mode, "hash") == 0)
         return run_hash(envs < 0 ? 2048 : envs, steps < 0 ? 500 : steps);
     if (strcmp(mode, "verify") == 0)
