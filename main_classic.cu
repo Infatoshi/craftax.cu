@@ -272,6 +272,7 @@ struct Rollout {
     float* r_reward;
     int8_t* r_done;
     float* r_state = nullptr;  // optional [T][HIDDEN][n] for training
+    unsigned long long* ep_stats = nullptr;  // optional [1+22] episode stats
     int32_t* reset_list;
     int32_t* reset_ctrl;
     int n, T;
@@ -346,7 +347,7 @@ struct Rollout {
         int grid = (n + MEGA_BLOCK - 1) / MEGA_BLOCK;
         rollout_kernel<<<grid, MEGA_BLOCK>>>(
             g, w, h_state, r_obs, r_act, r_logprob, r_value, r_reward, r_done,
-            r_state, n, T, seed, step_count);
+            r_state, ep_stats, n, T, seed, step_count);
         CUDA_CHECK(cudaGetLastError());
         step_count += T;
     }
@@ -552,11 +553,14 @@ struct Trainer {
         CUDA_CHECK(cudaMalloc(&ret, (size_t)r.n * r.T * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&loss_acc, 3 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&stats, 2 * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&r.ep_stats, 23 * sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(r.ep_stats, 0, 23 * sizeof(unsigned long long)));
     }
     ~Trainer() {
         cudaFree(grads); cudaFree(adam_m); cudaFree(adam_v);
         cudaFree(v_boot); cudaFree(adv); cudaFree(ret);
         cudaFree(loss_acc); cudaFree(stats);
+        cudaFree(r.ep_stats); r.ep_stats = nullptr;
     }
 
     // Rollout + advantage pipeline (no param update).
@@ -620,26 +624,49 @@ static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
     printf("train: envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g\n",
            num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf);
 
+    static const char* ach_names[22] = {
+        "collect_wood", "place_table", "eat_cow", "collect_sapling",
+        "collect_drink", "make_wood_pick", "make_wood_sword", "place_plant",
+        "defeat_zombie", "collect_stone", "place_stone", "eat_plant",
+        "defeat_skeleton", "make_stone_pick", "make_stone_sword", "wake_up",
+        "place_furnace", "collect_coal", "collect_iron", "collect_diamond",
+        "make_iron_pick", "make_iron_sword"};
+
     double* rew_stats;
     CUDA_CHECK(cudaMalloc(&rew_stats, 2 * sizeof(double)));
     double t0 = now_s();
-    size_t steps_done = 0;
+    size_t steps_done = 0, steps_window = 0;
+    unsigned long long total_eps = 0, total_ach[22] = {0};
     for (int it = 1; it <= iters; it++) {
         tr.update();
         steps_done += (size_t)num_envs * T;
+        steps_window += (size_t)num_envs * T;
         if (it == 1 || it % 10 == 0 || it == iters) {
             CUDA_CHECK(cudaMemsetAsync(rew_stats, 0, 16));
             adv_stats_kernel<<<256, 256>>>(r.r_reward, (size_t)num_envs * T, rew_stats);
             float h_loss[3];
             double h_rew[2];
+            unsigned long long h_eps[23];
             CUDA_CHECK(cudaMemcpy(h_loss, tr.loss_acc, 12, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(h_rew, rew_stats, 16, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_eps, r.ep_stats, 23 * 8, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemsetAsync(r.ep_stats, 0, 23 * 8));
+            total_eps += h_eps[0];
+            for (int a = 0; a < 22; a++) total_ach[a] += h_eps[1 + a];
             double count = (double)num_envs * T;
             double sps = steps_done / (now_s() - t0);
-            printf("iter %5d  %7.1f M SPS  pg %+.4f  vf %8.4f  ent %6.3f  rew/step %+.5f\n",
+            double eplen = h_eps[0] ? (double)steps_window / h_eps[0] : 0.0;
+            double retep = (h_rew[0] / count) * eplen;  // rew/step * mean ep len
+            printf("iter %5d  %7.1f M SPS  pg %+.4f  vf %8.4f  ent %6.3f  rew/step %+.5f  ret/ep %+.3f  eplen %5.0f\n",
                    it, sps / 1e6, h_loss[0] / count, h_loss[1] / count,
-                   h_loss[2] / count, h_rew[0] / count);
+                   h_loss[2] / count, h_rew[0] / count, retep, eplen);
+            steps_window = 0;
         }
+    }
+    if (total_eps) {
+        printf("achievement rates over %llu episodes:\n", total_eps);
+        for (int a = 0; a < 22; a++)
+            printf("  %-18s %6.3f\n", ach_names[a], (double)total_ach[a] / total_eps);
     }
     cudaFree(rew_stats);
 }

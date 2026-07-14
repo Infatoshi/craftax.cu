@@ -1742,6 +1742,7 @@ extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rol
     float* __restrict__ r_logprob, float* __restrict__ r_value,
     float* __restrict__ r_reward, int8_t* __restrict__ r_done,
     float* __restrict__ r_state,  // optional [T][HIDDEN][n]: recurrent state input per step (for BPTT)
+    unsigned long long* __restrict__ ep_stats,  // optional [1+22]: episodes, ach counts
     int num_envs, int T, uint64_t seed, uint64_t step0
 ) {
     __shared__ NNShared snn;
@@ -1786,6 +1787,12 @@ extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rol
         bool done = step_env(g, e, action, r_reward + (size_t)t * num_envs);
         r_done[o] = done ? 1 : 0;
         was_done = done;
+
+        if (ep_stats && done) {  // episode stats, read before reset wipes ach
+            atomicAdd(&ep_stats[0], 1ULL);
+            uint32_t a = g.ach[e];
+            while (a) { int b = __ffs(a) - 1; a &= a - 1; atomicAdd(&ep_stats[1 + b], 1ULL); }
+        }
 
         // Warp-cooperative reset of done lanes; stalls stay in this warp.
         unsigned mask = __ballot_sync(0xFFFFFFFFu, done);
