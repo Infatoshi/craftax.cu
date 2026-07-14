@@ -1,6 +1,6 @@
 # craftax.cu
 
-CUDA reimplementation of [Craftax-Classic](https://github.com/MichaelTMatthews/Craftax) (Matthews et al. 2024) for high-throughput RL training.
+CUDA reimplementation of [Craftax-Classic](https://github.com/MichaelTMatthews/Craftax) (Matthews et al. 2024) for high-throughput RL training. A pure C / AVX-512 CPU port lives in this repo too (`craftax.c`).
 
 > **This is Craftax-Classic, not Craftax-Full.** 17 actions, 22 achievements, a single 64x64 map. No dungeon floors, potions, enchantments, or bosses. If you want the full game, see the native C port in [PufferLib's `ocean/craftax`](https://github.com/PufferAI/PufferLib/tree/4.0/ocean/craftax).
 
@@ -54,6 +54,33 @@ An earlier torch-based training comparison (RTX 3090, 4096 envs, matched PPO
 hyperparameters) was 7.4x faster than the JAX original end-to-end, converging
 to the same mean return (5.48 vs 4.76 at 10M steps).
 
+## CPU port (craftax.c)
+
+`craftax.c` is a single-file pure C / AVX-512 port of the same game logic,
+tuned on a Ryzen 9 9950X3D (16c/32t): OpenMP or a custom spin-barrier thread
+pool over envs, AVX-512 Perlin worldgen via `permutexvar`, and a pipelined
+world-generation pool where dedicated producer threads pre-generate reset
+maps while consumer threads step envs. Best measured: **47.8M SPS** at 32k
+envs. Requires AVX-512 (Zen 4/5, Ice Lake+).
+
+```bash
+gcc -O3 -march=native -mtune=native -ffast-math -fno-math-errno \
+    -funroll-loops -flto -fopenmp -o craftax_c craftax.c -lpthread -lm
+./craftax_c 32768 5000    # runs three configs: libgomp / thread pool /
+                          # thread pool + world pool
+```
+
+How the CPU number got there (NE=32k hot path):
+
+```
+ 5.6M  naive C port, OpenMP parallel over envs
+13.3M  mob bitmaps, precomputed sincos, obs compaction, aligned state
+25.4M  share Perlin floor/frac/interp setup across the 4 noise layers
+28.0M  pipelined world-gen pool (producers on one CCD, consumers on the other)
+35.0M  AVX-512 Perlin via permutexvar (no gathers)
+47.8M  combined thread pool + world pool + SIMD Perlin
+```
+
 ## Build and run
 
 Two source files, no dependencies beyond the CUDA toolkit:
@@ -72,7 +99,7 @@ nvcc -O3 -arch=native --expt-relaxed-constexpr --use_fast_math main.cu -o crafta
 
 ## Architecture
 
-Everything lives on GPU. No CPU-GPU copies in the hot path. Two files:
+Everything lives on GPU. No CPU-GPU copies in the hot path. Three source files:
 
 - **`craftax.cu`** -- all device code: SoA env state arena (per-field arrays
   over envs so warp lanes coalesce), 4-bit packed maps, game logic (crafting,
@@ -82,6 +109,8 @@ Everything lives on GPU. No CPU-GPU copies in the hot path. Two files:
   and every kernel including the rollout megakernel
 - **`main.cu`** -- the launcher: benchmarks, validation suite, rollout
   harness, all subcommands
+- **`craftax.c`** -- self-contained CPU port (see above), independent of the
+  CUDA build
 
 Key design choices:
 
