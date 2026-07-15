@@ -1503,9 +1503,25 @@ extern "C" __global__ void gen_actions_kernel(int32_t* actions, int n, int step,
 }
 
 
-#define HIDDEN 32
+// Compile-time hidden size. Default 32 (canonical hashes). Build a
+// hidden-128 binary with -DCRAFTAX_HIDDEN=128 (its verify/train hashes
+// live in a different universe; h32 anchors are unaffected).
+#ifndef CRAFTAX_HIDDEN
+#define CRAFTAX_HIDDEN 32
+#endif
+#define HIDDEN CRAFTAX_HIDDEN
 #define GRU_OUT (3 * HIDDEN)
 #define MEGA_BLOCK 128
+
+// W_gru is 3*HIDDEN*HIDDEN floats: 12KB at hidden 32 (staged in shared
+// memory) but 192KB at hidden 128 -- over sm_86's 100KB smem budget, so
+// large-hidden builds read it straight from global (uniform across the
+// block, so it broadcasts through L1).
+#if (3 * HIDDEN * HIDDEN * 4) <= 49152
+#define GRU_SMEM 1
+#else
+#define GRU_SMEM 0
+#endif
 
 // ============================================================
 // Policy weights (device pointers, passed to kernels by value)
@@ -1530,9 +1546,15 @@ extern "C" __global__ void init_weights_kernel(
     w[i] = (2.0f * curand_uniform(&st) - 1.0f) * bound;
 }
 
-// Small weights staged in shared memory once per block.
+// Small weights staged in shared memory once per block. W_gru degrades
+// to a global pointer when it does not fit (GRU_SMEM 0); s.W_gru[i]
+// spelling works either way.
 struct NNShared {
+#if GRU_SMEM
     float W_gru[GRU_OUT * HIDDEN];
+#else
+    const float* W_gru;
+#endif
     float W_a[NUM_ACTIONS * HIDDEN];
     float b_a[NUM_ACTIONS];
     float W_v[HIDDEN];
@@ -1541,7 +1563,11 @@ struct NNShared {
 };
 
 __device__ void load_nn_shared(NNShared& s, const Weights& w) {
+#if GRU_SMEM
     for (int i = threadIdx.x; i < GRU_OUT * HIDDEN; i += blockDim.x) s.W_gru[i] = w.W_gru[i];
+#else
+    if (threadIdx.x == 0) s.W_gru = w.W_gru;
+#endif
     for (int i = threadIdx.x; i < NUM_ACTIONS * HIDDEN; i += blockDim.x) s.W_a[i] = w.W_a[i];
     for (int i = threadIdx.x; i < NUM_ACTIONS; i += blockDim.x) s.b_a[i] = w.b_a[i];
     for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) s.W_v[i] = w.W_v[i];
@@ -1645,7 +1671,10 @@ __device__ void nn_head(
     const float* h_enc, float* state, const NNShared& s,
     float* logits, float& value
 ) {
-    float hidden[HIDDEN], gate[HIDDEN], proj[HIDDEN];
+    // Single loop over units (no hidden/gate/proj staging arrays: at
+    // hidden 128 they are pure register/local pressure). Per-unit math
+    // and summation order are unchanged, so results stay bit-identical.
+    float hout[HIDDEN];
     #pragma unroll
     for (int k = 0; k < HIDDEN; k++) {
         float zh = 0.0f, zg = 0.0f, zp = 0.0f;
@@ -1655,14 +1684,9 @@ __device__ void nn_head(
             zg = fmaf(s.W_gru[(HIDDEN + k) * HIDDEN + j], h_enc[j], zg);
             zp = fmaf(s.W_gru[(2*HIDDEN + k) * HIDDEN + j], h_enc[j], zp);
         }
-        hidden[k] = zh; gate[k] = zg; proj[k] = zp;
-    }
-    float hout[HIDDEN];
-    #pragma unroll
-    for (int k = 0; k < HIDDEN; k++) {
         // torch.lerp(start, end, weight) = start + weight*(end-start)
-        float out = state[k] + sigmoidf_(gate[k]) * (mingru_g(hidden[k]) - state[k]);
-        float p = sigmoidf_(proj[k]);
+        float out = state[k] + sigmoidf_(zg) * (mingru_g(zh) - state[k]);
+        float p = sigmoidf_(zp);
         hout[k] = p * out + (1.0f - p) * h_enc[k];
         state[k] = out;
     }
@@ -1734,7 +1758,14 @@ __device__ void write_compact_obs(
 // and reset-seed schedule stay aligned with the split path).
 // ============================================================
 #ifndef ROLLOUT_MIN_BLOCKS
+#if HIDDEN > 64
+// Large hidden: per-thread state/h_enc alone exceed the 128-reg budget
+// that 4 resident blocks would force; let ptxas use the full register
+// file instead of spilling everything.
+#define ROLLOUT_MIN_BLOCKS 1
+#else
 #define ROLLOUT_MIN_BLOCKS 4
+#endif
 #endif
 extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rollout_kernel(
     EnvSoA g, Weights w, float* __restrict__ h_state,
@@ -2143,6 +2174,17 @@ extern "C" __global__ void ppo_loss_kernel(
 // env range; the loss mean is over that range while advantage
 // normalization keeps full-batch stats. env_start=0,
 // env_count=num_envs reproduces the full-batch update.
+//
+// BPTT thread-split (bptt_split = S > 1): each env's trajectory is cut
+// into S contiguous segments of T/S steps processed by S different
+// threads (thread et covers env et % env_count, segment et / env_count;
+// each segment's entry recurrent state is already stored per step in
+// r_state). dstate entering a segment from above is taken as zero, i.e.
+// gradient flow through the MinGRU state is TRUNCATED at segment
+// boundaries (standard truncated-BPTT; exact at boundaries that
+// coincide with dones, and for the last segment). S=1 is the exact
+// full-horizon backward. Requires T % S == 0 and env_count % 32 == 0
+// (warp scatter walks 32 consecutive envs at one t).
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
@@ -2160,16 +2202,28 @@ extern "C" __global__ void ppo_backward_kernel(
     const double* __restrict__ adv_stats,  // [2] sum, sumsq over the FULL batch
     int num_envs, int T,
     int env_start, int env_count,  // minibatch = contiguous env range
+    int bptt_split,                // S segments per env (1 = exact)
     float clip_eps, float vf_coef, float ent_coef
 ) {
     __shared__ NNShared snn;
-    __shared__ float sdh_all[256 / 32][32][HIDDEN + 1];  // +1 pad: bank-conflict-free
+    // W_enc scatter staging: fixed 32-wide hidden tile per pass (a full
+    // [32][HIDDEN+1] stage is 132KB at hidden 128 -- over sm_86's smem
+    // budget), +1 pad: bank-conflict-free. HIDDEN > 32 builds loop the
+    // scatter over HIDDEN/32 tiles.
+    __shared__ float sdh_all[256 / 32][32][32 + 1];
     load_nn_shared(snn, w);
     int lane = threadIdx.x & 31;
     int et = blockIdx.x * blockDim.x + threadIdx.x;
-    bool active = et < env_count;
-    // clamp: inactive lanes run zeroed
-    int e = env_start + (active ? et : env_count - 1);
+    bool active = et < env_count * bptt_split;
+    // clamp: inactive lanes run zeroed (env_count % 32 == 0 keeps every
+    // warp inside one segment, so warps stay converged at the shuffles)
+    if (!active) et = env_count * bptt_split - 1;
+    int seg = et / env_count;
+    int ei = et % env_count;
+    int e = env_start + ei;
+    int seg_len = T / bptt_split;
+    int t_lo = seg * seg_len;
+    int t_hi = t_lo + seg_len;
 
     float* gr = grads + (size_t)(blockIdx.x % grad_copies) * PARAM_COUNT;
 
@@ -2187,7 +2241,7 @@ extern "C" __global__ void ppo_backward_kernel(
 
     float pg_sum = 0.0f, v_sum = 0.0f, ent_sum = 0.0f;
 
-    for (int t = T - 1; t >= 0; t--) {
+    for (int t = t_hi - 1; t >= t_lo; t--) {
         size_t o = (size_t)t * num_envs + e;
         const uint8_t* obs = r_obs + o * OBS_DIM_COMPACT;
 
@@ -2360,15 +2414,16 @@ extern "C" __global__ void ppo_backward_kernel(
         // scattered ones. Feature decode is uniform across the warp
         // (every lane reads sample m's obs, broadcast through L1).
         {
-            float (*sdh)[HIDDEN + 1] = sdh_all[threadIdx.x >> 5];
+            float (*sdh)[32 + 1] = sdh_all[threadIdx.x >> 5];
+            int ebase = (env_start + ei) - lane;
+            for (int hc = 0; hc < HIDDEN; hc += 32) {
             #pragma unroll
-            for (int i = 0; i < HIDDEN; i++) sdh[lane][i] = dh_enc[i];
+            for (int i = 0; i < 32; i++) sdh[lane][i] = dh_enc[hc + i];
             __syncwarp();
-            int ebase = (env_start + et) - lane;
             for (int m = 0; m < 32 && ebase + m < env_start + env_count; m++) {
                 const uint8_t* obm = r_obs + ((size_t)t * num_envs + ebase + m) * OBS_DIM_COMPACT;
                 float dv = sdh[m][lane];
-                float* gcol = gr + PARAM_W_ENC + lane;
+                float* gcol = gr + PARAM_W_ENC + hc + lane;
                 for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
                     int f = cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obm[cell];
                     atomicAdd(gcol + f * HIDDEN, dv);
@@ -2393,7 +2448,8 @@ extern "C" __global__ void ppo_backward_kernel(
                 f++;
                 if (sleeping) atomicAdd(gcol + f * HIDDEN, dv);
             }
-            __syncwarp();  // sdh reused next t
+            __syncwarp();  // sdh reused next tile / next t
+            }
         }
     }
 

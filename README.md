@@ -229,6 +229,45 @@ policy; the remaining gap at hidden 32 is dominated by model capacity
 gamma/lambda/vf/ent coefficients were all swept and plateau at
 ~14.2-14.6).
 
+The hidden size is a compile-time parameter: `-DCRAFTAX_HIDDEN=128`
+builds a hidden-128 binary (default 32; the default build's hashes
+are unchanged). Two things stop scaling naively on sm_86: W_gru is
+192KB at hidden 128, so it stays in global memory instead of shared
+(uniform reads broadcast through L1), and the backward pass's warp
+staging for the W_enc scatter is tiled 32 hidden units at a time
+(a full stage would need 132KB of smem). The fused rollout megakernel
+survives the width: 255 registers with ~0.5KB spills, 10.1M SPS at
+8192 envs on the 3090 vs 56.5M at hidden 32 -- still 2.5x faster than
+the per-step split path, so it stays fused. The hidden-128 build
+passes gradcheck and the verify-mode bitwise mega/split cross-check
+(its rollout reference hash: 544e4104328fa113).
+
+Deep minibatching used to be launch-bound: one thread walks one env's
+whole T=128 trajectory in backward, so a 64-env minibatch is 64
+threads. `--bptt-split S` cuts each trajectory into S segments
+processed by S threads (each segment restarts from the stored
+per-step recurrent state; state-gradient flow is truncated at segment
+cuts, standard truncated BPTT -- S=1, the default, is the exact
+full-horizon backward). Backward wall time per epoch at hidden 128:
+8 minibatches 8.0s -> 1.27s with S=8 (6.3x); 32 minibatches ~32s ->
+2.1s with S=16 (15x); 128 minibatches ~128s -> 4.2s with S=32 (30x).
+At hidden 32 with `--epochs 3 --minibatches 8 --bptt-split 8` the
+truncation is learning-neutral (14.5 vs 14.5 exact) and the full
+200M-step run drops from 333s to 57s.
+
+With capacity plus split-affordable minibatching, the best recipe
+found is hidden 128 with `--epochs 3 --minibatches 8 --lr 5e-3
+--lr-anneal --gamma 0.995 --gae-lambda 0.90 --vf 2.0 --ent 0.001
+--bptt-split 8`: episodic return ~15.2-15.3 with the strongest tech
+tree (make_stone_pick 57%, collect_coal 35%, collect_iron 19%,
+make_iron_pick 8%) in ~740s on the 3090 -- closing most of the gap to
+PufferLib's 15.8. Without the coefficient changes the same schedule
+reaches ~15.0-15.3 but a weaker iron tier (~2%); raising lr to 8e-3
+nudges return to ~15.6 but trades the iron tier away entirely
+(survival-heavy, eplen ~960). Hotter deep-minibatch recipes (32
+minibatches, lr 1e-2, S=16 i.e. 8-step segments) collapse to ~9.2
+with a 3x higher value loss; keep segments at 16 steps or longer.
+
 ## Citation
 
 ```bibtex

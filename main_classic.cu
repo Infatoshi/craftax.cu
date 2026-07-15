@@ -3,6 +3,11 @@
 //
 // Build:  nvcc -O3 -arch=native --expt-relaxed-constexpr --use_fast_math \
 //              main.cu -o craftax
+//
+// Hidden-128 policy build (default is hidden 32; h32 hashes unaffected):
+//   nvcc -O3 -arch=native --expt-relaxed-constexpr --use_fast_math \
+//        -DCRAFTAX_HIDDEN=128 main_classic.cu craftax_classic_cpu.o \
+//        -o craftax_classic_h128 -Xcompiler -fopenmp -lpthread
 // Usage:
 //   ./craftax bench  [envs] [iters] [obs_mode] [reset_mode]   env-only SPS
 //   ./craftax sweep                          env-only sweep (obs x reset modes)
@@ -525,6 +530,8 @@ struct PPOConfig {
     int epochs = 1;       // backward+adam passes per collected batch
     int minibatches = 1;  // contiguous env-range slices per epoch
     int lr_anneal = 0;    // 1: linear lr decay over the run
+    int bptt_split = 1;   // BPTT segments per env in backward (1 = exact;
+                          // >1 truncates state gradients at segment cuts)
 };
 
 struct Trainer {
@@ -551,8 +558,15 @@ struct Trainer {
             exit(1);
         }
         mb_envs = r.n / cfg.minibatches;
+        if (cfg.bptt_split < 1 || r.T % cfg.bptt_split != 0 ||
+            (cfg.bptt_split > 1 && mb_envs % 32 != 0)) {
+            fprintf(stderr, "--bptt-split must divide horizon (%d %% %d != 0), "
+                    "and envs/minibatch must be a multiple of 32\n",
+                    r.T, cfg.bptt_split);
+            exit(1);
+        }
         // Grad copies sized for the minibatch grid, not the full batch.
-        int grid = (mb_envs + 255) / 256;
+        int grid = ((size_t)mb_envs * cfg.bptt_split + 255) / 256;
         grad_copies = grid < 512 ? grid : 512;
         CUDA_CHECK(cudaMalloc(&grads, (size_t)grad_copies * PARAM_COUNT * sizeof(float)));
         CUDA_CHECK(cudaMemset(grads, 0, (size_t)grad_copies * PARAM_COUNT * sizeof(float)));
@@ -591,11 +605,13 @@ struct Trainer {
 
     // Backward over a contiguous env range [env_start, env_start+env_count).
     void backward(int env_start, int env_count) {
-        int block = 256, grid = (env_count + block - 1) / block;
+        int block = 256;
+        int grid = (int)(((size_t)env_count * cfg.bptt_split + block - 1) / block);
         ppo_backward_kernel<<<grid, block>>>(
             r.w, r.r_obs, r.r_act, r.r_logprob, r.r_done, r.r_state,
             adv, ret, grads, grad_copies, loss_acc, stats,
-            r.n, r.T, env_start, env_count, cfg.clip, cfg.vf, cfg.ent);
+            r.n, r.T, env_start, env_count, cfg.bptt_split,
+            cfg.clip, cfg.vf, cfg.ent);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -648,9 +664,9 @@ static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
     Trainer tr(r, cfg);
     tr.total_updates = (long)iters * cfg.epochs * cfg.minibatches;
     r.reset();
-    printf("train: envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g epochs=%d minibatches=%d lr_anneal=%d\n",
-           num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf,
-           cfg.epochs, cfg.minibatches, cfg.lr_anneal);
+    printf("train: hidden=%d envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g epochs=%d minibatches=%d lr_anneal=%d bptt_split=%d\n",
+           HIDDEN, num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf,
+           cfg.epochs, cfg.minibatches, cfg.lr_anneal, cfg.bptt_split);
 
     static const char* ach_names[22] = {
         "collect_wood", "place_table", "eat_cow", "collect_sapling",
@@ -799,6 +815,8 @@ static void usage(const char* prog) {
         "  --envs N  --iters N  --steps N  --horizon N  --obs-mode 0|1  --reset-mode 0|1\n"
         "  --lr F  --gamma F  --gae-lambda F  --clip F  --ent F  --vf F  --epochs N\n"
         "  --minibatches M  (contiguous env-range slices per epoch, default 1)\n"
+        "  --bptt-split S   (BPTT segments per env in backward, default 1 = exact;\n"
+        "                    S>1 truncates state grads at segment cuts, more parallelism)\n"
         "  --lr-anneal      (linear lr decay over the run)\n",
         prog);
 }
@@ -826,6 +844,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--vf") && i + 1 < argc) cfg.vf = atof(argv[++i]);
         else if (!strcmp(argv[i], "--epochs") && i + 1 < argc) cfg.epochs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--minibatches") && i + 1 < argc) cfg.minibatches = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bptt-split") && i + 1 < argc) cfg.bptt_split = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lr-anneal")) cfg.lr_anneal = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else if (argv[i][0] != '-') mode = argv[i];
