@@ -9159,7 +9159,35 @@ static __device__ inline void cf_encode_tail(
 #endif
 }
 
-__global__ void k_step(
+// Optional occupancy forcing for the 64-thread step kernels (k_step,
+// k_step_run, k_step_policy, k_step_policy_train). N min blocks/SM caps
+// registers at floor(65536/(64*N)) and ptxas spills the excess to local;
+// 0 (default) keeps the unconstrained allocation. Pure scheduling: results
+// are bit-identical either way, only regs/occupancy move.
+//
+// MEASURED on an idle 3090 @65536 envs (fused run mode SPS / bench SPS),
+// 2026-07 register-pressure pass -- occupancy is NOT the lever here:
+//   N=0: 254 regs, 0 spill, 4 blocks/SM (16.7% occ)  29.0M run / 39.3M bench
+//   N=5: 168 regs, 0 spill, 6 blocks/SM (25%)        23.3M     / 39.5M
+//   N=8: 128 regs, 0 spill, 8 blocks/SM (33%)        19.3M     / 38.0M
+//   N=10: 96 regs, ~150B spill, 10 blocks (41.7%)    16.7M     / --
+//   N=12: 80 regs, ~250B spill, 12 blocks (50%)      14.8M     / --
+// More resident envs shrink the per-env L1 share and the hit rate collapses
+// (78.8% -> 67.3% at N=5); the kernel is L1TEX-latency-bound, and 256
+// threads/SM is the measured cache-vs-latency optimum. Occupancy DOWN loses
+// too (192 thr = 22.2M, 128 thr = 19.2M via smem padding), as do smem-staged
+// weights (73KB smem carveout eats L1: 20.7M) and __constant__ weights
+// (17.7KB cycling thrashes IMC: 26.7M). Keep N=0.
+#ifndef CRAFTAX_STEP_MIN_BLOCKS
+#define CRAFTAX_STEP_MIN_BLOCKS 0
+#endif
+#if CRAFTAX_STEP_MIN_BLOCKS > 0
+#define CRAFTAX_STEP_LB __launch_bounds__(64, CRAFTAX_STEP_MIN_BLOCKS)
+#else
+#define CRAFTAX_STEP_LB
+#endif
+
+__global__ void CRAFTAX_STEP_LB k_step(
     Craftax* envs, uint32_t* action_rng, int num_envs, CraftaxResetRec* resets
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -9624,6 +9652,14 @@ static __device__ void cf_nn_head(
     const float* __restrict__ b_a, const float* __restrict__ W_v, float b_v,
     float* logits, float* value
 ) {
+    // NOTE (register-pressure pass, 2026-07): fusing these two loops per-k
+    // (dropping the hidden/gate/proj arrays) cuts k_policy 255 -> 128 regs
+    // with zero spills -- and makes everything SLOWER on the 3090: the
+    // 128-reg k_policy runs 512 threads/SM and L1-thrashes (split run path
+    // 28.2 -> 19.4M SPS @65k); the fused k_step_policy stays at 4 blocks/SM
+    // and loses ~0.6%. The "wasteful" arrays are load-bearing: they pin
+    // register pressure high enough that occupancy stays at the L1-capacity
+    // optimum (256 threads/SM). Keep them.
     float hidden[CF_NN_HIDDEN], gate[CF_NN_HIDDEN], proj[CF_NN_HIDDEN];
     #pragma unroll
     for (int k = 0; k < CF_NN_HIDDEN; k++) {
@@ -9793,7 +9829,7 @@ __global__ void k_policy_ref(
 
 // Step kernel for the rollout path: actions come from the policy (already
 // in env->actions), and no observation bytes are written at all.
-__global__ void k_step_run(Craftax* envs, int num_envs, CraftaxResetRec* resets) {
+__global__ void CRAFTAX_STEP_LB k_step_run(Craftax* envs, int num_envs, CraftaxResetRec* resets) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_envs) return;
     Craftax* env = &envs[i];
@@ -9810,7 +9846,7 @@ __global__ void k_step_run(Craftax* envs, int num_envs, CraftaxResetRec* resets)
 // Fused variant: policy forward + gameplay in one kernel (weights read
 // straight from global so k_step's occupancy is not smem-capped). Same
 // math, same buffers -- bitwise identical to k_policy; k_step_run.
-__global__ void k_step_policy(
+__global__ void CRAFTAX_STEP_LB k_step_policy(
     Craftax* envs, CfWeights w, float* __restrict__ h_state, int num_envs,
     CraftaxResetRec* resets, int32_t* __restrict__ out_act,
     float* __restrict__ out_logprob, float* __restrict__ out_value,
@@ -9924,7 +9960,7 @@ static __device__ void cf_nn_encoder_from_record(
 // Fused rollout step with training storage: k_step_policy plus the
 // per-step record writes. The inference-only k_step_policy is untouched
 // (same math; runhash canonicals stay in their own universe).
-__global__ void k_step_policy_train(
+__global__ void CRAFTAX_STEP_LB k_step_policy_train(
     Craftax* envs, CfWeights w, float* __restrict__ h_state, int num_envs,
     CraftaxResetRec* resets,
     uint8_t* __restrict__ r_obs,      // row t: [n][CF_TRAIN_OBS]
@@ -11080,7 +11116,20 @@ static void cu_rollout_step(
     CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int)));
     CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int)));
     if (fused) {
-        k_step_policy<<<(n + 63) / 64, 64>>>(
+        // Occupancy experiment knobs, bit-identical either way (the
+        // thread->env map is the flat global index). SMEM_PAD reserves
+        // unused dynamic smem to force FEWER blocks/SM; STEP_BLOCK resizes
+        // blocks. Measured @65k fused on idle 3090: 64thr/4blk 29.0M (best),
+        // 96thr (288 thr/SM) 25.3M, 128thr 28.3M, pad->192thr 22.2M,
+        // pad->128thr 19.2M. Defaults are the optimum.
+#ifndef CRAFTAX_STEP_SMEM_PAD
+#define CRAFTAX_STEP_SMEM_PAD 0
+#endif
+#ifndef CRAFTAX_STEP_BLOCK
+#define CRAFTAX_STEP_BLOCK 64
+#endif
+        k_step_policy<<<(n + CRAFTAX_STEP_BLOCK - 1) / CRAFTAX_STEP_BLOCK,
+                        CRAFTAX_STEP_BLOCK, CRAFTAX_STEP_SMEM_PAD>>>(
             v->d_envs, p->w, p->h_state, n, v->d_resets,
             p->d_act, p->d_logprob, p->d_value, seed, step);
     } else {
