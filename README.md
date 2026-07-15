@@ -148,7 +148,7 @@ the V-Cache CCD). Progression at 32k envs: 5.6M naive -> 47.8M.
 
 ## Training
 
-`./craftax_classic train` runs PPO (1 epoch, full batch) entirely on device: fused
+`./craftax_classic train` runs PPO entirely on device: fused
 rollout, bootstrap value, GAE, advantage normalization, backward, and Adam,
 with no tensor round-trips to the host inside an iteration. The 1345-float
 observation is never materialized for training either: the backward pass
@@ -176,9 +176,23 @@ matched hyperparameters (8192 envs, horizon 128, full-batch updates,
 lr 3e-4, 200M steps): this trainer reaches episodic return 3.7 vs 1.1
 for PuffeRL forced into the same single-update regime. With more
 optimization pressure per batch (`--epochs 16 --lr 2e-3`) it reaches
-13.1, approaching PufferLib's tuned-default recipe (15.8, which uses
+13.1 (12.9 on the RTX 3090).
+
+The trainer also supports minibatched updates (`--minibatches M`
+slices each epoch into M contiguous env ranges with one backward+Adam
+step per slice, keeping BPTT within an env intact; advantages stay
+normalized with full-batch statistics) and flag-gated linear lr decay
+(`--lr-anneal`). Minibatching is worth more per unit compute than
+extra full-batch epochs: `--epochs 3 --minibatches 8 --lr 5e-3`
+reaches episodic return 14.6 (eplen ~400, 17 of 22 achievements above
+1%, wake_up 0.83 vs 0.08 for the full-batch recipe) in 344s on the
+3090 -- better than the 16-epoch full-batch recipe at a quarter of
+its update count. PufferLib's tuned-default recipe reaches 15.8 with
 128 minibatch updates per batch, annealed lr 0.015, and a hidden-128
-policy). Closing the rest is minibatched updates -- future work.
+policy; the remaining gap at hidden 32 is dominated by model capacity
+(deeper minibatching, lr annealing, and PufferLib's
+gamma/lambda/vf/ent coefficients were all swept and plateau at
+~14.2-14.6).
 
 ## Citation
 

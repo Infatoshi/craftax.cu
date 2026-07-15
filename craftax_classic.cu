@@ -2138,6 +2138,11 @@ extern "C" __global__ void ppo_loss_kernel(
 // run the whole loop with e clamped and zeroed gradients so warps
 // stay converged at the shuffles. loss_acc[0..2] accumulates
 // pg/v/ent sums (fp32, logging only).
+//
+// Minibatching: [env_start, env_start+env_count) selects a contiguous
+// env range; the loss mean is over that range while advantage
+// normalization keeps full-batch stats. env_start=0,
+// env_count=num_envs reproduces the full-batch update.
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
@@ -2152,8 +2157,9 @@ extern "C" __global__ void ppo_backward_kernel(
     const float* __restrict__ adv, const float* __restrict__ ret,
     float* __restrict__ grads, int grad_copies,
     float* __restrict__ loss_acc,        // [3] or nullptr
-    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the batch
+    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the FULL batch
     int num_envs, int T,
+    int env_start, int env_count,  // minibatch = contiguous env range
     float clip_eps, float vf_coef, float ent_coef
 ) {
     __shared__ NNShared snn;
@@ -2161,12 +2167,16 @@ extern "C" __global__ void ppo_backward_kernel(
     load_nn_shared(snn, w);
     int lane = threadIdx.x & 31;
     int et = blockIdx.x * blockDim.x + threadIdx.x;
-    bool active = et < num_envs;
-    int e = active ? et : num_envs - 1;  // clamp: inactive lanes run zeroed
+    bool active = et < env_count;
+    // clamp: inactive lanes run zeroed
+    int e = env_start + (active ? et : env_count - 1);
+
     float* gr = grads + (size_t)(blockIdx.x % grad_copies) * PARAM_COUNT;
 
+    // Advantage normalization always uses full-batch stats; the loss
+    // mean is over the minibatch (env_count * T samples).
     double inv_count = 1.0 / ((double)num_envs * T);
-    float inv_batch = (float)inv_count;
+    float inv_batch = (float)(1.0 / ((double)env_count * T));
     float adv_mean = (float)(adv_stats[0] * inv_count);
     double var = adv_stats[1] * inv_count - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
     float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
@@ -2354,8 +2364,8 @@ extern "C" __global__ void ppo_backward_kernel(
             #pragma unroll
             for (int i = 0; i < HIDDEN; i++) sdh[lane][i] = dh_enc[i];
             __syncwarp();
-            int ebase = et - lane;
-            for (int m = 0; m < 32 && ebase + m < num_envs; m++) {
+            int ebase = (env_start + et) - lane;
+            for (int m = 0; m < 32 && ebase + m < env_start + env_count; m++) {
                 const uint8_t* obm = r_obs + ((size_t)t * num_envs + ebase + m) * OBS_DIM_COMPACT;
                 float dv = sdh[m][lane];
                 float* gcol = gr + PARAM_W_ENC + lane;

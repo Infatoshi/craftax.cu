@@ -522,7 +522,9 @@ static int run_verify(int num_envs, int steps) {
 struct PPOConfig {
     float lr = 3e-4f, gamma = 0.99f, lam = 0.95f;
     float clip = 0.2f, ent = 0.01f, vf = 0.5f;
-    int epochs = 1;  // backward+adam passes per collected batch
+    int epochs = 1;       // backward+adam passes per collected batch
+    int minibatches = 1;  // contiguous env-range slices per epoch
+    int lr_anneal = 0;    // 1: linear lr decay over the run
 };
 
 struct Trainer {
@@ -538,10 +540,19 @@ struct Trainer {
     float* loss_acc;   // [3] pg, v, ent sums (fp32, logging)
     double* stats;     // [2] adv sum, sumsq
     int adam_step = 0;
+    int mb_envs;           // envs per minibatch
+    long total_updates = 0;  // adam steps over the whole run (lr anneal)
 
     Trainer(Rollout& r_, PPOConfig cfg_) : r(r_), cfg(cfg_) {
         r.alloc_states();
-        int grid = (r.n + 255) / 256;
+        if (cfg.minibatches < 1 || r.n % cfg.minibatches != 0) {
+            fprintf(stderr, "--minibatches must divide num_envs (%d %% %d != 0)\n",
+                    r.n, cfg.minibatches);
+            exit(1);
+        }
+        mb_envs = r.n / cfg.minibatches;
+        // Grad copies sized for the minibatch grid, not the full batch.
+        int grid = (mb_envs + 255) / 256;
         grad_copies = grid < 512 ? grid : 512;
         CUDA_CHECK(cudaMalloc(&grads, (size_t)grad_copies * PARAM_COUNT * sizeof(float)));
         CUDA_CHECK(cudaMemset(grads, 0, (size_t)grad_copies * PARAM_COUNT * sizeof(float)));
@@ -578,27 +589,38 @@ struct Trainer {
         CUDA_CHECK(cudaGetLastError());
     }
 
-    void backward() {
-        int block = 256, grid = (r.n + block - 1) / block;
-        CUDA_CHECK(cudaMemsetAsync(loss_acc, 0, 3 * sizeof(float)));
+    // Backward over a contiguous env range [env_start, env_start+env_count).
+    void backward(int env_start, int env_count) {
+        int block = 256, grid = (env_count + block - 1) / block;
         ppo_backward_kernel<<<grid, block>>>(
             r.w, r.r_obs, r.r_act, r.r_logprob, r.r_done, r.r_state,
             adv, ret, grads, grad_copies, loss_acc, stats,
-            r.n, r.T, cfg.clip, cfg.vf, cfg.ent);
+            r.n, r.T, env_start, env_count, cfg.clip, cfg.vf, cfg.ent);
         CUDA_CHECK(cudaGetLastError());
     }
 
     void adam() {
         adam_step++;
+        float lr = cfg.lr;
+        if (cfg.lr_anneal && total_updates > 0)
+            lr *= 1.0f - (float)(adam_step - 1) / (float)total_updates;
         adam_kernel<<<(PARAM_COUNT + 255) / 256, 256>>>(
             r.params, grads, grad_copies, adam_m, adam_v,
-            adam_step, cfg.lr, 0.9f, 0.999f, 1e-8f);
+            adam_step, lr, 0.9f, 0.999f, 1e-8f);
         CUDA_CHECK(cudaGetLastError());
     }
 
     void update() {
         collect();
-        for (int e = 0; e < cfg.epochs; e++) { backward(); adam(); }
+        for (int e = 0; e < cfg.epochs; e++) {
+            // loss_acc accumulates over the epoch's minibatches; the log
+            // line after update() reports the last epoch's full-batch sums.
+            CUDA_CHECK(cudaMemsetAsync(loss_acc, 0, 3 * sizeof(float)));
+            for (int m = 0; m < cfg.minibatches; m++) {
+                backward(m * mb_envs, mb_envs);
+                adam();
+            }
+        }
     }
 
     // Total PPO loss over the stored rollout at the current params
@@ -624,9 +646,11 @@ struct Trainer {
 static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
     Rollout r(num_envs, T, 42);
     Trainer tr(r, cfg);
+    tr.total_updates = (long)iters * cfg.epochs * cfg.minibatches;
     r.reset();
-    printf("train: envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g epochs=%d\n",
-           num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf, cfg.epochs);
+    printf("train: envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g epochs=%d minibatches=%d lr_anneal=%d\n",
+           num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf,
+           cfg.epochs, cfg.minibatches, cfg.lr_anneal);
 
     static const char* ach_names[22] = {
         "collect_wood", "place_table", "eat_cow", "collect_sapling",
@@ -686,7 +710,8 @@ static int run_gradcheck() {
     Trainer tr(r, cfg);
     r.reset();
     tr.collect();
-    tr.backward();
+    CUDA_CHECK(cudaMemsetAsync(tr.loss_acc, 0, 3 * sizeof(float)));
+    tr.backward(0, n);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> g_all((size_t)tr.grad_copies * PARAM_COUNT);
@@ -772,7 +797,9 @@ static void usage(const char* prog) {
         "flags:\n"
         "  --backend cuda|cpu   (default cuda; cpu supports bench only)\n"
         "  --envs N  --iters N  --steps N  --horizon N  --obs-mode 0|1  --reset-mode 0|1\n"
-        "  --lr F  --gamma F  --gae-lambda F  --clip F  --ent F  --vf F  --epochs N\n",
+        "  --lr F  --gamma F  --gae-lambda F  --clip F  --ent F  --vf F  --epochs N\n"
+        "  --minibatches M  (contiguous env-range slices per epoch, default 1)\n"
+        "  --lr-anneal      (linear lr decay over the run)\n",
         prog);
 }
 
@@ -798,6 +825,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ent") && i + 1 < argc) cfg.ent = atof(argv[++i]);
         else if (!strcmp(argv[i], "--vf") && i + 1 < argc) cfg.vf = atof(argv[++i]);
         else if (!strcmp(argv[i], "--epochs") && i + 1 < argc) cfg.epochs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--minibatches") && i + 1 < argc) cfg.minibatches = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--lr-anneal")) cfg.lr_anneal = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else if (argv[i][0] != '-') mode = argv[i];
         else { usage(argv[0]); return 1; }
