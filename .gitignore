@@ -4,3 +4,4 @@ craftax_full_cuda
 craftax_full_cuda_compact
 *.o
 craftax_classic_h128*
+craftax_full_cuda_h128

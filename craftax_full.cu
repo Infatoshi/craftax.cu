@@ -9439,8 +9439,25 @@ __global__ void k_mega(
 // offset = global step): independent per (env, step) and fully disjoint
 // from the env's threefry game RNG, which is never touched.
 // ============================================================
-#define CF_NN_HIDDEN 32
+// Compile-time hidden size. Default 32 (canonical hashes). Build a
+// hidden-128 binary with -DCRAFTAX_HIDDEN=128 (its runhash/verify/train
+// numbers live in a different universe; h32 anchors are unaffected).
+// Random-action env anchors (hash/statehash) are hidden-independent.
+#ifndef CRAFTAX_HIDDEN
+#define CRAFTAX_HIDDEN 32
+#endif
+#define CF_NN_HIDDEN CRAFTAX_HIDDEN
 #define CF_NN_GRU (3 * CF_NN_HIDDEN)
+// W_gru is 3*H*H floats: 12KB at hidden 32 (staged in shared memory) but
+// 192KB at hidden 128 -- over sm_86's 48KB static smem limit, so larger
+// builds read it straight from global (uniform across the block, so it
+// broadcasts through L1). s->W_gru[i] spelling works either way. Gate at
+// 24KB: k_ppo_backward must also fit W_a + the 16.9KB scatter tile.
+#if (3 * CF_NN_HIDDEN * CF_NN_HIDDEN * 4) <= 24576
+#define CF_GRU_SMEM 1
+#else
+#define CF_GRU_SMEM 0
+#endif
 #define CF_NN_OBS ((int)CRAFTAX_WG_PACKED_OBS_SIZE)  // 843
 #define CF_NN_MAP (CRAFTAX_WG_PACKED_MAP_OBS_SIZE)   // 792
 #define CF_NN_TAIL (CRAFTAX_WG_INVENTORY_OBS_SIZE)   // 51
@@ -9476,7 +9493,11 @@ __global__ void k_nn_init_weights(
 
 // Small weights staged in shared memory once per block (per-step kernel).
 typedef struct CfNNShared {
+#if CF_GRU_SMEM
     float W_gru[CF_NN_GRU * CF_NN_HIDDEN];
+#else
+    const float* W_gru;
+#endif
     float W_a[CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN];
     float b_a[CRAFTAX_NUM_ACTIONS];
     float W_v[CF_NN_HIDDEN];
@@ -9485,8 +9506,12 @@ typedef struct CfNNShared {
 } CfNNShared;
 
 static __device__ void cf_nn_load_shared(CfNNShared* s, const CfWeights& w) {
+#if CF_GRU_SMEM
     for (int i = threadIdx.x; i < CF_NN_GRU * CF_NN_HIDDEN; i += blockDim.x)
         s->W_gru[i] = w.W_gru[i];
+#else
+    if (threadIdx.x == 0) s->W_gru = w.W_gru;
+#endif
     for (int i = threadIdx.x; i < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN;
          i += blockDim.x)
         s->W_a[i] = w.W_a[i];
@@ -9660,6 +9685,8 @@ static __device__ void cf_nn_head(
     // and loses ~0.6%. The "wasteful" arrays are load-bearing: they pin
     // register pressure high enough that occupancy stays at the L1-capacity
     // optimum (256 threads/SM). Keep them.
+    float hout[CF_NN_HIDDEN];
+#if CF_NN_HIDDEN <= 64
     float hidden[CF_NN_HIDDEN], gate[CF_NN_HIDDEN], proj[CF_NN_HIDDEN];
     #pragma unroll
     for (int k = 0; k < CF_NN_HIDDEN; k++) {
@@ -9672,7 +9699,6 @@ static __device__ void cf_nn_head(
         }
         hidden[k] = zh; gate[k] = zg; proj[k] = zp;
     }
-    float hout[CF_NN_HIDDEN];
     #pragma unroll
     for (int k = 0; k < CF_NN_HIDDEN; k++) {
         // torch.lerp(start, end, weight) = start + weight*(end-start)
@@ -9682,6 +9708,26 @@ static __device__ void cf_nn_head(
         hout[k] = p * out + (1.0f - p) * h_enc[k];
         state[k] = out;
     }
+#else
+    // Large hidden: single fused loop over units (the staging arrays above
+    // are 3*H floats of pure register/local pressure at hidden 128; per-unit
+    // math and summation order are unchanged, so results are identical).
+    #pragma unroll
+    for (int k = 0; k < CF_NN_HIDDEN; k++) {
+        float zh = 0.0f, zg = 0.0f, zp = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < CF_NN_HIDDEN; j++) {
+            zh = fmaf(W_gru[k * CF_NN_HIDDEN + j], h_enc[j], zh);
+            zg = fmaf(W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], zg);
+            zp = fmaf(W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], zp);
+        }
+        float out = state[k]
+            + cf_nn_sigmoid(zg) * (cf_nn_mingru_g(zh) - state[k]);
+        float p = cf_nn_sigmoid(zp);
+        hout[k] = p * out + (1.0f - p) * h_enc[k];
+        state[k] = out;
+    }
+#endif
     for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
         float z = b_a[a];
         #pragma unroll
@@ -9826,6 +9872,246 @@ __global__ void k_policy_ref(
         s.b_v, out_logprob, out_value, e, num_envs, seed, step_count);
     if (out_act) out_act[e] = action;
 }
+
+// ------------------------------------------------------------
+// Warp-cooperative policy forward (hidden % 128 == 0 builds only; the
+// h32 binary compiles none of this). One warp per env, lane l owns
+// hidden units [4l, 4l+4) as a float4. Bit-identical to k_policy:
+//  - encoder: same feature decode (duplicated below -- KEEP IN SYNC with
+//    cf_nn_encoder_gather) and the same per-unit fmaf chain; only the
+//    unit->thread mapping changes. W_enc column loads are one coalesced
+//    512B line per feature instead of a 32x broadcast loop.
+//  - GRU matvecs: j runs 0..H-1 sequentially per output unit (h_enc
+//    broadcast from the owning lane via shuffle), so each unit's
+//    accumulation order is exactly the scalar loop's.
+//  - heads: hout staged in shared memory; one lane per logit row, each
+//    row's j-chain sequential; lane 0 samples with the same Philox
+//    stream and writes the same outputs.
+// ------------------------------------------------------------
+#if CF_NN_HIDDEN == 128
+
+static __device__ __forceinline__ void cf_nn_warp_fma(
+    float4* acc, float x, const float* __restrict__ colp, int lane
+) {
+    float4 cv = ((const float4*)colp)[lane];
+    acc->x = fmaf(x, cv.x, acc->x);
+    acc->y = fmaf(x, cv.y, acc->y);
+    acc->z = fmaf(x, cv.z, acc->z);
+    acc->w = fmaf(x, cv.w, acc->w);
+}
+
+// KEEP IN SYNC with cf_nn_encoder_gather: identical predicates, feature
+// order, and skip conditions. The decode is computed redundantly by all
+// 32 lanes (uniform, so it broadcasts); only the FMA work is split.
+static __device__ void cf_nn_encoder_gather_warp(
+    const CraftaxState* cs, const float* __restrict__ W_enc,
+    const float* __restrict__ b_enc, int lane, float4* acc
+) {
+    const CraftaxWorldState* state = (const CraftaxWorldState*)(const void*)cs;
+    *acc = ((const float4*)b_enc)[lane];
+
+    const int level = CF(player_level, state);
+    const int mob_level =
+        craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
+    const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
+    const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
+
+    int16_t mob_cell[14];
+    int8_t mob_ch[14];
+    float mob_val[14];
+    int nm = 0;
+    for (int c = 0; c < CRAFTAX_WG_NUM_MOB_CLASSES; c++) {
+        const int nslots = c == 2 ? 2 : 3;
+        for (int i = 0; i < nslots; i++) {
+            int type_id = MOB_TYPE(c, mob_level, i, state);
+            if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
+                || !MOB_MASK(c, mob_level, i, state)) {
+                continue;
+            }
+            int mob_row = MOB_POS(c, mob_level, i, 0, state);
+            int mob_col = MOB_POS(c, mob_level, i, 1, state);
+            int local_row = mob_row - top;
+            int local_col = mob_col - left;
+            if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
+                || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
+                continue;
+            }
+            bool in_bounds = mob_row >= 0 && mob_row < CRAFTAX_WG_MAP_SIZE
+                && mob_col >= 0 && mob_col < CRAFTAX_WG_MAP_SIZE;
+            if (!in_bounds
+                || state->light_map[mob_level][mob_row][mob_col] <= 12) {
+                continue;
+            }
+            int16_t cell =
+                (int16_t)(local_row * CRAFTAX_WG_OBS_COLS + local_col);
+            int8_t ch = (int8_t)(3 + c);
+            int found = -1;
+            for (int j = 0; j < nm; j++)
+                if (mob_cell[j] == cell && mob_ch[j] == ch) found = j;
+            if (found >= 0) {
+                mob_val[found] = (float)(type_id + 1);
+            } else {
+                mob_cell[nm] = cell;
+                mob_ch[nm] = ch;
+                mob_val[nm] = (float)(type_id + 1);
+                nm++;
+            }
+        }
+    }
+
+    for (int cell = 0; cell < CRAFTAX_WG_OBS_ROWS * CRAFTAX_WG_OBS_COLS;
+         cell++) {
+        int row = cell / CRAFTAX_WG_OBS_COLS;
+        int col = cell % CRAFTAX_WG_OBS_COLS;
+        int world_row = top + row;
+        int world_col = left + col;
+        bool in_bounds = world_row >= 0 && world_row < CRAFTAX_WG_MAP_SIZE
+            && world_col >= 0 && world_col < CRAFTAX_WG_MAP_SIZE;
+        bool visible =
+            in_bounds && state->light_map[level][world_row][world_col] > 12;
+        int fbase = cell * CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
+        if (visible) {
+            float v0 = (float)state->map[level][world_row][world_col];
+            if (v0 != 0.0f)
+                cf_nn_warp_fma(acc, v0,
+                               W_enc + (size_t)fbase * CF_NN_HIDDEN, lane);
+            float v1 =
+                (float)state->item_map[level][world_row][world_col] + 1.0f;
+            if (v1 != 0.0f)
+                cf_nn_warp_fma(acc, v1,
+                               W_enc + (size_t)(fbase + 1) * CF_NN_HIDDEN,
+                               lane);
+            cf_nn_warp_fma(acc, 1.0f,
+                           W_enc + (size_t)(fbase + 2) * CF_NN_HIDDEN, lane);
+        }
+        for (int m = 0; m < nm; m++) {
+            if ((int)mob_cell[m] == cell) {
+                cf_nn_warp_fma(
+                    acc, mob_val[m],
+                    W_enc + (size_t)(fbase + mob_ch[m]) * CF_NN_HIDDEN, lane);
+            }
+        }
+    }
+
+    float tail[CF_NN_TAIL];
+    craftax_encode_scalar_observation_tail_at(state, tail, 0);
+    for (int j = 0; j < CF_NN_TAIL; j++) {
+        float x = tail[j];
+        if (x == 0.0f) continue;
+        cf_nn_warp_fma(acc, x, W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN,
+                       lane);
+    }
+}
+
+#define CF_POL_WARPS 4  // warps (envs) per block
+__global__ void k_policy_warp(
+    CfWeights w, float* __restrict__ h_state,
+    const float* __restrict__ prev_terminals,
+    float* __restrict__ env_actions, int32_t* __restrict__ out_act,
+    float* __restrict__ out_logprob, float* __restrict__ out_value,
+    int num_envs, uint64_t seed, uint64_t step_count
+) {
+    __shared__ float s_hout[CF_POL_WARPS][CF_NN_HIDDEN];
+    __shared__ float s_logits[CF_POL_WARPS][CRAFTAX_NUM_ACTIONS];
+    __shared__ float s_value[CF_POL_WARPS];
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int e = blockIdx.x * CF_POL_WARPS + warp;
+    if (e >= num_envs) return;
+    const CraftaxState* state = &((const CraftaxState*)g_cf_state_base)[e];
+
+    float4 h4;
+    cf_nn_encoder_gather_warp(state, w.W_enc, w.b_enc, lane, &h4);
+
+    float4 st;
+    if (prev_terminals[e] != 0.0f) {
+        st = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else {
+        st = ((const float4*)(h_state + (size_t)e * CF_NN_HIDDEN))[lane];
+    }
+
+    // GRU matvecs, j sequential via warp broadcast (scalar order per unit).
+    float zh[4] = {0, 0, 0, 0}, zg[4] = {0, 0, 0, 0}, zp[4] = {0, 0, 0, 0};
+    for (int jb = 0; jb < 32; jb++) {
+        float4 hj;
+        hj.x = __shfl_sync(0xffffffffu, h4.x, jb);
+        hj.y = __shfl_sync(0xffffffffu, h4.y, jb);
+        hj.z = __shfl_sync(0xffffffffu, h4.z, jb);
+        hj.w = __shfl_sync(0xffffffffu, h4.w, jb);
+        #pragma unroll
+        for (int u = 0; u < 4; u++) {
+            int k = 4 * lane + u;
+            float4 wh = ((const float4*)(w.W_gru
+                + (size_t)k * CF_NN_HIDDEN))[jb];
+            float4 wg = ((const float4*)(w.W_gru
+                + (size_t)(CF_NN_HIDDEN + k) * CF_NN_HIDDEN))[jb];
+            float4 wp = ((const float4*)(w.W_gru
+                + (size_t)(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN))[jb];
+            zh[u] = fmaf(wh.x, hj.x, zh[u]);
+            zh[u] = fmaf(wh.y, hj.y, zh[u]);
+            zh[u] = fmaf(wh.z, hj.z, zh[u]);
+            zh[u] = fmaf(wh.w, hj.w, zh[u]);
+            zg[u] = fmaf(wg.x, hj.x, zg[u]);
+            zg[u] = fmaf(wg.y, hj.y, zg[u]);
+            zg[u] = fmaf(wg.z, hj.z, zg[u]);
+            zg[u] = fmaf(wg.w, hj.w, zg[u]);
+            zp[u] = fmaf(wp.x, hj.x, zp[u]);
+            zp[u] = fmaf(wp.y, hj.y, zp[u]);
+            zp[u] = fmaf(wp.z, hj.z, zp[u]);
+            zp[u] = fmaf(wp.w, hj.w, zp[u]);
+        }
+    }
+    float4 hout4, stout;
+    #pragma unroll
+    for (int u = 0; u < 4; u++) {
+        float st_u = (&st.x)[u];
+        float he_u = (&h4.x)[u];
+        float out = st_u
+            + cf_nn_sigmoid(zg[u]) * (cf_nn_mingru_g(zh[u]) - st_u);
+        float p = cf_nn_sigmoid(zp[u]);
+        (&hout4.x)[u] = p * out + (1.0f - p) * he_u;
+        (&stout.x)[u] = out;
+    }
+    ((float4*)s_hout[warp])[lane] = hout4;
+    __syncwarp();
+
+    // Heads: lane a computes logits[a] (rows 0..31), then lanes 0..10 the
+    // remaining rows 32..42; lane 11 computes the value. Each row's
+    // j-chain is sequential from the staged hout: scalar order.
+    const float* hh = s_hout[warp];
+    {
+        float z = w.b_a[lane];
+        const float* wa = w.W_a + (size_t)lane * CF_NN_HIDDEN;
+        for (int j = 0; j < CF_NN_HIDDEN; j++) z = fmaf(wa[j], hh[j], z);
+        s_logits[warp][lane] = z;
+    }
+    if (lane < CRAFTAX_NUM_ACTIONS - 32) {
+        int a = 32 + lane;
+        float z = w.b_a[a];
+        const float* wa = w.W_a + (size_t)a * CF_NN_HIDDEN;
+        for (int j = 0; j < CF_NN_HIDDEN; j++) z = fmaf(wa[j], hh[j], z);
+        s_logits[warp][a] = z;
+    } else if (lane == CRAFTAX_NUM_ACTIONS - 32) {
+        float z = w.b_v[0];
+        for (int j = 0; j < CF_NN_HIDDEN; j++) z = fmaf(w.W_v[j], hh[j], z);
+        s_value[warp] = z;
+    }
+    __syncwarp();
+
+    if (lane == 0) {
+        curandStatePhilox4_32_10_t sampler;
+        curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, (uint64_t)e, step_count,
+                    &sampler);
+        float logprob;
+        int action = cf_nn_sample_action(s_logits[warp],
+                                         curand_uniform(&sampler), &logprob);
+        if (out_logprob) out_logprob[e] = logprob;
+        if (out_value) out_value[e] = s_value[warp];
+        env_actions[e] = (float)action;
+        if (out_act) out_act[e] = action;
+    }
+    ((float4*)(h_state + (size_t)e * CF_NN_HIDDEN))[lane] = stout;
+}
+#endif  // CF_NN_HIDDEN == 128
 
 // Step kernel for the rollout path: actions come from the policy (already
 // in env->actions), and no observation bytes are written at all.
@@ -10467,14 +10753,18 @@ __global__ void k_ppo_backward(
         {
             float (*sdh)[32 + 1] = sdh_all[threadIdx.x >> 5];
             int ebase = e - lane;
+            // Fixed 32-wide hidden tile per pass (a full [32][HIDDEN+1]
+            // stage is 132KB at hidden 128 -- over the smem budget);
+            // HIDDEN > 32 builds loop the scatter over HIDDEN/32 tiles.
+            for (int hc = 0; hc < CF_NN_HIDDEN; hc += 32) {
             #pragma unroll
-            for (int k = 0; k < CF_NN_HIDDEN; k++) sdh[lane][k] = dh_enc[k];
+            for (int k = 0; k < 32; k++) sdh[lane][k] = dh_enc[hc + k];
             __syncwarp();
             for (int m = 0; m < 32 && ebase + m < env_start + env_count; m++) {
                 const uint8_t* rm =
                     r_obs + ((size_t)t * num_envs + ebase + m) * CF_TRAIN_OBS;
                 float dv = sdh[m][lane];
-                float* gcol = gr + CF_NN_W_ENC + lane;
+                float* gcol = gr + CF_NN_W_ENC + hc + lane;
                 for (int f = 0; f < CF_NN_MAP; f++) {
                     float x = (float)rm[f];
                     if (x != 0.0f)
@@ -10488,7 +10778,8 @@ __global__ void k_ppo_backward(
                                   x * dv);
                 }
             }
-            __syncwarp();  // sdh reused next t
+            __syncwarp();  // sdh reused next tile / next t
+            }
         }
     }
 
@@ -11132,6 +11423,20 @@ static void cu_rollout_step(
                         CRAFTAX_STEP_BLOCK, CRAFTAX_STEP_SMEM_PAD>>>(
             v->d_envs, p->w, p->h_state, n, v->d_resets,
             p->d_act, p->d_logprob, p->d_value, seed, step);
+    } else if (fused == 2) {
+        // Split path with the warp-cooperative policy kernel (bit-identical
+        // outputs to k_policy; hidden % 128 builds only).
+#if CF_NN_HIDDEN == 128
+        k_policy_warp<<<(n + CF_POL_WARPS - 1) / CF_POL_WARPS,
+                        32 * CF_POL_WARPS>>>(
+            p->w, p->h_state, v->d_terminals, v->d_actions,
+            p->d_act, p->d_logprob, p->d_value, n, seed, step);
+        k_step_run<<<(n + 63) / 64, 64>>>(v->d_envs, n, v->d_resets);
+#else
+        fprintf(stderr, "--fused 2 (warp policy) requires -DCRAFTAX_HIDDEN "
+                "to be 128 (this build: %d)\n", CF_NN_HIDDEN);
+        exit(1);
+#endif
     } else {
         k_policy<<<(n + 63) / 64, 64>>>(
             p->w, p->h_state, v->d_terminals, v->d_actions,
@@ -11327,6 +11632,8 @@ typedef struct {
     int minibatches;  // contiguous env-range slices per epoch
     int lr_anneal;    // 1: linear lr decay over the run
     int bptt_split;   // BPTT segments per env in backward (1 = exact)
+    int ent_anneal;   // 1: linear ent -> ent_final over the run
+    float ent_final;  // --ent-anneal endpoint (start is --ent)
 } CuPPOConfig;
 
 static CuPPOConfig cu_ppo_defaults(void) {
@@ -11335,6 +11642,7 @@ static CuPPOConfig cu_ppo_defaults(void) {
     cfg.clip = 0.2f; cfg.ent = 0.01f; cfg.vf = 0.5f;
     cfg.epochs = 1; cfg.minibatches = 1; cfg.lr_anneal = 0;
     cfg.bptt_split = 1;
+    cfg.ent_anneal = 0; cfg.ent_final = 0.003f;
     return cfg;
 }
 
@@ -11484,11 +11792,18 @@ static void cu_train_collect(CuTrain* tr) {
 static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
     int grid = (int)(((size_t)env_count * tr->cfg.bptt_split + CF_BWD_BLOCK - 1)
                      / CF_BWD_BLOCK);
+    // --ent-anneal: linear ent -> ent_final over the run (same schedule
+    // convention as --lr-anneal: fraction of completed adam updates).
+    float ent = tr->cfg.ent;
+    if (tr->cfg.ent_anneal && tr->total_updates > 0) {
+        float frac = (float)tr->adam_step / (float)tr->total_updates;
+        ent = tr->cfg.ent + (tr->cfg.ent_final - tr->cfg.ent) * frac;
+    }
     k_ppo_backward<<<grid, CF_BWD_BLOCK>>>(
         tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
         tr->r_state, tr->adv, tr->ret, tr->grads, tr->grad_copies,
         tr->loss_acc, tr->stats, tr->n, tr->T, env_start, env_count,
-        tr->cfg.bptt_split, tr->cfg.clip, tr->cfg.vf, tr->cfg.ent);
+        tr->cfg.bptt_split, tr->cfg.clip, tr->cfg.vf, ent);
     CU_CHECK(cudaGetLastError());
 }
 
@@ -11595,10 +11910,12 @@ static int cu_run_train(
 
     printf("train: envs=%d horizon=%d iters=%d seed=%llu lr=%g gamma=%g "
            "lam=%g clip=%g ent=%g vf=%g epochs=%d minibatches=%d "
-           "lr_anneal=%d bptt_split=%d\n",
+           "lr_anneal=%d bptt_split=%d hidden=%d",
            num_envs, T, iters, (unsigned long long)seed, cfg.lr, cfg.gamma,
            cfg.lam, cfg.clip, cfg.ent, cfg.vf, cfg.epochs, cfg.minibatches,
-           cfg.lr_anneal, cfg.bptt_split);
+           cfg.lr_anneal, cfg.bptt_split, CF_NN_HIDDEN);
+    if (cfg.ent_anneal) printf(" ent_anneal->%g", cfg.ent_final);
+    printf("\n");
 
     Craftax* h_envs = (Craftax*)malloc((size_t)num_envs * sizeof(Craftax));
     double ep0, len0, ret0, ach0[CRAFTAX_NUM_ACHIEVEMENTS];
@@ -11819,7 +12136,7 @@ static void cu_usage(const char* prog) {
             "       %s train     [--envs N] [--horizon T] [--iters M] [--seed S]\n"
             "                    [--lr F] [--gamma F] [--gae-lambda F] [--clip F]\n"
             "                    [--ent F] [--vf F] [--epochs N] [--minibatches M]\n"
-            "                    [--bptt-split S] [--lr-anneal]\n"
+            "                    [--bptt-split S] [--lr-anneal] [--ent-anneal F]\n"
             "       %s gradcheck [--seed S]\n",
             prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
@@ -11858,6 +12175,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--minibatches") && i + 1 < argc) cfg.minibatches = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bptt-split") && i + 1 < argc) cfg.bptt_split = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lr-anneal")) cfg.lr_anneal = 1;
+        else if (!strcmp(argv[i], "--ent-anneal") && i + 1 < argc) {
+            cfg.ent_anneal = 1;
+            cfg.ent_final = (float)atof(argv[++i]);
+        }
         else { cu_usage(argv[0]); return 1; }
     }
     if (envs <= 0 || iters <= 0 || steps <= 0 || horizon <= 0) { cu_usage(argv[0]); return 1; }

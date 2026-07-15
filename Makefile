@@ -35,6 +35,13 @@ craftax_full_cuda: craftax_full.cu
 full-compact: craftax_full_cuda_compact
 craftax_full_cuda_compact: craftax_full.cu
 	$(NVCC) $(NVCCFLAGS_FULL) -DCRAFTAX_COMPACT_OBS craftax_full.cu -o $@
+
+# Hidden-128 policy build (default hidden size is 32). Env trajectories
+# (hash/statehash anchors) are hidden-independent; runhash/runverify/train
+# numbers live in their own universe (see README).
+full-h128: craftax_full_cuda_h128
+craftax_full_cuda_h128: craftax_full.cu
+	$(NVCC) $(NVCCFLAGS_FULL) -DCRAFTAX_HIDDEN=128 craftax_full.cu -o $@
 else
 craftax_classic: craftax_classic.c
 	$(CC) $(CPUFLAGS) -DCRAFTAX_STANDALONE craftax_classic.c -o $@ -lpthread -lm
@@ -44,6 +51,7 @@ craftax_full: craftax_full.c
 	$(CC) $(CPUFLAGS) craftax_full.c -o $@ -lpthread -lm
 
 clean:
-	rm -f craftax_classic craftax_full craftax_full_cuda craftax_classic_cpu.o
+	rm -f craftax_classic craftax_full craftax_full_cuda craftax_classic_cpu.o \
+	      craftax_full_cuda_compact craftax_full_cuda_h128
 
-.PHONY: all classic full clean
+.PHONY: all classic full full-compact full-h128 clean
