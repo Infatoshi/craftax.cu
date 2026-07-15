@@ -142,6 +142,8 @@ The classic CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 ./craftax_full_cuda run --envs 131072 --iters 500 --fused 1  # full-game env+policy rollouts
 ./craftax_full_cuda runhash --envs 1024 --steps 500  # rollout determinism anchor
 ./craftax_full_cuda runverify --envs 1024 --steps 128  # gathered vs dense forward, bitwise
+./craftax_full_cuda train --envs 8192 --horizon 128 --iters 191   # full-game on-device PPO
+./craftax_full_cuda gradcheck                        # analytic grads vs finite differences
 ```
 
 ## Verification
@@ -267,6 +269,58 @@ nudges return to ~15.6 but trades the iron tier away entirely
 (survival-heavy, eplen ~960). Hotter deep-minibatch recipes (32
 minibatches, lr 1e-2, S=16 i.e. 8-step segments) collapse to ~9.2
 with a 3x higher value loss; keep segments at 16 steps or longer.
+
+### Full game
+
+`./craftax_full_cuda train` ports the same on-device PPO stack to the
+full game (43 actions, 67 achievements, 9 floors): fused rollout with
+training storage, bootstrap value, GAE, full-batch advantage
+normalization, `k_ppo_backward`, and Adam, all resident on device. Per
+step each env stores a 996-byte compact obs record (792 packed-map
+bytes + the 51-float scalar tail -- the `CRAFTAX_WG_COMPACT_OBS_SIZE`
+layout, written independently of the obs build flag), its MinGRU state
+input, and action/logprob/value/reward/done. Backward recomputes the
+forward from the record bit-identically to the rollout (verified by a
+bitwise replay check in `gradcheck`): the encoder's active set is
+exactly the nonzero record entries, so the W_enc gradient scatters
+`x_f * dh_enc` into only the columns the forward touched. Unlike
+classic's one-hot features, full-game features are scalar-coded
+(block/item/mob ids) or continuous (inventory sqrt-scales, health,
+light level), so every active column's gradient is weighted by its
+actual feature value. `./craftax_full_cuda gradcheck` verifies all
+seven parameter segments against central finite differences of the
+PPO loss (max |fd-g| ~1.6e-4) plus the replay check; the training
+kernels leave the inference `run` path untouched (all six
+random-action anchors and both rollout-hash canonicals unchanged).
+
+Training runs at 3.0M SPS at 8k envs and 5.1M SPS at 65k envs on the
+RTX 3090 (vs 13.4M / 31.2M inference rollouts; ~62% of training time
+is the backward pass, ~37% the rollout). A 200M-step run (8192 envs,
+horizon 128, 191 iters) takes ~2.5-4 minutes depending on the update
+recipe.
+
+Learning at 200M steps (8192 envs, horizon 128, seed 42) with the
+hidden-32 policy, final-window episodic return (random actions ~1.2):
+
+| recipe (all `--epochs 3 --minibatches 8 --lr-anneal --gamma 0.995 --gae-lambda 0.90 --vf 2.0 --bptt-split 8`) | ret/ep | eplen | notes |
+|---|---:|---:|---|
+| lr 5e-3, ent 0.001 (classic-best) | 5.45 | 325 | entropy collapses to ~1.0, crafting dies |
+| lr 1e-3, ent 0.001 | 5.47 | 352 | same collapse, slower |
+| lr 2.5e-3, ent 0.01 | **5.79** | 354 | crafting tree stays alive |
+| lr 5e-3, ent 0.01 | 4.73 | 294 | too hot |
+| lr 1e-3, ent 0.01, full-batch e1 | 3.95 | 284 | conservative control |
+
+Unlike classic, the full game punishes the low entropy bonus: with ent
+0.001 the policy collapses into pure survival (eat_cow/wake_up/plant
+farming, zero tool crafting); ent 0.01 keeps entropy at ~2.0 and holds
+the crafting tree open. The best recipe's final window (56k episodes):
+wood pickaxe 8.7%, wood sword 4.0%, collect stone 3.7%, place stone
+2.9%, place furnace 3.0%, collect coal 0.5%, stone pickaxe/dungeon
+descent just emerging (0.02% / 0.12%) -- clearly beyond random
+(wood pickaxe 0.6%, stone 0.09%) but far from the full 67-achievement
+tree at this scale and capacity. There is no PufferLib baseline at
+these hypers for the full game; the classic-tuned coefficients
+transfer except for the entropy coefficient.
 
 ## Citation
 

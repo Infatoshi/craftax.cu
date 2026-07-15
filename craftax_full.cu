@@ -9866,6 +9866,625 @@ __global__ void k_nan_scan(
     }
 }
 
+// ============================================================
+// On-device PPO training (train / gradcheck modes).
+//
+// Per rollout step the training kernel stores, per env:
+//   - a 996-byte compact obs record (792 uint8 packed-map bytes +
+//     51 float scalar tail, the CRAFTAX_WG_COMPACT_OBS_SIZE layout):
+//     enough to recompute the 843-float encoder input bit-exactly,
+//     independent of CRAFTAX_COMPACT_OBS
+//   - the MinGRU state INPUT (post terminal-zeroing) [32 floats]
+//   - action, logprob, value, reward, done
+// Backward recomputes the forward from the record: the encoder's
+// active set is exactly the nonzero record entries (map features are
+// scalar-coded ids where x_f = (float)byte; tail features are
+// continuous floats used verbatim), so the W_enc gradient scatters
+// x_f * dh_enc into exactly the columns the forward touched.
+// Parameter layout is the flat CF_NN_* arena of the run path.
+// ============================================================
+#define CF_TRAIN_OBS ((int)CRAFTAX_WG_COMPACT_OBS_SIZE)  // 996
+
+// Encoder forward from a stored compact record. Feature order and fmaf
+// order match cf_nn_encoder_gather / k_policy_ref exactly (dense
+// ascending feature index, exact-zero terms skipped), so h_enc is
+// bit-identical to the value the rollout computed.
+static __device__ void cf_nn_encoder_from_record(
+    const uint8_t* __restrict__ rec, const float* __restrict__ W_enc,
+    const float* __restrict__ b_enc, float* h
+) {
+    float4 h4[CF_NN_HIDDEN / 4];
+    #pragma unroll
+    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
+        h4[b].x = b_enc[4 * b];
+        h4[b].y = b_enc[4 * b + 1];
+        h4[b].z = b_enc[4 * b + 2];
+        h4[b].w = b_enc[4 * b + 3];
+    }
+    for (int f = 0; f < CF_NN_MAP; f++) {
+        float x = (float)rec[f];
+        if (x == 0.0f) continue;
+        cf_nn_fma_col(h4, x, W_enc + (size_t)f * CF_NN_HIDDEN);
+    }
+    for (int j = 0; j < CF_NN_TAIL; j++) {
+        float x;
+        memcpy(&x, rec + CF_NN_MAP + 4 * j, sizeof(float));
+        if (x == 0.0f) continue;
+        cf_nn_fma_col(h4, x, W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN);
+    }
+    #pragma unroll
+    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
+        h[4 * b] = h4[b].x;
+        h[4 * b + 1] = h4[b].y;
+        h[4 * b + 2] = h4[b].z;
+        h[4 * b + 3] = h4[b].w;
+    }
+}
+
+// Fused rollout step with training storage: k_step_policy plus the
+// per-step record writes. The inference-only k_step_policy is untouched
+// (same math; runhash canonicals stay in their own universe).
+__global__ void k_step_policy_train(
+    Craftax* envs, CfWeights w, float* __restrict__ h_state, int num_envs,
+    CraftaxResetRec* resets,
+    uint8_t* __restrict__ r_obs,      // row t: [n][CF_TRAIN_OBS]
+    float* __restrict__ r_state_row,  // row t: [n][CF_NN_HIDDEN] state inputs
+    int32_t* __restrict__ r_act, float* __restrict__ r_logprob,
+    float* __restrict__ r_value, float* __restrict__ r_reward,
+    uint8_t* __restrict__ r_done,
+    uint64_t seed, uint64_t step_count
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_envs) return;
+    Craftax* env = &envs[i];
+    const CraftaxState* state = env->state;
+
+    craftax_encode_compact_observation(
+        (const CraftaxWorldState*)(const void*)state,
+        r_obs + (size_t)i * CF_TRAIN_OBS);
+
+    float h_enc[CF_NN_HIDDEN];
+    cf_nn_encoder_gather(state, w.W_enc, w.b_enc, h_enc);
+
+    float st[CF_NN_HIDDEN];
+    if (env->terminals[0] != 0.0f) {
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++) st[k] = 0.0f;
+    } else {
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++)
+            st[k] = h_state[(size_t)i * CF_NN_HIDDEN + k];
+    }
+    #pragma unroll
+    for (int k = 0; k < CF_NN_HIDDEN; k++)
+        r_state_row[(size_t)i * CF_NN_HIDDEN + k] = st[k];
+
+    float logits[CRAFTAX_NUM_ACTIONS], value, logprob;
+    cf_nn_head(h_enc, st, w.W_gru, w.W_a, w.b_a, w.W_v, w.b_v[0],
+               logits, &value);
+    curandStatePhilox4_32_10_t sampler;
+    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, (uint64_t)i, step_count,
+                &sampler);
+    int action = cf_nn_sample_action(logits, curand_uniform(&sampler),
+                                     &logprob);
+    r_act[i] = action;
+    r_logprob[i] = logprob;
+    r_value[i] = value;
+    #pragma unroll
+    for (int k = 0; k < CF_NN_HIDDEN; k++)
+        h_state[(size_t)i * CF_NN_HIDDEN + k] = st[k];
+    env->actions[0] = (float)action;
+
+    CraftaxThreefryKey reset_key;
+    bool done = c_step_gameplay_core(env, &reset_key);
+    if (done) {
+        int slot = atomicAdd(&g_reset_count, 1);
+        resets[slot].env = i;
+        resets[slot].key0 = reset_key.word[0];
+        resets[slot].key1 = reset_key.word[1];
+    }
+    r_reward[i] = env->rewards[0];
+    r_done[i] = done ? 1 : 0;
+}
+
+// Value of the current (post-rollout) env state: V(s_T) for the GAE
+// bootstrap. Envs that finished on the last step get masked by
+// (1 - done) in the GAE scan, so their (reset-state) value is unused.
+__global__ void k_nn_bootstrap(
+    Craftax* envs, CfWeights w, const float* __restrict__ h_state,
+    float* __restrict__ v_boot, int num_envs
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+    Craftax* env = &envs[e];
+    float h_enc[CF_NN_HIDDEN];
+    cf_nn_encoder_gather(env->state, w.W_enc, w.b_enc, h_enc);
+    float st[CF_NN_HIDDEN];
+    if (env->terminals[0] != 0.0f) {
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++) st[k] = 0.0f;
+    } else {
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++)
+            st[k] = h_state[(size_t)e * CF_NN_HIDDEN + k];
+    }
+    float logits[CRAFTAX_NUM_ACTIONS], value;
+    cf_nn_head(h_enc, st, w.W_gru, w.W_a, w.b_a, w.W_v, w.b_v[0],
+               logits, &value);
+    v_boot[e] = value;
+}
+
+// GAE scan, one thread per env, t = T-1 .. 0.
+__global__ void k_gae(
+    const float* __restrict__ values, const float* __restrict__ rewards,
+    const uint8_t* __restrict__ dones, const float* __restrict__ v_boot,
+    float* __restrict__ adv, float* __restrict__ ret,
+    int num_envs, int T, float gamma, float lam
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+    float A = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        size_t o = (size_t)t * num_envs + e;
+        float vnext = (t == T - 1) ? v_boot[e] : values[o + num_envs];
+        float nonterm = dones[o] ? 0.0f : 1.0f;
+        float delta = rewards[o] + gamma * vnext * nonterm - values[o];
+        A = delta + gamma * lam * nonterm * A;
+        adv[o] = A;
+        ret[o] = A + values[o];
+    }
+}
+
+// Sum and sum-of-squares (batch advantage normalization / reward logging).
+__global__ void k_adv_stats(
+    const float* __restrict__ adv, size_t count, double* __restrict__ stats  // [2]: sum, sumsq
+) {
+    __shared__ double s_sum[256], s_sq[256];
+    double sum = 0.0, sq = 0.0;
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += (size_t)gridDim.x * blockDim.x) {
+        double a = adv[i];
+        sum += a; sq += a * a;
+    }
+    s_sum[threadIdx.x] = sum; s_sq[threadIdx.x] = sq;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + w];
+            s_sq[threadIdx.x] += s_sq[threadIdx.x + w];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&stats[0], s_sum[0]);
+        atomicAdd(&stats[1], s_sq[0]);
+    }
+}
+
+static __device__ __forceinline__ float cf_nn_dg_mingru(float x) {  // d/dx of cf_nn_mingru_g
+    if (x >= 0.0f) return 1.0f;
+    float s = cf_nn_sigmoid(x);
+    return s * (1.0f - s);
+}
+
+// Replay check (gradcheck mode): recompute logprob/value at each stored
+// step from the record + stored state input and compare bitwise against
+// what the rollout stored. Proves the record encoder and stored-state
+// discipline reproduce the rollout forward exactly.
+__global__ void k_train_replay_check(
+    CfWeights w,
+    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob, const float* __restrict__ r_value,
+    const float* __restrict__ r_state,
+    int num_envs, int T, int* __restrict__ mismatches
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+    for (int t = 0; t < T; t++) {
+        size_t o = (size_t)t * num_envs + e;
+        float h_enc[CF_NN_HIDDEN], st[CF_NN_HIDDEN];
+        cf_nn_encoder_from_record(r_obs + o * CF_TRAIN_OBS, w.W_enc, w.b_enc,
+                                  h_enc);
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++)
+            st[k] = r_state[o * CF_NN_HIDDEN + k];
+        float logits[CRAFTAX_NUM_ACTIONS], value;
+        cf_nn_head(h_enc, st, w.W_gru, w.W_a, w.b_a, w.W_v, w.b_v[0],
+                   logits, &value);
+        float m = logits[0];
+        for (int a = 1; a < CRAFTAX_NUM_ACTIONS; a++) m = fmaxf(m, logits[a]);
+        float total = 0.0f;
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++)
+            total += expf(logits[a] - m);
+        float logprob = logits[r_act[o]] - m - logf(total);
+        if (__float_as_uint(value) != __float_as_uint(r_value[o])
+            || __float_as_uint(logprob) != __float_as_uint(r_logprob[o])) {
+            atomicAdd(mismatches, 1);
+        }
+    }
+}
+
+// PPO loss on stored rollout data (actions/old-logprobs/adv/ret fixed),
+// recomputing the recurrent forward from the stored t=0 state input so
+// the loss is a pure function of the parameters. Double accumulators:
+// this is the reference for finite-difference gradient checking.
+// losses[0] += policy loss, [1] += 0.5*(v-ret)^2, [2] += entropy
+// (all sums; host divides by n*T and applies coefficients).
+__global__ void k_ppo_loss(
+    CfWeights w,
+    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob, const uint8_t* __restrict__ r_done,
+    const float* __restrict__ r_state,   // [T][n][CF_NN_HIDDEN]; t=0 row used
+    const float* __restrict__ adv, const float* __restrict__ ret,
+    double* __restrict__ losses,
+    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the batch
+    int num_envs, int T, float clip_eps
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+
+    double inv_count = 1.0 / ((double)num_envs * T);
+    float adv_mean = (float)(adv_stats[0] * inv_count);
+    double var = adv_stats[1] * inv_count
+        - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
+    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+
+    float state[CF_NN_HIDDEN];
+    #pragma unroll
+    for (int k = 0; k < CF_NN_HIDDEN; k++)
+        state[k] = r_state[(size_t)e * CF_NN_HIDDEN + k];
+
+    double pg_sum = 0.0, v_sum = 0.0, ent_sum = 0.0;
+    for (int t = 0; t < T; t++) {
+        size_t o = (size_t)t * num_envs + e;
+        if (t > 0 && r_done[o - num_envs]) {
+            #pragma unroll
+            for (int k = 0; k < CF_NN_HIDDEN; k++) state[k] = 0.0f;
+        }
+        float h_enc[CF_NN_HIDDEN], logits[CRAFTAX_NUM_ACTIONS], value;
+        cf_nn_encoder_from_record(r_obs + o * CF_TRAIN_OBS, w.W_enc, w.b_enc,
+                                  h_enc);
+        cf_nn_head(h_enc, state, w.W_gru, w.W_a, w.b_a, w.W_v, w.b_v[0],
+                   logits, &value);
+
+        float mx = logits[0];
+        for (int a = 1; a < CRAFTAX_NUM_ACTIONS; a++) mx = fmaxf(mx, logits[a]);
+        float total = 0.0f;
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++)
+            total += expf(logits[a] - mx);
+        float lse = mx + logf(total);
+
+        float logp_new = logits[r_act[o]] - lse;
+        float ratio = expf(logp_new - r_logprob[o]);
+        float A = (adv[o] - adv_mean) * adv_inv_std;
+        float u1 = ratio * A;
+        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+        pg_sum += -fminf(u1, u2);
+
+        float dv = value - ret[o];
+        v_sum += 0.5 * (double)dv * (double)dv;
+
+        float H = 0.0f;
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+            float lp = logits[a] - lse;
+            H -= expf(lp) * lp;
+        }
+        ent_sum += H;
+    }
+    atomicAdd(&losses[0], pg_sum);
+    atomicAdd(&losses[1], v_sum);
+    atomicAdd(&losses[2], ent_sum);
+}
+
+static __device__ __forceinline__ float cf_warp_sum(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// PPO backward: one thread per (env, BPTT segment) walks its segment
+// t = t_hi-1 .. t_lo, recomputing the forward at each step from the
+// stored record and stored per-step state input (bit-identical to the
+// rollout), then backpropagating through heads, MinGRU (BPTT across
+// the horizon, cut at done boundaries and segment cuts), and the
+// encoder. Encoder backward is a scatter-add of x_f * dh_enc into the
+// active feature columns (nonzero record entries): the map features'
+// scalar ids and the continuous tail floats both take gradient through
+// their actual value x_f; the dense 843-float obs never exists.
+//
+// Dense grads (b_enc, W_gru, heads) are shuffle-reduced across the
+// warp so only lane 0 issues one atomicAdd per element; the W_enc
+// scatter is warp-cooperative and smem-staged (each lane's dh_enc is
+// staged, then the warp walks its 32 samples together: one coalesced
+// line-atomic per active feature). Both go into a per-block global
+// copy (grads + (blockIdx.x % grad_copies) * CF_NN_PARAM_COUNT);
+// k_adam reduces the copies. Out-of-range threads run the whole loop
+// with e clamped and zeroed gradients so warps stay converged at the
+// shuffles. Requires env_count % 32 == 0 and T % bptt_split == 0.
+//
+// Block is 128 (not 256): CfNNShared (18.2KB) + the [4][32][33] W_enc
+// staging tile (16.9KB) must fit sm_86's 48KB static smem.
+#define CF_BWD_BLOCK 128
+__global__ void k_ppo_backward(
+    CfWeights w,
+    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob, const uint8_t* __restrict__ r_done,
+    const float* __restrict__ r_state,   // [T][n][CF_NN_HIDDEN]
+    const float* __restrict__ adv, const float* __restrict__ ret,
+    float* __restrict__ grads, int grad_copies,
+    float* __restrict__ loss_acc,        // [3] or nullptr
+    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the FULL batch
+    int num_envs, int T,
+    int env_start, int env_count,  // minibatch = contiguous env range
+    int bptt_split,                // S segments per env (1 = exact)
+    float clip_eps, float vf_coef, float ent_coef
+) {
+    __shared__ CfNNShared snn;
+    __shared__ float sdh_all[CF_BWD_BLOCK / 32][32][32 + 1];
+    cf_nn_load_shared(&snn, w);
+    int lane = threadIdx.x & 31;
+    int et = blockIdx.x * blockDim.x + threadIdx.x;
+    bool active = et < env_count * bptt_split;
+    // clamp: inactive lanes run zeroed (env_count % 32 == 0 keeps every
+    // warp inside one segment, so warps stay converged at the shuffles)
+    if (!active) et = env_count * bptt_split - 1;
+    int seg = et / env_count;
+    int ei = et % env_count;
+    int e = env_start + ei;
+    int seg_len = T / bptt_split;
+    int t_lo = seg * seg_len;
+    int t_hi = t_lo + seg_len;
+
+    float* gr = grads + (size_t)(blockIdx.x % grad_copies) * CF_NN_PARAM_COUNT;
+
+    // Advantage normalization always uses full-batch stats; the loss
+    // mean is over the minibatch (env_count * T samples).
+    double inv_count = 1.0 / ((double)num_envs * T);
+    float inv_batch = (float)(1.0 / ((double)env_count * T));
+    float adv_mean = (float)(adv_stats[0] * inv_count);
+    double var = adv_stats[1] * inv_count
+        - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
+    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+
+    float dstate[CF_NN_HIDDEN];  // dL/d(state output of step t), carried backward
+    #pragma unroll
+    for (int k = 0; k < CF_NN_HIDDEN; k++) dstate[k] = 0.0f;
+
+    float pg_sum = 0.0f, v_sum = 0.0f, ent_sum = 0.0f;
+
+    for (int t = t_hi - 1; t >= t_lo; t--) {
+        size_t o = (size_t)t * num_envs + e;
+        const uint8_t* rec = r_obs + o * CF_TRAIN_OBS;
+
+        // ---- Recompute forward at step t ----
+        float h_enc[CF_NN_HIDDEN], s_in[CF_NN_HIDDEN];
+        cf_nn_encoder_from_record(rec, w.W_enc, snn.b_enc, h_enc);
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++)
+            s_in[k] = r_state[o * CF_NN_HIDDEN + k];
+
+        float hout[CF_NN_HIDDEN];
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++) {
+            float ah = 0.0f, ag = 0.0f, ap = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < CF_NN_HIDDEN; j++) {
+                ah = fmaf(snn.W_gru[k * CF_NN_HIDDEN + j], h_enc[j], ah);
+                ag = fmaf(snn.W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], ag);
+                ap = fmaf(snn.W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], ap);
+            }
+            float sg = cf_nn_sigmoid(ag);
+            float o_k = s_in[k] + sg * (cf_nn_mingru_g(ah) - s_in[k]);
+            float p = cf_nn_sigmoid(ap);
+            hout[k] = p * o_k + (1.0f - p) * h_enc[k];
+        }
+
+        float logits[CRAFTAX_NUM_ACTIONS], value;
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+            float z = snn.b_a[a];
+            #pragma unroll
+            for (int j = 0; j < CF_NN_HIDDEN; j++)
+                z = fmaf(snn.W_a[a * CF_NN_HIDDEN + j], hout[j], z);
+            logits[a] = z;
+        }
+        {
+            float z = snn.b_v;
+            #pragma unroll
+            for (int j = 0; j < CF_NN_HIDDEN; j++)
+                z = fmaf(snn.W_v[j], hout[j], z);
+            value = z;
+        }
+
+        // ---- Loss gradients at the heads ----
+        float mx = logits[0];
+        for (int a = 1; a < CRAFTAX_NUM_ACTIONS; a++) mx = fmaxf(mx, logits[a]);
+        float total = 0.0f, pi[CRAFTAX_NUM_ACTIONS];
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+            pi[a] = expf(logits[a] - mx);
+            total += pi[a];
+        }
+        float inv_total = 1.0f / total;
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) pi[a] *= inv_total;
+        float lse = mx + logf(total);
+
+        int act = r_act[o];
+        float logp_new = logits[act] - lse;
+        float ratio = expf(logp_new - r_logprob[o]);
+        float A = (adv[o] - adv_mean) * adv_inv_std;
+        float u1 = ratio * A;
+        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+        // d(-min(u1,u2))/dlogp_new: if min picks u1, -A*ratio; else the
+        // clamp is active and the gradient is blocked.
+        float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
+
+        float H = 0.0f;
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+            float lp = logits[a] - lse;
+            H -= pi[a] * lp;
+        }
+
+        float dvalue = inv_batch * vf_coef * (value - ret[o]);
+        float dlogits[CRAFTAX_NUM_ACTIONS];
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+            float d = dlogp * (((a == act) ? 1.0f : 0.0f) - pi[a]);  // policy term
+            d += ent_coef * pi[a] * ((logits[a] - lse) + H);         // d(-ent_coef*H)
+            dlogits[a] = d * inv_batch;
+        }
+        if (!active) {
+            dvalue = 0.0f;
+            for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) dlogits[a] = 0.0f;
+        }
+
+        if (active) {
+            pg_sum += -fminf(u1, u2);
+            v_sum += 0.5f * (value - ret[o]) * (value - ret[o]);
+            ent_sum += H;
+        }
+
+        // ---- Heads backward ----
+        float dhout[CF_NN_HIDDEN];
+        #pragma unroll
+        for (int j = 0; j < CF_NN_HIDDEN; j++) dhout[j] = dvalue * snn.W_v[j];
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+            float da = dlogits[a];
+            #pragma unroll
+            for (int j = 0; j < CF_NN_HIDDEN; j++) {
+                dhout[j] = fmaf(da, snn.W_a[a * CF_NN_HIDDEN + j], dhout[j]);
+                float g = cf_warp_sum(da * hout[j]);
+                if (lane == 0) atomicAdd(&gr[CF_NN_W_A + a * CF_NN_HIDDEN + j], g);
+            }
+            float gb = cf_warp_sum(da);
+            if (lane == 0) atomicAdd(&gr[CF_NN_B_A + a], gb);
+        }
+        #pragma unroll
+        for (int j = 0; j < CF_NN_HIDDEN; j++) {
+            float g = cf_warp_sum(dvalue * hout[j]);
+            if (lane == 0) atomicAdd(&gr[CF_NN_W_V + j], g);
+        }
+        {
+            float g = cf_warp_sum(dvalue);
+            if (lane == 0) atomicAdd(&gr[CF_NN_B_V], g);
+        }
+
+        // ---- MinGRU backward ----
+        bool done_t = r_done[o] != 0;  // done at t: step t+1's state input was zeroed
+        float dh_enc[CF_NN_HIDDEN];
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++) dh_enc[k] = 0.0f;
+
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++) {
+            // Recompute this unit's pre-activations (cheaper than
+            // carrying zh/zg/zp/out across the heads backward).
+            float ah = 0.0f, ag = 0.0f, ap = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < CF_NN_HIDDEN; j++) {
+                ah = fmaf(snn.W_gru[k * CF_NN_HIDDEN + j], h_enc[j], ah);
+                ag = fmaf(snn.W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], ag);
+                ap = fmaf(snn.W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], ap);
+            }
+            float p = cf_nn_sigmoid(ap);
+            float sg = cf_nn_sigmoid(ag);
+            float gh = cf_nn_mingru_g(ah);
+            float out_k = s_in[k] + sg * (gh - s_in[k]);
+
+            float dout = dhout[k] * p + (done_t ? 0.0f : dstate[k]);
+            float dp = dhout[k] * (out_k - h_enc[k]);
+            float dzp_k = dp * p * (1.0f - p);
+            dh_enc[k] += dhout[k] * (1.0f - p);
+
+            dstate[k] = dout * (1.0f - sg);  // ds_prev, safe in place
+            float dsg = dout * (gh - s_in[k]);
+            float dzg_k = dsg * sg * (1.0f - sg);
+            float dzh_k = dout * sg * cf_nn_dg_mingru(ah);
+
+            #pragma unroll
+            for (int j = 0; j < CF_NN_HIDDEN; j++) {
+                dh_enc[j] = fmaf(dzh_k, snn.W_gru[k * CF_NN_HIDDEN + j], dh_enc[j]);
+                dh_enc[j] = fmaf(dzg_k, snn.W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], dh_enc[j]);
+                dh_enc[j] = fmaf(dzp_k, snn.W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], dh_enc[j]);
+                float gh_ = cf_warp_sum(dzh_k * h_enc[j]);
+                float gg_ = cf_warp_sum(dzg_k * h_enc[j]);
+                float gp_ = cf_warp_sum(dzp_k * h_enc[j]);
+                if (lane == 0) {
+                    atomicAdd(&gr[CF_NN_W_GRU + k * CF_NN_HIDDEN + j], gh_);
+                    atomicAdd(&gr[CF_NN_W_GRU + (CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], gg_);
+                    atomicAdd(&gr[CF_NN_W_GRU + (2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], gp_);
+                }
+            }
+        }
+
+        // ---- Encoder backward: scatter dh_enc into active columns ----
+        #pragma unroll
+        for (int k = 0; k < CF_NN_HIDDEN; k++) {
+            float g = cf_warp_sum(dh_enc[k]);
+            if (lane == 0) atomicAdd(&gr[CF_NN_B_ENC + k], g);
+        }
+
+        // Warp-cooperative W_enc scatter: stage each lane's dh_enc in
+        // shared memory, then walk the warp's 32 samples together.
+        // For each active (nonzero) feature f of sample m, all 32
+        // lanes add x_f * sdh[m][lane] to the contiguous column
+        // gr[f*HIDDEN + lane]: one coalesced line-atomic per feature.
+        // Feature decode is uniform across the warp (every lane reads
+        // sample m's record, broadcast through L1).
+        {
+            float (*sdh)[32 + 1] = sdh_all[threadIdx.x >> 5];
+            int ebase = e - lane;
+            #pragma unroll
+            for (int k = 0; k < CF_NN_HIDDEN; k++) sdh[lane][k] = dh_enc[k];
+            __syncwarp();
+            for (int m = 0; m < 32 && ebase + m < env_start + env_count; m++) {
+                const uint8_t* rm =
+                    r_obs + ((size_t)t * num_envs + ebase + m) * CF_TRAIN_OBS;
+                float dv = sdh[m][lane];
+                float* gcol = gr + CF_NN_W_ENC + lane;
+                for (int f = 0; f < CF_NN_MAP; f++) {
+                    float x = (float)rm[f];
+                    if (x != 0.0f)
+                        atomicAdd(gcol + (size_t)f * CF_NN_HIDDEN, x * dv);
+                }
+                for (int j = 0; j < CF_NN_TAIL; j++) {
+                    float x;
+                    memcpy(&x, rm + CF_NN_MAP + 4 * j, sizeof(float));
+                    if (x != 0.0f)
+                        atomicAdd(gcol + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN,
+                                  x * dv);
+                }
+            }
+            __syncwarp();  // sdh reused next t
+        }
+    }
+
+    if (active && loss_acc) {
+        atomicAdd(&loss_acc[0], pg_sum);
+        atomicAdd(&loss_acc[1], v_sum);
+        atomicAdd(&loss_acc[2], ent_sum);
+    }
+}
+
+// Reduce per-block gradient copies, Adam-update the flat params, and
+// zero the copies for the next iteration. One thread per parameter.
+__global__ void k_adam(
+    float* __restrict__ params, float* __restrict__ grads, int grad_copies,
+    float* __restrict__ m, float* __restrict__ v,
+    int step, float lr, float beta1, float beta2, float eps
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= CF_NN_PARAM_COUNT) return;
+    float gsum = 0.0f;
+    for (int c = 0; c < grad_copies; c++) {
+        gsum += grads[(size_t)c * CF_NN_PARAM_COUNT + i];
+        grads[(size_t)c * CF_NN_PARAM_COUNT + i] = 0.0f;
+    }
+    float mi = beta1 * m[i] + (1.0f - beta1) * gsum;
+    float vi = beta2 * v[i] + (1.0f - beta2) * gsum * gsum;
+    m[i] = mi; v[i] = vi;
+    float mhat = mi / (1.0f - powf(beta1, (float)step));
+    float vhat = vi / (1.0f - powf(beta2, (float)step));
+    params[i] -= lr * mhat / (sqrtf(vhat) + eps);
+}
+
 typedef struct {
     int num_envs;
     Craftax* d_envs;
@@ -10648,6 +11267,497 @@ static int cu_run_rollout_verify(int num_envs, int num_steps, uint64_t seed) {
     return bad == 0 ? 0 : 1;
 }
 
+// ------------------------------------------------------------
+// train / gradcheck: on-device PPO (rollout -> bootstrap -> GAE ->
+// backward -> Adam), everything resident on device; the loop syncs
+// only to log. Ported from the classic trainer (main_classic.cu).
+// ------------------------------------------------------------
+typedef struct {
+    float lr, gamma, lam, clip, ent, vf;
+    int epochs;       // backward+adam passes per collected batch
+    int minibatches;  // contiguous env-range slices per epoch
+    int lr_anneal;    // 1: linear lr decay over the run
+    int bptt_split;   // BPTT segments per env in backward (1 = exact)
+} CuPPOConfig;
+
+static CuPPOConfig cu_ppo_defaults(void) {
+    CuPPOConfig cfg;
+    cfg.lr = 3e-4f; cfg.gamma = 0.99f; cfg.lam = 0.95f;
+    cfg.clip = 0.2f; cfg.ent = 0.01f; cfg.vf = 0.5f;
+    cfg.epochs = 1; cfg.minibatches = 1; cfg.lr_anneal = 0;
+    cfg.bptt_split = 1;
+    return cfg;
+}
+
+typedef struct {
+    CuVec* v;
+    CuPolicy* p;
+    CuPPOConfig cfg;
+    int n, T;
+    uint64_t seed;
+    uint64_t step_count;
+    uint8_t* r_obs;     // [T][n][CF_TRAIN_OBS]
+    float* r_state;     // [T][n][CF_NN_HIDDEN] per-step state inputs
+    int32_t* r_act;     // [T][n]
+    float* r_logprob;
+    float* r_value;
+    float* r_reward;
+    uint8_t* r_done;
+    float* grads;
+    int grad_copies;
+    float* adam_m;
+    float* adam_v;
+    float* v_boot;
+    float* adv;
+    float* ret;
+    float* loss_acc;    // [3] pg, v, ent sums (fp32, logging)
+    double* stats;      // [2] adv sum, sumsq
+    int adam_step;
+    int mb_envs;        // envs per minibatch
+    long total_updates; // adam steps over the whole run (lr anneal)
+    // Phase timers (CRAFTAX_CU_TRAIN_PROF=1: sync per phase)
+    int prof;
+    double t_rollout, t_gae, t_backward, t_adam;
+} CuTrain;
+
+static void cu_train_init(
+    CuTrain* tr, CuVec* v, CuPolicy* p, int T, uint64_t seed, CuPPOConfig cfg
+) {
+    memset(tr, 0, sizeof(*tr));
+    tr->v = v; tr->p = p; tr->cfg = cfg;
+    tr->n = v->num_envs; tr->T = T; tr->seed = seed;
+    if (tr->n % 32 != 0) {
+        fprintf(stderr, "train: --envs must be a multiple of 32\n");
+        exit(1);
+    }
+    if (cfg.minibatches < 1 || tr->n % cfg.minibatches != 0) {
+        fprintf(stderr, "--minibatches must divide num_envs (%d %% %d != 0)\n",
+                tr->n, cfg.minibatches);
+        exit(1);
+    }
+    tr->mb_envs = tr->n / cfg.minibatches;
+    if (cfg.bptt_split < 1 || T % cfg.bptt_split != 0
+        || tr->mb_envs % 32 != 0) {
+        fprintf(stderr, "--bptt-split must divide horizon (%d %% %d != 0), "
+                "and envs/minibatch must be a multiple of 32\n",
+                T, cfg.bptt_split);
+        exit(1);
+    }
+    size_t nt = (size_t)tr->n * T;
+    CU_CHECK(cudaMalloc(&tr->r_obs, nt * CF_TRAIN_OBS));
+    CU_CHECK(cudaMalloc(&tr->r_state, nt * CF_NN_HIDDEN * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->r_act, nt * sizeof(int32_t)));
+    CU_CHECK(cudaMalloc(&tr->r_logprob, nt * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->r_value, nt * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->r_reward, nt * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->r_done, nt));
+    CU_CHECK(cudaMemset(tr->r_done, 0, nt));
+    int grid = (int)(((size_t)tr->mb_envs * cfg.bptt_split + CF_BWD_BLOCK - 1)
+                     / CF_BWD_BLOCK);
+    tr->grad_copies = grid < 512 ? grid : 512;
+    CU_CHECK(cudaMalloc(&tr->grads,
+                        (size_t)tr->grad_copies * CF_NN_PARAM_COUNT * sizeof(float)));
+    CU_CHECK(cudaMemset(tr->grads, 0,
+                        (size_t)tr->grad_copies * CF_NN_PARAM_COUNT * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->adam_m, CF_NN_PARAM_COUNT * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->adam_v, CF_NN_PARAM_COUNT * sizeof(float)));
+    CU_CHECK(cudaMemset(tr->adam_m, 0, CF_NN_PARAM_COUNT * sizeof(float)));
+    CU_CHECK(cudaMemset(tr->adam_v, 0, CF_NN_PARAM_COUNT * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->v_boot, tr->n * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->adv, nt * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->ret, nt * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->loss_acc, 3 * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->stats, 2 * sizeof(double)));
+    const char* prof = getenv("CRAFTAX_CU_TRAIN_PROF");
+    tr->prof = prof != NULL && atoi(prof) != 0;
+}
+
+static void cu_train_free(CuTrain* tr) {
+    cudaFree(tr->r_obs); cudaFree(tr->r_state); cudaFree(tr->r_act);
+    cudaFree(tr->r_logprob); cudaFree(tr->r_value); cudaFree(tr->r_reward);
+    cudaFree(tr->r_done);
+    cudaFree(tr->grads); cudaFree(tr->adam_m); cudaFree(tr->adam_v);
+    cudaFree(tr->v_boot); cudaFree(tr->adv); cudaFree(tr->ret);
+    cudaFree(tr->loss_acc); cudaFree(tr->stats);
+}
+
+static double cu_prof_mark(CuTrain* tr) {
+    if (!tr->prof) return 0.0;
+    CU_CHECK(cudaDeviceSynchronize());
+    return cf_now_s();
+}
+
+// Rollout + advantage pipeline (no param update).
+static void cu_train_collect(CuTrain* tr) {
+    CuVec* v = tr->v;
+    CuPolicy* p = tr->p;
+    int n = tr->n;
+    double t0 = cu_prof_mark(tr);
+    for (int t = 0; t < tr->T; t++) {
+        size_t o = (size_t)t * n;
+        CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int)));
+        CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int)));
+        k_step_policy_train<<<(n + 63) / 64, 64>>>(
+            v->d_envs, p->w, p->h_state, n, v->d_resets,
+            tr->r_obs + o * CF_TRAIN_OBS,
+            tr->r_state + o * CF_NN_HIDDEN,
+            tr->r_act + o, tr->r_logprob + o, tr->r_value + o,
+            tr->r_reward + o, tr->r_done + o,
+            tr->seed, tr->step_count);
+        {
+            int tail_blocks = (n * 32 + 255) / 256;
+            if (tail_blocks > 512) tail_blocks = 512;
+            k_spawn_tail<<<tail_blocks, 256>>>();
+        }
+        if (v->lazy) {
+            k_reset_list_warp<<<n, 32>>>(v->d_envs, v->d_resets);
+        } else {
+            k_reset_list<<<(n + 63) / 64, 64>>>(v->d_envs, v->d_resets);
+        }
+        CU_CHECK(cudaGetLastError());
+        tr->step_count++;
+    }
+    double t1 = cu_prof_mark(tr);
+    k_nn_bootstrap<<<(n + 63) / 64, 64>>>(
+        v->d_envs, p->w, p->h_state, tr->v_boot, n);
+    k_gae<<<(n + 255) / 256, 256>>>(
+        tr->r_value, tr->r_reward, tr->r_done, tr->v_boot, tr->adv, tr->ret,
+        n, tr->T, tr->cfg.gamma, tr->cfg.lam);
+    CU_CHECK(cudaMemsetAsync(tr->stats, 0, 2 * sizeof(double)));
+    k_adv_stats<<<256, 256>>>(tr->adv, (size_t)n * tr->T, tr->stats);
+    CU_CHECK(cudaGetLastError());
+    double t2 = cu_prof_mark(tr);
+    tr->t_rollout += t1 - t0;
+    tr->t_gae += t2 - t1;
+}
+
+// Backward over a contiguous env range [env_start, env_start+env_count).
+static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
+    int grid = (int)(((size_t)env_count * tr->cfg.bptt_split + CF_BWD_BLOCK - 1)
+                     / CF_BWD_BLOCK);
+    k_ppo_backward<<<grid, CF_BWD_BLOCK>>>(
+        tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
+        tr->r_state, tr->adv, tr->ret, tr->grads, tr->grad_copies,
+        tr->loss_acc, tr->stats, tr->n, tr->T, env_start, env_count,
+        tr->cfg.bptt_split, tr->cfg.clip, tr->cfg.vf, tr->cfg.ent);
+    CU_CHECK(cudaGetLastError());
+}
+
+static void cu_train_adam(CuTrain* tr) {
+    tr->adam_step++;
+    float lr = tr->cfg.lr;
+    if (tr->cfg.lr_anneal && tr->total_updates > 0)
+        lr *= 1.0f - (float)(tr->adam_step - 1) / (float)tr->total_updates;
+    k_adam<<<(CF_NN_PARAM_COUNT + 255) / 256, 256>>>(
+        tr->p->params, tr->grads, tr->grad_copies, tr->adam_m, tr->adam_v,
+        tr->adam_step, lr, 0.9f, 0.999f, 1e-8f);
+    CU_CHECK(cudaGetLastError());
+}
+
+static void cu_train_update(CuTrain* tr) {
+    cu_train_collect(tr);
+    for (int e = 0; e < tr->cfg.epochs; e++) {
+        // loss_acc accumulates over the epoch's minibatches; the log
+        // line after update reports the last epoch's full-batch sums.
+        CU_CHECK(cudaMemsetAsync(tr->loss_acc, 0, 3 * sizeof(float)));
+        for (int m = 0; m < tr->cfg.minibatches; m++) {
+            double t0 = cu_prof_mark(tr);
+            cu_train_backward(tr, m * tr->mb_envs, tr->mb_envs);
+            double t1 = cu_prof_mark(tr);
+            cu_train_adam(tr);
+            double t2 = cu_prof_mark(tr);
+            tr->t_backward += t1 - t0;
+            tr->t_adam += t2 - t1;
+        }
+    }
+}
+
+// Total PPO loss over the stored rollout at the current params
+// (recomputes the recurrent forward; used by gradcheck FD).
+static double cu_train_loss(CuTrain* tr) {
+    double zero[3] = {0, 0, 0};
+    double* d_losses;
+    CU_CHECK(cudaMalloc(&d_losses, 3 * sizeof(double)));
+    CU_CHECK(cudaMemcpy(d_losses, zero, 24, cudaMemcpyHostToDevice));
+    k_ppo_loss<<<(tr->n + 255) / 256, 256>>>(
+        tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
+        tr->r_state, tr->adv, tr->ret, d_losses, tr->stats,
+        tr->n, tr->T, tr->cfg.clip);
+    CU_CHECK(cudaGetLastError());
+    double h[3];
+    CU_CHECK(cudaMemcpy(h, d_losses, 24, cudaMemcpyDeviceToHost));
+    cudaFree(d_losses);
+    double count = (double)tr->n * tr->T;
+    return (h[0] + tr->cfg.vf * h[1] - tr->cfg.ent * h[2]) / count;
+}
+
+static const char* CU_ACH_NAMES[CRAFTAX_NUM_ACHIEVEMENTS] = {
+    "collect_wood", "place_table", "eat_cow", "collect_sapling",
+    "collect_drink", "make_wood_pickaxe", "make_wood_sword", "place_plant",
+    "defeat_zombie", "collect_stone", "place_stone", "eat_plant",
+    "defeat_skeleton", "make_stone_pickaxe", "make_stone_sword", "wake_up",
+    "place_furnace", "collect_coal", "collect_iron", "collect_diamond",
+    "make_iron_pickaxe", "make_iron_sword", "make_arrow", "make_torch",
+    "place_torch", "make_diamond_sword", "make_iron_armour",
+    "make_diamond_armour", "enter_gnomish_mines", "enter_dungeon",
+    "enter_sewers", "enter_vault", "enter_troll_mines", "enter_fire_realm",
+    "enter_ice_realm", "enter_graveyard", "defeat_gnome_warrior",
+    "defeat_gnome_archer", "defeat_orc_soldier", "defeat_orc_mage",
+    "defeat_lizard", "defeat_kobold", "defeat_troll", "defeat_deep_thing",
+    "defeat_pigman", "defeat_fire_elemental", "defeat_frost_troll",
+    "defeat_ice_elemental", "damage_necromancer", "defeat_necromancer",
+    "eat_bat", "eat_snail", "find_bow", "fire_bow", "collect_sapphire",
+    "learn_fireball", "cast_fireball", "learn_iceball", "cast_iceball",
+    "collect_ruby", "make_diamond_pickaxe", "open_chest", "drink_potion",
+    "enchant_sword", "enchant_armour", "defeat_knight", "defeat_archer",
+};
+
+// Sum the per-env Logs (cumulative episode stats maintained by
+// c_step_gameplay_core / add_log) into host doubles.
+static void cu_sum_logs(
+    CuVec* v, Craftax* h_envs, double* episodes, double* ep_len,
+    double* ep_ret, double* ach  // ach[CRAFTAX_NUM_ACHIEVEMENTS]
+) {
+    CU_CHECK(cudaMemcpy(h_envs, v->d_envs,
+                        (size_t)v->num_envs * sizeof(Craftax),
+                        cudaMemcpyDeviceToHost));
+    *episodes = 0.0; *ep_len = 0.0; *ep_ret = 0.0;
+    for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++) ach[a] = 0.0;
+    for (int i = 0; i < v->num_envs; i++) {
+        const Log* log = &h_envs[i].log;
+        *episodes += (double)log->n;
+        *ep_len += (double)log->episode_length;
+        *ep_ret += (double)log->score;
+        for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++)
+            ach[a] += (double)log->achievements[a];
+    }
+}
+
+static int cu_run_train(
+    int num_envs, int T, int iters, uint64_t seed, CuPPOConfig cfg
+) {
+    CuVec v;
+    cu_vec_init(&v, num_envs, seed);
+    CuPolicy p;
+    cu_policy_init(&p, num_envs);
+    CuTrain tr;
+    cu_train_init(&tr, &v, &p, T, seed, cfg);
+    tr.total_updates = (long)iters * cfg.epochs * cfg.minibatches;
+
+    printf("train: envs=%d horizon=%d iters=%d seed=%llu lr=%g gamma=%g "
+           "lam=%g clip=%g ent=%g vf=%g epochs=%d minibatches=%d "
+           "lr_anneal=%d bptt_split=%d\n",
+           num_envs, T, iters, (unsigned long long)seed, cfg.lr, cfg.gamma,
+           cfg.lam, cfg.clip, cfg.ent, cfg.vf, cfg.epochs, cfg.minibatches,
+           cfg.lr_anneal, cfg.bptt_split);
+
+    Craftax* h_envs = (Craftax*)malloc((size_t)num_envs * sizeof(Craftax));
+    double ep0, len0, ret0, ach0[CRAFTAX_NUM_ACHIEVEMENTS];
+    double ep1, len1, ret1, ach1[CRAFTAX_NUM_ACHIEVEMENTS];
+    cu_sum_logs(&v, h_envs, &ep0, &len0, &ret0, ach0);
+    double run_ep0 = ep0, run_len0 = len0, run_ret0 = ret0;
+    double run_ach0[CRAFTAX_NUM_ACHIEVEMENTS];
+    memcpy(run_ach0, ach0, sizeof(run_ach0));
+
+    // Final-window achievement snapshot (last ~10% of the run).
+    int fw_start = iters - iters / 10;
+    double fw_ep0 = ep0, fw_len0 = len0, fw_ret0 = ret0;
+    double fw_ach0[CRAFTAX_NUM_ACHIEVEMENTS];
+    memcpy(fw_ach0, ach0, sizeof(fw_ach0));
+    int fw_taken = 0;
+
+    double* rew_stats;
+    CU_CHECK(cudaMalloc(&rew_stats, 2 * sizeof(double)));
+    double t0 = cf_now_s();
+    size_t steps_done = 0;
+    for (int it = 1; it <= iters; it++) {
+        cu_train_update(&tr);
+        steps_done += (size_t)num_envs * T;
+        if (!fw_taken && it >= fw_start) {
+            cu_sum_logs(&v, h_envs, &fw_ep0, &fw_len0, &fw_ret0, fw_ach0);
+            fw_taken = 1;
+        }
+        if (it == 1 || it % 10 == 0 || it == iters) {
+            CU_CHECK(cudaMemsetAsync(rew_stats, 0, 16));
+            k_adv_stats<<<256, 256>>>(tr.r_reward, (size_t)num_envs * T,
+                                      rew_stats);
+            float h_loss[3];
+            double h_rew[2];
+            CU_CHECK(cudaMemcpy(h_loss, tr.loss_acc, 12, cudaMemcpyDeviceToHost));
+            CU_CHECK(cudaMemcpy(h_rew, rew_stats, 16, cudaMemcpyDeviceToHost));
+            cu_sum_logs(&v, h_envs, &ep1, &len1, &ret1, ach1);
+            double eps_w = ep1 - ep0;
+            double count = (double)num_envs * T;
+            double sps = steps_done / (cf_now_s() - t0);
+            double eplen = eps_w > 0.0 ? (len1 - len0) / eps_w : 0.0;
+            double retep = eps_w > 0.0 ? (ret1 - ret0) / eps_w : 0.0;
+            printf("iter %5d  %7.2f M SPS  pg %+.4f  vf %8.4f  ent %6.3f  "
+                   "rew/step %+.5f  ret/ep %+.3f  eplen %6.0f  eps %.0f\n",
+                   it, sps / 1e6, h_loss[0] / count, h_loss[1] / count,
+                   h_loss[2] / count, h_rew[0] / count, retep, eplen, eps_w);
+            fflush(stdout);
+            ep0 = ep1; len0 = len1; ret0 = ret1;
+        }
+    }
+    double dt = cf_now_s() - t0;
+    printf("train done: %.1f s, %.2f M SPS overall\n",
+           dt, steps_done / dt / 1e6);
+    if (tr.prof) {
+        double tt = tr.t_rollout + tr.t_gae + tr.t_backward + tr.t_adam;
+        printf("phase breakdown: rollout %.2fs (%.1f%%)  gae %.2fs (%.1f%%)  "
+               "backward %.2fs (%.1f%%)  adam %.2fs (%.1f%%)\n",
+               tr.t_rollout, 100.0 * tr.t_rollout / tt,
+               tr.t_gae, 100.0 * tr.t_gae / tt,
+               tr.t_backward, 100.0 * tr.t_backward / tt,
+               tr.t_adam, 100.0 * tr.t_adam / tt);
+    }
+    cu_sum_logs(&v, h_envs, &ep1, &len1, &ret1, ach1);
+    double eps_total = ep1 - run_ep0;
+    if (eps_total > 0.0) {
+        printf("run totals: %.0f episodes  ret/ep %+.3f  eplen %.0f\n",
+               eps_total, (ret1 - run_ret0) / eps_total,
+               (len1 - run_len0) / eps_total);
+        printf("achievement rates over %.0f episodes (nonzero only):\n",
+               eps_total);
+        for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++) {
+            double r = (ach1[a] - run_ach0[a]) / eps_total;
+            if (r > 0.0) printf("  %-24s %8.4f\n", CU_ACH_NAMES[a], r);
+        }
+    }
+    double fw_eps = ep1 - fw_ep0;
+    if (fw_taken && fw_eps > 0.0) {
+        printf("final window (iters %d..%d): %.0f episodes  ret/ep %+.3f  "
+               "eplen %.0f\n", fw_start, iters, fw_eps,
+               (ret1 - fw_ret0) / fw_eps, (len1 - fw_len0) / fw_eps);
+        printf("final-window achievement rates (nonzero only):\n");
+        for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++) {
+            double r = (ach1[a] - fw_ach0[a]) / fw_eps;
+            if (r > 0.0) printf("  %-24s %8.4f\n", CU_ACH_NAMES[a], r);
+        }
+    }
+    cudaFree(rew_stats);
+    free(h_envs);
+    cu_train_free(&tr);
+    cu_policy_free(&p);
+    cu_vec_free(&v);
+    return 0;
+}
+
+// Analytic gradients vs central finite differences of the PPO loss on
+// a small fixed rollout. The loss treats actions, old logprobs, and
+// advantages as constants, so it is a pure function of the parameters
+// and FD is exact up to fp32 forward noise.
+static int cu_run_gradcheck(uint64_t seed) {
+    const int n = 64, T = 8;
+    CuVec v;
+    cu_vec_init(&v, n, seed);
+    CuPolicy p;
+    cu_policy_init(&p, n);
+    CuPPOConfig cfg = cu_ppo_defaults();
+    CuTrain tr;
+    cu_train_init(&tr, &v, &p, T, seed, cfg);
+    cu_train_collect(&tr);
+
+    // Replay fidelity: recomputed forward from the stored records must
+    // be bitwise identical to what the rollout stored.
+    {
+        int* d_mis;
+        CU_CHECK(cudaMalloc(&d_mis, sizeof(int)));
+        CU_CHECK(cudaMemset(d_mis, 0, sizeof(int)));
+        k_train_replay_check<<<(n + 63) / 64, 64>>>(
+            p.w, tr.r_obs, tr.r_act, tr.r_logprob, tr.r_value, tr.r_state,
+            n, T, d_mis);
+        CU_CHECK(cudaGetLastError());
+        int mis = 0;
+        CU_CHECK(cudaMemcpy(&mis, d_mis, sizeof(int), cudaMemcpyDeviceToHost));
+        cudaFree(d_mis);
+        printf("record replay: %s (%d/%d env-steps mismatching)\n",
+               mis == 0 ? "EXACT" : "MISMATCH", mis, n * T);
+        if (mis != 0) { printf("gradcheck: FAIL (replay)\n"); return 1; }
+    }
+
+    CU_CHECK(cudaMemsetAsync(tr.loss_acc, 0, 3 * sizeof(float)));
+    cu_train_backward(&tr, 0, n);
+    CU_CHECK(cudaDeviceSynchronize());
+
+    size_t gc = (size_t)tr.grad_copies * CF_NN_PARAM_COUNT;
+    float* g_all = (float*)malloc(gc * sizeof(float));
+    CU_CHECK(cudaMemcpy(g_all, tr.grads, gc * 4, cudaMemcpyDeviceToHost));
+    double* g = (double*)calloc(CF_NN_PARAM_COUNT, sizeof(double));
+    for (int c = 0; c < tr.grad_copies; c++)
+        for (int i = 0; i < CF_NN_PARAM_COUNT; i++)
+            g[i] += g_all[(size_t)c * CF_NN_PARAM_COUNT + i];
+
+    struct Seg { const char* name; int off, count; };
+    struct Seg segs[7] = {
+        {"W_enc", CF_NN_W_ENC, CF_NN_OBS * CF_NN_HIDDEN},
+        {"b_enc", CF_NN_B_ENC, CF_NN_HIDDEN},
+        {"W_gru", CF_NN_W_GRU, CF_NN_GRU * CF_NN_HIDDEN},
+        {"W_a",   CF_NN_W_A,   CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN},
+        {"b_a",   CF_NN_B_A,   CRAFTAX_NUM_ACTIONS},
+        {"W_v",   CF_NN_W_V,   CF_NN_HIDDEN},
+        {"b_v",   CF_NN_B_V,   1},
+    };
+    uint64_t rng = 0x12345678ULL;
+    int fail = 0;
+    for (int si = 0; si < 7; si++) {
+        const struct Seg* s = &segs[si];
+        double gnorm = 0.0;
+        for (int i = 0; i < s->count; i++) gnorm += fabs(g[s->off + i]);
+        double max_rel = 0.0, max_diff = 0.0;
+        // Check the 8 largest-|g| params (FD can resolve their relative
+        // error) plus 16 random ones (absolute agreement).
+        int* idx = (int*)malloc(s->count * sizeof(int));
+        for (int i = 0; i < s->count; i++) idx[i] = s->off + i;
+        int topk = s->count < 8 ? s->count : 8;
+        for (int a = 0; a < topk; a++) {   // partial selection sort
+            int best = a;
+            for (int b = a + 1; b < s->count; b++)
+                if (fabs(g[idx[b]]) > fabs(g[idx[best]])) best = b;
+            int tmp = idx[a]; idx[a] = idx[best]; idx[best] = tmp;
+        }
+        int checks = s->count < 24 ? s->count : 24;
+        for (int c = 0; c < checks; c++) {
+            int i;
+            if (c < topk) i = idx[c];
+            else {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                i = s->off + (int)((rng >> 33) % s->count);
+            }
+            float theta;
+            CU_CHECK(cudaMemcpy(&theta, p.params + i, 4, cudaMemcpyDeviceToHost));
+            float h = 1e-3f * fmaxf(fabsf(theta), 0.1f);
+            float tp = theta + h, tm = theta - h;
+            CU_CHECK(cudaMemcpy(p.params + i, &tp, 4, cudaMemcpyHostToDevice));
+            double lp = cu_train_loss(&tr);
+            CU_CHECK(cudaMemcpy(p.params + i, &tm, 4, cudaMemcpyHostToDevice));
+            double lm = cu_train_loss(&tr);
+            CU_CHECK(cudaMemcpy(p.params + i, &theta, 4, cudaMemcpyHostToDevice));
+            double fd = (lp - lm) / (2.0 * (double)(tp - tm) * 0.5);
+            double diff = fabs(fd - g[i]);
+            double scale = fabs(fd) > fabs(g[i]) ? fabs(fd) : fabs(g[i]);
+            double rel = diff / (scale > 1e-8 ? scale : 1e-8);
+            if (diff > max_diff) max_diff = diff;
+            if (diff > 2e-4 && rel > max_rel) max_rel = rel;
+            if (diff > 2e-4 && rel > 3e-2) {
+                printf("  MISMATCH %s[%d]: analytic %.6e  fd %.6e\n",
+                       s->name, i - s->off, g[i], fd);
+                fail = 1;
+            }
+        }
+        printf("%-6s mean|g| %.3e  max |fd-g| %.3e  max rel err %.4f  (%d sampled)\n",
+               s->name, gnorm / s->count, max_diff, max_rel, checks);
+        if (gnorm == 0.0) { printf("  FAIL: all-zero gradient segment\n"); fail = 1; }
+        free(idx);
+    }
+    printf("gradcheck: envs=%d steps=%d  =>  %s\n", n, T, fail ? "FAIL" : "PASS");
+    free(g_all); free(g);
+    cu_train_free(&tr);
+    cu_policy_free(&p);
+    cu_vec_free(&v);
+    return fail;
+}
+
 static void cu_usage(const char* prog) {
     fprintf(stderr,
             "usage: %s hash  [--envs N] [--steps M] [--seed S]\n"
@@ -10656,8 +11766,13 @@ static void cu_usage(const char* prog) {
             "       %s bench [--envs N] [--iters M] [--seed S]\n"
             "       %s run       [--envs N] [--iters M] [--seed S] [--fused 0|1]\n"
             "       %s runhash   [--envs N] [--steps M] [--seed S] [--fused 0|1]\n"
-            "       %s runverify [--envs N] [--steps M] [--seed S]\n",
-            prog, prog, prog, prog, prog, prog, prog);
+            "       %s runverify [--envs N] [--steps M] [--seed S]\n"
+            "       %s train     [--envs N] [--horizon T] [--iters M] [--seed S]\n"
+            "                    [--lr F] [--gamma F] [--gae-lambda F] [--clip F]\n"
+            "                    [--ent F] [--vf F] [--epochs N] [--minibatches M]\n"
+            "                    [--bptt-split S] [--lr-anneal]\n"
+            "       %s gradcheck [--seed S]\n",
+            prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char** argv) {
@@ -10665,24 +11780,38 @@ int main(int argc, char** argv) {
     const char* mode = argv[1];
     int envs = !strcmp(mode, "bench") ? 8192 : 64;
     if (!strncmp(mode, "run", 3)) envs = !strcmp(mode, "runverify") ? 1024 : 65536;
+    if (!strcmp(mode, "train")) envs = 8192;
     int iters = 1000;
     int steps = 2000;
+    int horizon = 128;
     uint64_t seed = 42;
     const char* dump = NULL;
     int max_report = 40;
     int fused = 0;
+    CuPPOConfig cfg = cu_ppo_defaults();
 
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--envs") && i + 1 < argc) envs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fused") && i + 1 < argc) fused = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--horizon") && i + 1 < argc) horizon = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
         else if (!strcmp(argv[i], "--max-report") && i + 1 < argc) max_report = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--lr") && i + 1 < argc) cfg.lr = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gamma") && i + 1 < argc) cfg.gamma = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gae-lambda") && i + 1 < argc) cfg.lam = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--clip") && i + 1 < argc) cfg.clip = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--ent") && i + 1 < argc) cfg.ent = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--vf") && i + 1 < argc) cfg.vf = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--epochs") && i + 1 < argc) cfg.epochs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--minibatches") && i + 1 < argc) cfg.minibatches = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bptt-split") && i + 1 < argc) cfg.bptt_split = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--lr-anneal")) cfg.lr_anneal = 1;
         else { cu_usage(argv[0]); return 1; }
     }
-    if (envs <= 0 || iters <= 0 || steps <= 0) { cu_usage(argv[0]); return 1; }
+    if (envs <= 0 || iters <= 0 || steps <= 0 || horizon <= 0) { cu_usage(argv[0]); return 1; }
 
     if (!strcmp(mode, "hash")) return cu_run_hash(envs, steps, seed);
     if (!strcmp(mode, "cmp")) {
@@ -10698,6 +11827,10 @@ int main(int argc, char** argv) {
         return cu_run_rollout_hash(envs, steps == 2000 ? 500 : steps, seed, fused);
     if (!strcmp(mode, "runverify"))
         return cu_run_rollout_verify(envs, steps == 2000 ? 128 : steps, seed);
+    if (!strcmp(mode, "train"))
+        return cu_run_train(envs, horizon, iters == 1000 ? 200 : iters, seed, cfg);
+    if (!strcmp(mode, "gradcheck"))
+        return cu_run_gradcheck(seed);
     cu_usage(argv[0]);
     return 1;
 }
