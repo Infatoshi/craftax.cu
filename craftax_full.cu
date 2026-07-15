@@ -26,6 +26,7 @@
 #include <cmath>
 #include <ctime>
 #include <cuda_runtime.h>
+#include <curand_kernel.h>  // policy weight init + action sampling (run mode)
 
 // [cuda port] compatibility shims for the transformed C body below.
 // gcc atomics: only touched by the single-threaded global-init kernel and
@@ -8698,6 +8699,263 @@ static __device__ inline void craftax_spawn_ranged_mob(
     CF_BITS(mob_bits, level, row, state) |= (1ULL << col);
 }
 
+// [cuda port] Spawn request compaction: the prologue below (RNG draws, type
+// writes, try_* probability rolls) runs for every env every step, but the
+// span scans only run for the rare envs whose rolls succeed (~1 in 40 under
+// random actions). Inline, those scans make every warp pay the full
+// divergent cost. When g_cf_spawn_queue is set (split-kernel path), envs
+// that would scan are appended to a compacted worklist instead and
+// k_spawn_tail processes them densely between k_step and the reset kernel.
+// Bit-exactness: the scans read only spawn_{all,grave,water}_bits, mob_bits
+// and player_position; no phase after spawn_mobs in the step mutates any of
+// those (update_plants only toggles PLANT/RIPE_PLANT, which are in no spawn
+// mask, and its set_map_block rewrites recompute identical bit values), so
+// running the tail after k_step reads exactly the same inputs. Per-env
+// writes are independent, so worklist order does not matter. Envs that
+// finish this step still get their spawn writes before the reset kernel
+// wipes them -- same net state as the inline order.
+typedef struct CraftaxSpawnRec {
+    int32_t env;
+    uint32_t pkey0, pkey1;   // passive_pos_key
+    uint32_t mkey0, mkey1;   // melee_pos_key
+    uint32_t rkey0, rkey1;   // ranged_pos_key
+    uint8_t level;
+    uint8_t flags;           // bit0 try_passive, bit1 try_melee,
+                             // bit2 try_ranged, bit3 fighting_boss
+    uint8_t pslot, mslot, rslot;
+    uint8_t ptype, mtype, rtype;
+} CraftaxSpawnRec;
+
+__device__ CraftaxSpawnRec* g_cf_spawn_queue = NULL;  // NULL => inline tail
+__device__ int g_cf_spawn_count = 0;
+
+static __device__ inline void craftax_spawn_mobs_tail(
+    CraftaxState* state, int32_t level, bool fighting_boss,
+    bool try_passive, bool try_melee, bool try_ranged,
+    int32_t passive_slot, int32_t melee_slot, int32_t ranged_slot,
+    int32_t passive_type, int32_t melee_type, int32_t ranged_type,
+    CraftaxThreefryKey passive_pos_key, CraftaxThreefryKey melee_pos_key,
+    CraftaxThreefryKey ranged_pos_key
+) {
+    // [cuda port] The list-building multi-spawn path (scan_all into 8KB of
+    // per-thread CraftaxSpawnLists + pick_excluding) is replaced by three
+    // sequential span scans. Each successful spawn sets its mob_bits bit
+    // before the next scan runs, which removes exactly the coordinates that
+    // pick_excluding excluded; iteration order and the k-th pick arithmetic
+    // are unchanged, so the chosen cells are bit-identical.
+    craftax_spawn_init_offsets_once();
+
+    bool passive_spawned = false;
+    int32_t passive_row = 0;
+    int32_t passive_col = 0;
+    if (try_passive && craftax_spawn_scan_passive(
+            state, level, passive_pos_key, &passive_row, &passive_col
+        )) {
+        MOB_POS(1, level, passive_slot, 0, state) = passive_row;
+        MOB_POS(1, level, passive_slot, 1, state) = passive_col;
+        MOB_HP(1, level, passive_slot, state) =
+            craftax_spawn_mob_type_health(passive_type, CRAFTAX_MOB_PASSIVE);
+        MOB_MASK(1, level, passive_slot, state) = true;
+        CF_BITS(mob_bits, level, passive_row, state) |= (1ULL << passive_col);
+        passive_spawned = true;
+    }
+
+    bool melee_spawned = false;
+    int32_t melee_row = 0;
+    int32_t melee_col = 0;
+    (void)passive_spawned;
+    if (try_melee && craftax_spawn_scan_melee(
+            state, level, fighting_boss, melee_pos_key,
+            &melee_row, &melee_col
+        )) {
+        MOB_POS(0, level, melee_slot, 0, state) = melee_row;
+        MOB_POS(0, level, melee_slot, 1, state) = melee_col;
+        MOB_HP(0, level, melee_slot, state) =
+            craftax_spawn_mob_type_health(melee_type, CRAFTAX_MOB_MELEE);
+        MOB_MASK(0, level, melee_slot, state) = true;
+        CF_BITS(mob_bits, level, melee_row, state) |= (1ULL << melee_col);
+        melee_spawned = true;
+    }
+
+    int32_t ranged_row = 0;
+    int32_t ranged_col = 0;
+    (void)melee_spawned;
+    if (try_ranged && craftax_spawn_scan_ranged(
+            state, level, ranged_type, fighting_boss, ranged_pos_key,
+            &ranged_row, &ranged_col
+        )) {
+        MOB_POS(2, level, ranged_slot, 0, state) = ranged_row;
+        MOB_POS(2, level, ranged_slot, 1, state) = ranged_col;
+        MOB_HP(2, level, ranged_slot, state) =
+            craftax_spawn_mob_type_health(ranged_type, CRAFTAX_MOB_RANGED);
+        MOB_MASK(2, level, ranged_slot, state) = true;
+        CF_BITS(mob_bits, level, ranged_row, state) |= (1ULL << ranged_col);
+    }
+}
+
+// Warp-cooperative version of craftax_spawn_scan_spans: lanes stride the
+// span list. All selection arithmetic is integer (popcounts, prefix sums)
+// except the single uniform draw, which is computed exactly as the scalar
+// version from the same n and key, so the chosen (row, col) is bit-identical.
+static __device__ inline bool craftax_spawn_scan_spans_warp(
+    const CraftaxState* state, int32_t level,
+    const CraftaxSpawnOffsetSpan* spans, int32_t span_count,
+    uint64_t terrain_mask, CraftaxThreefryKey pos_key,
+    int32_t* out_row, int32_t* out_col, unsigned lane
+) {
+    const unsigned FULL = 0xffffffffu;
+    int32_t pr = CF2(player_position, 0, state);
+    int32_t pc = CF2(player_position, 1, state);
+
+    int32_t n_lane = 0;
+    for (int32_t i = (int32_t)lane; i < span_count; i += 32) {
+        int32_t row = pr + spans[i].dr;
+        if ((uint32_t)row >= CRAFTAX_MAP_SIZE) continue;
+        int32_t col0 = pc + spans[i].dc0;
+        int32_t col1 = pc + spans[i].dc1;
+        if (col0 < 0) col0 = 0;
+        if (col1 >= CRAFTAX_MAP_SIZE) col1 = CRAFTAX_MAP_SIZE - 1;
+        if (col0 > col1) continue;
+        uint64_t candidates =
+            craftax_spawn_row_bits_for_mask(state, level, row, terrain_mask)
+            & ~CF_BITS(mob_bits, level, row, state)
+            & craftax_spawn_col_mask(col0, col1);
+        n_lane += __popcll(candidates);
+    }
+    int32_t n = n_lane;
+    for (int off = 16; off > 0; off >>= 1)
+        n += __shfl_xor_sync(FULL, n, off);
+    if (n == 0) return false;
+
+    float draw = (float)n * (1.0f - craftax_threefry_uniform_f32(pos_key));
+    int32_t k = (int32_t)ceilf(draw) - 1;
+    if (k < 0) k = 0;
+    if (k > n - 1) k = n - 1;
+
+    int32_t seen = 0;
+    for (int32_t base = 0; base < span_count; base += 32) {
+        int32_t i = base + (int32_t)lane;
+        uint64_t candidates = 0;
+        int32_t row = 0;
+        if (i < span_count) {
+            row = pr + spans[i].dr;
+            int32_t col0 = pc + spans[i].dc0;
+            int32_t col1 = pc + spans[i].dc1;
+            if (col0 < 0) col0 = 0;
+            if (col1 >= CRAFTAX_MAP_SIZE) col1 = CRAFTAX_MAP_SIZE - 1;
+            if ((uint32_t)row < CRAFTAX_MAP_SIZE && col0 <= col1) {
+                candidates =
+                    craftax_spawn_row_bits_for_mask(state, level, row,
+                                                    terrain_mask)
+                    & ~CF_BITS(mob_bits, level, row, state)
+                    & craftax_spawn_col_mask(col0, col1);
+            }
+        }
+        int32_t c = __popcll(candidates);
+        int32_t incl = c;
+        for (int off = 1; off < 32; off <<= 1) {
+            int32_t v = __shfl_up_sync(FULL, incl, off);
+            if ((int)lane >= off) incl += v;
+        }
+        int32_t chunk_total = __shfl_sync(FULL, incl, 31);
+        if (seen + chunk_total > k) {
+            int32_t excl = incl - c;
+            bool mine = (seen + excl <= k) && (k < seen + incl);
+            unsigned m = __ballot_sync(FULL, mine);
+            int src = __ffs((int)m) - 1;
+            int32_t r_row = 0, r_col = 0;
+            if (mine) {
+                int32_t need = k - seen - excl;
+                while (need-- > 0) candidates &= candidates - 1;
+                r_row = row;
+                r_col = (int32_t)__builtin_ctzll(candidates);
+            }
+            *out_row = __shfl_sync(FULL, r_row, src);
+            *out_col = __shfl_sync(FULL, r_col, src);
+            return true;
+        }
+        seen += chunk_total;
+    }
+    return false;
+}
+
+// Warp-cooperative spawn tail: the three class scans stay sequential (each
+// successful spawn's mob_bits update must be visible to the next scan), but
+// each scan is lane-parallel. Writes happen on lane 0; __syncwarp() orders
+// them before the next scan reads.
+static __device__ inline void craftax_spawn_mobs_tail_warp(
+    CraftaxState* state, int32_t level, bool fighting_boss,
+    bool try_passive, bool try_melee, bool try_ranged,
+    int32_t passive_slot, int32_t melee_slot, int32_t ranged_slot,
+    int32_t passive_type, int32_t melee_type, int32_t ranged_type,
+    CraftaxThreefryKey passive_pos_key, CraftaxThreefryKey melee_pos_key,
+    CraftaxThreefryKey ranged_pos_key, unsigned lane
+) {
+    int32_t row = 0, col = 0;
+    if (try_passive && craftax_spawn_scan_spans_warp(
+            state, level, craftax_spawn_passive_spans,
+            craftax_spawn_passive_span_count,
+            CRAFTAX_SPAWN_ALL_VALID_BLOCK_MASK, passive_pos_key,
+            &row, &col, lane)) {
+        if (lane == 0) {
+            MOB_POS(1, level, passive_slot, 0, state) = row;
+            MOB_POS(1, level, passive_slot, 1, state) = col;
+            MOB_HP(1, level, passive_slot, state) =
+                craftax_spawn_mob_type_health(passive_type,
+                                              CRAFTAX_MOB_PASSIVE);
+            MOB_MASK(1, level, passive_slot, state) = true;
+            CF_BITS(mob_bits, level, row, state) |= (1ULL << col);
+        }
+    }
+    __syncwarp();
+
+    const CraftaxSpawnOffsetSpan* hostile_spans = fighting_boss
+        ? craftax_spawn_boss_spans
+        : craftax_spawn_hostile_spans;
+    int32_t hostile_span_count = fighting_boss
+        ? craftax_spawn_boss_span_count
+        : craftax_spawn_hostile_span_count;
+
+    uint64_t melee_terrain_mask = fighting_boss
+        ? CRAFTAX_SPAWN_GRAVE_BLOCK_MASK
+        : CRAFTAX_SPAWN_ALL_VALID_BLOCK_MASK;
+    if (try_melee && craftax_spawn_scan_spans_warp(
+            state, level, hostile_spans, hostile_span_count,
+            melee_terrain_mask, melee_pos_key, &row, &col, lane)) {
+        if (lane == 0) {
+            MOB_POS(0, level, melee_slot, 0, state) = row;
+            MOB_POS(0, level, melee_slot, 1, state) = col;
+            MOB_HP(0, level, melee_slot, state) =
+                craftax_spawn_mob_type_health(melee_type, CRAFTAX_MOB_MELEE);
+            MOB_MASK(0, level, melee_slot, state) = true;
+            CF_BITS(mob_bits, level, row, state) |= (1ULL << col);
+        }
+    }
+    __syncwarp();
+
+    uint64_t ranged_terrain_mask;
+    if (fighting_boss) {
+        ranged_terrain_mask = CRAFTAX_SPAWN_GRAVE_BLOCK_MASK;
+    } else if (ranged_type == 5) {
+        ranged_terrain_mask = CRAFTAX_SPAWN_WATER_BLOCK_MASK;
+    } else {
+        ranged_terrain_mask = CRAFTAX_SPAWN_ALL_VALID_BLOCK_MASK;
+    }
+    if (try_ranged && craftax_spawn_scan_spans_warp(
+            state, level, hostile_spans, hostile_span_count,
+            ranged_terrain_mask, ranged_pos_key, &row, &col, lane)) {
+        if (lane == 0) {
+            MOB_POS(2, level, ranged_slot, 0, state) = row;
+            MOB_POS(2, level, ranged_slot, 1, state) = col;
+            MOB_HP(2, level, ranged_slot, state) =
+                craftax_spawn_mob_type_health(ranged_type, CRAFTAX_MOB_RANGED);
+            MOB_MASK(2, level, ranged_slot, state) = true;
+            CF_BITS(mob_bits, level, row, state) |= (1ULL << col);
+        }
+    }
+    __syncwarp();
+}
+
 static __device__ inline void craftax_spawn_mobs_native(
     CraftaxState* state, CraftaxThreefryKey rng
 ) {
@@ -8766,60 +9024,33 @@ static __device__ inline void craftax_spawn_mobs_native(
 
     if (!try_passive && !try_melee && !try_ranged) return;
 
-    // [cuda port] The list-building multi-spawn path (scan_all into 8KB of
-    // per-thread CraftaxSpawnLists + pick_excluding) is replaced by three
-    // sequential span scans. Each successful spawn sets its mob_bits bit
-    // before the next scan runs, which removes exactly the coordinates that
-    // pick_excluding excluded; iteration order and the k-th pick arithmetic
-    // are unchanged, so the chosen cells are bit-identical.
-    craftax_spawn_init_offsets_once();
-
-    bool passive_spawned = false;
-    int32_t passive_row = 0;
-    int32_t passive_col = 0;
-    if (try_passive && craftax_spawn_scan_passive(
-            state, level, passive_pos_key, &passive_row, &passive_col
-        )) {
-        MOB_POS(1, level, passive_slot, 0, state) = passive_row;
-        MOB_POS(1, level, passive_slot, 1, state) = passive_col;
-        MOB_HP(1, level, passive_slot, state) =
-            craftax_spawn_mob_type_health(passive_type, CRAFTAX_MOB_PASSIVE);
-        MOB_MASK(1, level, passive_slot, state) = true;
-        CF_BITS(mob_bits, level, passive_row, state) |= (1ULL << passive_col);
-        passive_spawned = true;
+    if (g_cf_spawn_queue != NULL) {
+        int slot = atomicAdd(&g_cf_spawn_count, 1);
+        CraftaxSpawnRec* r = &g_cf_spawn_queue[slot];
+        r->env = cf_slot(state);
+        r->pkey0 = passive_pos_key.word[0];
+        r->pkey1 = passive_pos_key.word[1];
+        r->mkey0 = melee_pos_key.word[0];
+        r->mkey1 = melee_pos_key.word[1];
+        r->rkey0 = ranged_pos_key.word[0];
+        r->rkey1 = ranged_pos_key.word[1];
+        r->level = (uint8_t)level;
+        r->flags = (uint8_t)((try_passive ? 1 : 0) | (try_melee ? 2 : 0)
+                             | (try_ranged ? 4 : 0) | (fighting_boss ? 8 : 0));
+        r->pslot = (uint8_t)passive_slot;
+        r->mslot = (uint8_t)melee_slot;
+        r->rslot = (uint8_t)ranged_slot;
+        r->ptype = (uint8_t)passive_type;
+        r->mtype = (uint8_t)melee_type;
+        r->rtype = (uint8_t)ranged_type;
+        return;
     }
 
-    bool melee_spawned = false;
-    int32_t melee_row = 0;
-    int32_t melee_col = 0;
-    (void)passive_spawned;
-    if (try_melee && craftax_spawn_scan_melee(
-            state, level, fighting_boss, melee_pos_key,
-            &melee_row, &melee_col
-        )) {
-        MOB_POS(0, level, melee_slot, 0, state) = melee_row;
-        MOB_POS(0, level, melee_slot, 1, state) = melee_col;
-        MOB_HP(0, level, melee_slot, state) =
-            craftax_spawn_mob_type_health(melee_type, CRAFTAX_MOB_MELEE);
-        MOB_MASK(0, level, melee_slot, state) = true;
-        CF_BITS(mob_bits, level, melee_row, state) |= (1ULL << melee_col);
-        melee_spawned = true;
-    }
-
-    int32_t ranged_row = 0;
-    int32_t ranged_col = 0;
-    (void)melee_spawned;
-    if (try_ranged && craftax_spawn_scan_ranged(
-            state, level, ranged_type, fighting_boss, ranged_pos_key,
-            &ranged_row, &ranged_col
-        )) {
-        MOB_POS(2, level, ranged_slot, 0, state) = ranged_row;
-        MOB_POS(2, level, ranged_slot, 1, state) = ranged_col;
-        MOB_HP(2, level, ranged_slot, state) =
-            craftax_spawn_mob_type_health(ranged_type, CRAFTAX_MOB_RANGED);
-        MOB_MASK(2, level, ranged_slot, state) = true;
-        CF_BITS(mob_bits, level, ranged_row, state) |= (1ULL << ranged_col);
-    }
+    craftax_spawn_mobs_tail(
+        state, level, fighting_boss, try_passive, try_melee, try_ranged,
+        passive_slot, melee_slot, ranged_slot,
+        passive_type, melee_type, ranged_type,
+        passive_pos_key, melee_pos_key, ranged_pos_key);
 }
 
 // ============================================================
@@ -9049,6 +9280,30 @@ __global__ void k_encode(Craftax* envs, int num_envs) {
     cf_encode_map_warp(&envs[env_idx], threadIdx.x);
 }
 
+// Compacted spawn-scan tail (see CraftaxSpawnRec): one thread per env that
+// rolled a spawn attempt this step. Runs after k_step and before the reset
+// kernels, so done envs still receive their (about-to-be-wiped) spawn writes
+// in the same order as the inline path.
+__global__ void k_spawn_tail(void) {
+    const unsigned lane = (unsigned)(threadIdx.x & 31);
+    const int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    const int total_warps = (int)((gridDim.x * blockDim.x) >> 5);
+    const int count = g_cf_spawn_count;
+    for (int idx = warp; idx < count; idx += total_warps) {
+        const CraftaxSpawnRec r = g_cf_spawn_queue[idx];
+        CraftaxState* state = &((CraftaxState*)g_cf_state_base)[r.env];
+        CraftaxThreefryKey pkey = {{r.pkey0, r.pkey1}};
+        CraftaxThreefryKey mkey = {{r.mkey0, r.mkey1}};
+        CraftaxThreefryKey rkey = {{r.rkey0, r.rkey1}};
+        craftax_spawn_mobs_tail_warp(
+            state, (int32_t)r.level, (r.flags & 8) != 0,
+            (r.flags & 1) != 0, (r.flags & 2) != 0, (r.flags & 4) != 0,
+            (int32_t)r.pslot, (int32_t)r.mslot, (int32_t)r.rslot,
+            (int32_t)r.ptype, (int32_t)r.mtype, (int32_t)r.rtype,
+            pkey, mkey, rkey, lane);
+    }
+}
+
 __global__ void k_reset_list(Craftax* envs, const CraftaxResetRec* resets) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= g_reset_count) return;
@@ -9133,6 +9388,464 @@ __global__ void k_mega(
     if (active) action_rng[i] = arng;
 }
 
+// ============================================================
+// NN-fused rollout path (run / runhash / runverify modes).
+//
+// Policy = the PufferLib default for full craftax
+// (config/craftax.ini: hidden_size 32, num_layers 1):
+//   Linear(843 -> 32) encoder (no activation)
+//   MinGRU (1 layer, expansion_factor 1)
+//   actor Linear(32 -> 43) + value Linear(32 -> 1)
+//
+// The fused forward NEVER materializes the 843-float observation: the
+// encoder gathers W_enc columns directly from SoA/AoS state, computing each
+// feature value with the exact expressions of k_encode / cf_encode_tail and
+// accumulating fmaf(x_f, W_enc[f], h) in dense feature order, skipping only
+// terms whose x_f is an exact float zero (invisible cells, absent mobs,
+// zero scalars). Skipping exact zeros with unchanged summation order leaves
+// the sum bit-identical to the dense loop (verified bitwise by runverify
+// against a dense reference forward computed from the materialized obs).
+// Explicit fmaf() is unaffected by -fmad=false.
+//
+// Sampling uses a dedicated Philox stream (seed ^ A5.., subsequence = env,
+// offset = global step): independent per (env, step) and fully disjoint
+// from the env's threefry game RNG, which is never touched.
+// ============================================================
+#define CF_NN_HIDDEN 32
+#define CF_NN_GRU (3 * CF_NN_HIDDEN)
+#define CF_NN_OBS ((int)CRAFTAX_WG_PACKED_OBS_SIZE)  // 843
+#define CF_NN_MAP (CRAFTAX_WG_PACKED_MAP_OBS_SIZE)   // 792
+#define CF_NN_TAIL (CRAFTAX_WG_INVENTORY_OBS_SIZE)   // 51
+
+#define CF_NN_W_ENC 0
+#define CF_NN_B_ENC (CF_NN_OBS * CF_NN_HIDDEN)
+#define CF_NN_W_GRU (CF_NN_B_ENC + CF_NN_HIDDEN)
+#define CF_NN_W_A (CF_NN_W_GRU + CF_NN_GRU * CF_NN_HIDDEN)
+#define CF_NN_B_A (CF_NN_W_A + CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN)
+#define CF_NN_W_V (CF_NN_B_A + CRAFTAX_NUM_ACTIONS)
+#define CF_NN_B_V (CF_NN_W_V + CF_NN_HIDDEN)
+#define CF_NN_PARAM_COUNT (CF_NN_B_V + 1)
+
+typedef struct CfWeights {
+    const float* __restrict__ W_enc;  // [843][32], one row per input feature
+    const float* __restrict__ b_enc;  // [32]
+    const float* __restrict__ W_gru;  // [96][32]
+    const float* __restrict__ W_a;    // [43][32]
+    const float* __restrict__ b_a;    // [43]
+    const float* __restrict__ W_v;    // [32]
+    const float* __restrict__ b_v;    // [1]
+} CfWeights;
+
+__global__ void k_nn_init_weights(
+    float* w, int count, float bound, uint64_t seed, int subseq
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    curandStatePhilox4_32_10_t st;
+    curand_init(seed, (uint64_t)subseq, (uint64_t)i, &st);
+    w[i] = (2.0f * curand_uniform(&st) - 1.0f) * bound;
+}
+
+// Small weights staged in shared memory once per block (per-step kernel).
+typedef struct CfNNShared {
+    float W_gru[CF_NN_GRU * CF_NN_HIDDEN];
+    float W_a[CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN];
+    float b_a[CRAFTAX_NUM_ACTIONS];
+    float W_v[CF_NN_HIDDEN];
+    float b_enc[CF_NN_HIDDEN];
+    float b_v;
+} CfNNShared;
+
+static __device__ void cf_nn_load_shared(CfNNShared* s, const CfWeights& w) {
+    for (int i = threadIdx.x; i < CF_NN_GRU * CF_NN_HIDDEN; i += blockDim.x)
+        s->W_gru[i] = w.W_gru[i];
+    for (int i = threadIdx.x; i < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN;
+         i += blockDim.x)
+        s->W_a[i] = w.W_a[i];
+    for (int i = threadIdx.x; i < CRAFTAX_NUM_ACTIONS; i += blockDim.x)
+        s->b_a[i] = w.b_a[i];
+    for (int i = threadIdx.x; i < CF_NN_HIDDEN; i += blockDim.x) {
+        s->W_v[i] = w.W_v[i];
+        s->b_enc[i] = w.b_enc[i];
+    }
+    if (threadIdx.x == 0) s->b_v = w.b_v[0];
+    __syncthreads();
+}
+
+// One weight-column FMA into the float4 accumulator. Loads are float4
+// (columns are 128B-aligned: W_enc starts a cudaMalloc'd arena and each
+// column is 32 floats); the per-component fmaf chains are the same
+// h[i] = fmaf(x, col[i], h[i]) as the scalar loop, so results are
+// bit-identical -- only the load width changes (4x fewer LSU ops).
+static __device__ __forceinline__ void cf_nn_fma_col(
+    float4* h4, float x, const float* __restrict__ colp
+) {
+    const float4* c4 = (const float4*)colp;
+    #pragma unroll
+    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
+        float4 cv = c4[b];
+        h4[b].x = fmaf(x, cv.x, h4[b].x);
+        h4[b].y = fmaf(x, cv.y, h4[b].y);
+        h4[b].z = fmaf(x, cv.z, h4[b].z);
+        h4[b].w = fmaf(x, cv.w, h4[b].w);
+    }
+}
+
+// Fused encoder: Linear(843 -> 32) gathered from state, feature values and
+// order exactly as k_encode + cf_encode_tail produce them.
+static __device__ void cf_nn_encoder_gather(
+    const CraftaxState* cs, const float* __restrict__ W_enc,
+    const float* __restrict__ b_enc, float* h
+) {
+    const CraftaxWorldState* state = (const CraftaxWorldState*)(const void*)cs;
+    float4 h4[CF_NN_HIDDEN / 4];
+    #pragma unroll
+    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
+        h4[b].x = b_enc[4 * b];
+        h4[b].y = b_enc[4 * b + 1];
+        h4[b].z = b_enc[4 * b + 2];
+        h4[b].w = b_enc[4 * b + 3];
+    }
+
+    const int level = CF(player_level, state);
+    const int mob_level =
+        craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
+    const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
+    const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
+
+    // Visible-mob list (same predicates and class/slot order as the
+    // k_encode scatter). Last-slot-wins per (cell, channel) is reproduced
+    // by overwriting an existing entry instead of appending.
+    int16_t mob_cell[14];
+    int8_t mob_ch[14];
+    float mob_val[14];
+    int nm = 0;
+    for (int c = 0; c < CRAFTAX_WG_NUM_MOB_CLASSES; c++) {
+        const int nslots = c == 2 ? 2 : 3;
+        for (int i = 0; i < nslots; i++) {
+            int type_id = MOB_TYPE(c, mob_level, i, state);
+            if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
+                || !MOB_MASK(c, mob_level, i, state)) {
+                continue;
+            }
+            int mob_row = MOB_POS(c, mob_level, i, 0, state);
+            int mob_col = MOB_POS(c, mob_level, i, 1, state);
+            int local_row = mob_row - top;
+            int local_col = mob_col - left;
+            if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
+                || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
+                continue;
+            }
+            bool in_bounds = mob_row >= 0 && mob_row < CRAFTAX_WG_MAP_SIZE
+                && mob_col >= 0 && mob_col < CRAFTAX_WG_MAP_SIZE;
+            if (!in_bounds
+                || state->light_map[mob_level][mob_row][mob_col] <= 12) {
+                continue;
+            }
+            int16_t cell =
+                (int16_t)(local_row * CRAFTAX_WG_OBS_COLS + local_col);
+            int8_t ch = (int8_t)(3 + c);
+            int found = -1;
+            for (int j = 0; j < nm; j++)
+                if (mob_cell[j] == cell && mob_ch[j] == ch) found = j;
+            if (found >= 0) {
+                mob_val[found] = (float)(type_id + 1);
+            } else {
+                mob_cell[nm] = cell;
+                mob_ch[nm] = ch;
+                mob_val[nm] = (float)(type_id + 1);
+                nm++;
+            }
+        }
+    }
+
+    for (int cell = 0; cell < CRAFTAX_WG_OBS_ROWS * CRAFTAX_WG_OBS_COLS;
+         cell++) {
+        int row = cell / CRAFTAX_WG_OBS_COLS;
+        int col = cell % CRAFTAX_WG_OBS_COLS;
+        int world_row = top + row;
+        int world_col = left + col;
+        bool in_bounds = world_row >= 0 && world_row < CRAFTAX_WG_MAP_SIZE
+            && world_col >= 0 && world_col < CRAFTAX_WG_MAP_SIZE;
+        bool visible =
+            in_bounds && state->light_map[level][world_row][world_col] > 12;
+        int fbase = cell * CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
+        if (visible) {
+            float v0 = (float)state->map[level][world_row][world_col];
+            if (v0 != 0.0f)
+                cf_nn_fma_col(h4, v0, W_enc + (size_t)fbase * CF_NN_HIDDEN);
+            float v1 =
+                (float)state->item_map[level][world_row][world_col] + 1.0f;
+            if (v1 != 0.0f)
+                cf_nn_fma_col(h4, v1,
+                              W_enc + (size_t)(fbase + 1) * CF_NN_HIDDEN);
+            cf_nn_fma_col(h4, 1.0f,
+                          W_enc + (size_t)(fbase + 2) * CF_NN_HIDDEN);
+        }
+        for (int m = 0; m < nm; m++) {
+            if ((int)mob_cell[m] == cell) {
+                cf_nn_fma_col(
+                    h4, mob_val[m],
+                    W_enc + (size_t)(fbase + mob_ch[m]) * CF_NN_HIDDEN);
+            }
+        }
+    }
+
+    // Scalar tail: exact values of cf_encode_tail, zero terms skipped.
+    float tail[CF_NN_TAIL];
+    craftax_encode_scalar_observation_tail_at(state, tail, 0);
+    for (int j = 0; j < CF_NN_TAIL; j++) {
+        float x = tail[j];
+        if (x == 0.0f) continue;
+        cf_nn_fma_col(h4, x, W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN);
+    }
+
+    #pragma unroll
+    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
+        h[4 * b] = h4[b].x;
+        h[4 * b + 1] = h4[b].y;
+        h[4 * b + 2] = h4[b].z;
+        h[4 * b + 3] = h4[b].w;
+    }
+}
+
+static __device__ __forceinline__ float cf_nn_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+static __device__ __forceinline__ float cf_nn_mingru_g(float x) {
+    return x >= 0.0f ? x + 0.5f : cf_nn_sigmoid(x);
+}
+
+// MinGRU cell + decoder heads (PufferLib MinGRU.forward_eval semantics:
+// out = lerp(state, g(hidden), sigmoid(gate)); highway on sigmoid(proj)).
+static __device__ void cf_nn_head(
+    const float* h_enc, float* state,
+    const float* __restrict__ W_gru, const float* __restrict__ W_a,
+    const float* __restrict__ b_a, const float* __restrict__ W_v, float b_v,
+    float* logits, float* value
+) {
+    float hidden[CF_NN_HIDDEN], gate[CF_NN_HIDDEN], proj[CF_NN_HIDDEN];
+    #pragma unroll
+    for (int k = 0; k < CF_NN_HIDDEN; k++) {
+        float zh = 0.0f, zg = 0.0f, zp = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < CF_NN_HIDDEN; j++) {
+            zh = fmaf(W_gru[k * CF_NN_HIDDEN + j], h_enc[j], zh);
+            zg = fmaf(W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], zg);
+            zp = fmaf(W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], zp);
+        }
+        hidden[k] = zh; gate[k] = zg; proj[k] = zp;
+    }
+    float hout[CF_NN_HIDDEN];
+    #pragma unroll
+    for (int k = 0; k < CF_NN_HIDDEN; k++) {
+        // torch.lerp(start, end, weight) = start + weight*(end-start)
+        float out = state[k]
+            + cf_nn_sigmoid(gate[k]) * (cf_nn_mingru_g(hidden[k]) - state[k]);
+        float p = cf_nn_sigmoid(proj[k]);
+        hout[k] = p * out + (1.0f - p) * h_enc[k];
+        state[k] = out;
+    }
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        float z = b_a[a];
+        #pragma unroll
+        for (int j = 0; j < CF_NN_HIDDEN; j++)
+            z = fmaf(W_a[a * CF_NN_HIDDEN + j], hout[j], z);
+        logits[a] = z;
+    }
+    float v = b_v;
+    #pragma unroll
+    for (int j = 0; j < CF_NN_HIDDEN; j++) v = fmaf(W_v[j], hout[j], v);
+    *value = v;
+}
+
+// Categorical sample from logits with one uniform; fills the sampled
+// action's logprob.
+static __device__ int cf_nn_sample_action(
+    const float* logits, float u, float* logprob
+) {
+    float m = logits[0];
+    for (int a = 1; a < CRAFTAX_NUM_ACTIONS; a++) m = fmaxf(m, logits[a]);
+    float p[CRAFTAX_NUM_ACTIONS], total = 0.0f;
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        p[a] = expf(logits[a] - m);
+        total += p[a];
+    }
+    float target = u * total, cum = 0.0f;
+    int action = CRAFTAX_NUM_ACTIONS - 1;
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        cum += p[a];
+        if (target <= cum) { action = a; break; }
+    }
+    *logprob = logits[action] - m - logf(total);
+    return action;
+}
+
+// Shared forward + sample tail used by every policy kernel: recurrent state
+// zeroing on the previous step's terminal, MinGRU + heads, Philox sample.
+static __device__ __forceinline__ int cf_nn_forward_tail(
+    const float* h_enc, float prev_terminal, float* __restrict__ h_state,
+    const float* W_gru, const float* W_a, const float* b_a,
+    const float* W_v, float b_v,
+    float* __restrict__ out_logprob, float* __restrict__ out_value,
+    int e, int num_envs, uint64_t seed, uint64_t step_count
+) {
+    float st[CF_NN_HIDDEN];
+    if (prev_terminal != 0.0f) {
+        #pragma unroll
+        for (int i = 0; i < CF_NN_HIDDEN; i++) st[i] = 0.0f;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < CF_NN_HIDDEN; i++)
+            st[i] = h_state[(size_t)e * CF_NN_HIDDEN + i];
+    }
+    float logits[CRAFTAX_NUM_ACTIONS], value, logprob;
+    cf_nn_head(h_enc, st, W_gru, W_a, b_a, W_v, b_v, logits, &value);
+    curandStatePhilox4_32_10_t sampler;
+    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, (uint64_t)e, step_count,
+                &sampler);
+    int action = cf_nn_sample_action(logits, curand_uniform(&sampler),
+                                     &logprob);
+    if (out_logprob) out_logprob[e] = logprob;
+    if (out_value) out_value[e] = value;
+    #pragma unroll
+    for (int i = 0; i < CF_NN_HIDDEN; i++)
+        h_state[(size_t)e * CF_NN_HIDDEN + i] = st[i];
+    return action;
+}
+
+// ------------------------------------------------------------
+// Production split-path policy kernel: thread-per-env scalar gather.
+// ~229 regs/thread caps it at 256 threads/SM (16.7% occupancy), but it is
+// issue-efficient: each warp advances 32 envs through the 843-feature loop
+// simultaneously. Two rejected alternatives, with numbers @65536 envs:
+//  - __launch_bounds__(256,2)/(256,3) to force occupancy: spills tanked the
+//    run path 29.7 -> 18.0 / 15.3M SPS.
+//  - warp-per-env (lane i owns hidden unit i, coalesced 128B column loads,
+//    smem-staged transposed weights, later smem-staged obs bytes): 20.9M
+//    then 19.6M SPS vs 29.7M scalar; ncu showed 2.00ms vs 1.07ms. The
+//    feature loop is serial per env, so a warp issues ~32x more uniform
+//    instructions per env than a thread does; hidden=32 is too narrow for
+//    warp-per-env to pay for itself.
+// ------------------------------------------------------------
+__global__ void k_policy(
+    CfWeights w, float* __restrict__ h_state,
+    const float* __restrict__ prev_terminals,
+    float* __restrict__ env_actions, int32_t* __restrict__ out_act,
+    float* __restrict__ out_logprob, float* __restrict__ out_value,
+    int num_envs, uint64_t seed, uint64_t step_count
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+    const CraftaxState* state = &((const CraftaxState*)g_cf_state_base)[e];
+    float h_enc[CF_NN_HIDDEN];
+    cf_nn_encoder_gather(state, w.W_enc, w.b_enc, h_enc);
+    int action = cf_nn_forward_tail(
+        h_enc, prev_terminals[e], h_state, w.W_gru, w.W_a, w.b_a, w.W_v,
+        w.b_v[0], out_logprob, out_value, e, num_envs, seed, step_count);
+    env_actions[e] = (float)action;
+    if (out_act) out_act[e] = action;
+}
+// Dense reference forward (runverify only): identical math from the
+// materialized observation tensor, dense feature loop skipping exact zeros.
+__global__ void k_policy_ref(
+    CfWeights w, float* __restrict__ h_state,
+    const float* __restrict__ prev_terminals,
+    const CraftaxObs* __restrict__ observations,
+    int32_t* __restrict__ out_act, float* __restrict__ out_logprob,
+    float* __restrict__ out_value,
+    int num_envs, uint64_t seed, uint64_t step_count
+) {
+    __shared__ CfNNShared s;
+    cf_nn_load_shared(&s, w);
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+    const CraftaxObs* obs = observations + (size_t)e * CRAFTAX_OBS_SIZE;
+    float h_enc[CF_NN_HIDDEN];
+    #pragma unroll
+    for (int i = 0; i < CF_NN_HIDDEN; i++) h_enc[i] = s.b_enc[i];
+    for (int f = 0; f < CF_NN_MAP; f++) {
+        float xf = (float)obs[f];
+        if (xf == 0.0f) continue;
+        const float* colp = w.W_enc + (size_t)f * CF_NN_HIDDEN;
+        #pragma unroll
+        for (int i = 0; i < CF_NN_HIDDEN; i++)
+            h_enc[i] = fmaf(xf, colp[i], h_enc[i]);
+    }
+    for (int j = 0; j < CF_NN_TAIL; j++) {
+        float xf;
+#ifdef CRAFTAX_COMPACT_OBS
+        memcpy(&xf, obs + CF_NN_MAP + 4 * j, sizeof(float));
+#else
+        xf = obs[CF_NN_MAP + j];
+#endif
+        if (xf == 0.0f) continue;
+        const float* colp = w.W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN;
+        #pragma unroll
+        for (int i = 0; i < CF_NN_HIDDEN; i++)
+            h_enc[i] = fmaf(xf, colp[i], h_enc[i]);
+    }
+    int action = cf_nn_forward_tail(
+        h_enc, prev_terminals[e], h_state, s.W_gru, s.W_a, s.b_a, s.W_v,
+        s.b_v, out_logprob, out_value, e, num_envs, seed, step_count);
+    if (out_act) out_act[e] = action;
+}
+
+// Step kernel for the rollout path: actions come from the policy (already
+// in env->actions), and no observation bytes are written at all.
+__global__ void k_step_run(Craftax* envs, int num_envs, CraftaxResetRec* resets) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_envs) return;
+    Craftax* env = &envs[i];
+    CraftaxThreefryKey reset_key;
+    bool done = c_step_gameplay_core(env, &reset_key);
+    if (done) {
+        int slot = atomicAdd(&g_reset_count, 1);
+        resets[slot].env = i;
+        resets[slot].key0 = reset_key.word[0];
+        resets[slot].key1 = reset_key.word[1];
+    }
+}
+
+// Fused variant: policy forward + gameplay in one kernel (weights read
+// straight from global so k_step's occupancy is not smem-capped). Same
+// math, same buffers -- bitwise identical to k_policy; k_step_run.
+__global__ void k_step_policy(
+    Craftax* envs, CfWeights w, float* __restrict__ h_state, int num_envs,
+    CraftaxResetRec* resets, int32_t* __restrict__ out_act,
+    float* __restrict__ out_logprob, float* __restrict__ out_value,
+    uint64_t seed, uint64_t step_count
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_envs) return;
+    Craftax* env = &envs[i];
+    const CraftaxState* state = env->state;
+    float h_enc[CF_NN_HIDDEN];
+    cf_nn_encoder_gather(state, w.W_enc, w.b_enc, h_enc);
+    int action = cf_nn_forward_tail(
+        h_enc, env->terminals[0], h_state, w.W_gru, w.W_a, w.b_a, w.W_v,
+        w.b_v[0], out_logprob, out_value, i, num_envs, seed, step_count);
+    env->actions[0] = (float)action;
+    if (out_act) out_act[i] = action;
+
+    CraftaxThreefryKey reset_key;
+    bool done = c_step_gameplay_core(env, &reset_key);
+    if (done) {
+        int slot = atomicAdd(&g_reset_count, 1);
+        resets[slot].env = i;
+        resets[slot].key0 = reset_key.word[0];
+        resets[slot].key1 = reset_key.word[1];
+    }
+}
+
+// Scalar-tail encode as a standalone kernel (runverify materializes the
+// full obs; in the normal split path k_step writes the tail itself).
+__global__ void k_encode_tail(Craftax* envs, int num_envs) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_envs) return;
+    cf_encode_tail(envs[i].state, envs[i].observations);
+}
+
 __device__ int g_nan_flag = 0;
 
 __global__ void k_nan_scan(
@@ -9164,6 +9877,8 @@ typedef struct {
     uint32_t* d_action_rng;
     CraftaxResetRec* d_resets;
     int* d_reset_count;  // symbol address of g_reset_count
+    CraftaxSpawnRec* d_spawn_queue;
+    int* d_spawn_count;  // symbol address of g_cf_spawn_count
     CraftaxWorldgenScratch* d_wg_scratch;
     void* d_soa[64];
     int num_soa;
@@ -9213,6 +9928,9 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
     CU_CHECK(cudaMalloc(&v->d_resets,
                         (size_t)num_envs * sizeof(CraftaxResetRec)));
     CU_CHECK(cudaGetSymbolAddress((void**)&v->d_reset_count, g_reset_count));
+    CU_CHECK(cudaMalloc(&v->d_spawn_queue,
+                        (size_t)num_envs * sizeof(CraftaxSpawnRec)));
+    CU_CHECK(cudaGetSymbolAddress((void**)&v->d_spawn_count, g_cf_spawn_count));
     CU_CHECK(cudaMalloc(&v->d_wg_scratch,
                         (size_t)num_envs * sizeof(CraftaxWorldgenScratch)));
     CU_CHECK(cudaMemcpyToSymbol(g_craftax_wg_scratch, &v->d_wg_scratch,
@@ -9263,6 +9981,12 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
     // path stays the default. Requires lazy floors (warp reset).
     const char* mega_env = getenv("CRAFTAX_CU_MEGA");
     v->mega = (mega_env == NULL ? 0 : atoi(mega_env)) && lazy;
+    // Spawn request compaction is a split-path optimization; the megakernel
+    // keeps the inline tail (queue symbol stays NULL there).
+    if (!v->mega) {
+        CU_CHECK(cudaMemcpyToSymbol(g_cf_spawn_queue, &v->d_spawn_queue,
+                                    sizeof(v->d_spawn_queue)));
+    }
     v->d_warp_scratch = NULL;
     if (v->mega) {
         size_t n_warps = ((size_t)num_envs + 63) / 64 * 2;
@@ -9287,6 +10011,7 @@ static void cu_vec_free(CuVec* v) {
     cudaFree(v->d_envs); cudaFree(v->d_states); cudaFree(v->d_obs);
     cudaFree(v->d_actions); cudaFree(v->d_rewards); cudaFree(v->d_terminals);
     cudaFree(v->d_action_rng); cudaFree(v->d_resets);
+    cudaFree(v->d_spawn_queue);
     cudaFree(v->d_wg_scratch);
     if (v->d_warp_scratch != NULL) cudaFree(v->d_warp_scratch);
     for (int i = 0; i < v->num_soa; i++) cudaFree(v->d_soa[i]);
@@ -9351,8 +10076,17 @@ static void cu_step_launch(CuVec* v) {
         return;
     }
     CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int)));
+    CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int)));
     k_step<<<(v->num_envs + 63) / 64, 64>>>(
         v->d_envs, v->d_action_rng, v->num_envs, v->d_resets);
+    // Compacted spawn scans; must precede the reset kernels (done envs get
+    // their spawn writes into the pre-reset world, as inline order did).
+    // One warp per request, grid-stride over the worklist.
+    {
+        int tail_blocks = (v->num_envs * 32 + 255) / 256;
+        if (tail_blocks > 512) tail_blocks = 512;
+        k_spawn_tail<<<tail_blocks, 256>>>();
+    }
     // Worst-case grid; threads/blocks beyond g_reset_count exit immediately.
     if (v->lazy) {
         k_reset_list_warp<<<v->num_envs, 32>>>(v->d_envs, v->d_resets);
@@ -9666,27 +10400,281 @@ static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
     return 0;
 }
 
+// ------------------------------------------------------------
+// run / runhash / runverify: NN-fused env+policy rollouts.
+// ------------------------------------------------------------
+typedef struct {
+    float* params;
+    CfWeights w;
+    float* h_state;
+    int32_t* d_act;
+    float* d_logprob;
+    float* d_value;
+} CuPolicy;
+
+static void cu_policy_init(CuPolicy* p, int num_envs) {
+    CU_CHECK(cudaMalloc(&p->params, (size_t)CF_NN_PARAM_COUNT * sizeof(float)));
+    float be = 1.0f / sqrtf((float)CF_NN_OBS);
+    float bh = 1.0f / sqrtf((float)CF_NN_HIDDEN);
+    const struct { int off, count; float bound; } segs[7] = {
+        {CF_NN_W_ENC, CF_NN_OBS * CF_NN_HIDDEN, be},
+        {CF_NN_B_ENC, CF_NN_HIDDEN, be},
+        {CF_NN_W_GRU, CF_NN_GRU * CF_NN_HIDDEN, bh},
+        {CF_NN_W_A, CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN, bh},
+        {CF_NN_B_A, CRAFTAX_NUM_ACTIONS, bh},
+        {CF_NN_W_V, CF_NN_HIDDEN, bh},
+        {CF_NN_B_V, 1, bh},
+    };
+    for (int s = 0; s < 7; s++) {
+        k_nn_init_weights<<<(segs[s].count + 255) / 256, 256>>>(
+            p->params + segs[s].off, segs[s].count, segs[s].bound, 1234, s);
+        CU_CHECK(cudaGetLastError());
+    }
+    p->w.W_enc = p->params + CF_NN_W_ENC;
+    p->w.b_enc = p->params + CF_NN_B_ENC;
+    p->w.W_gru = p->params + CF_NN_W_GRU;
+    p->w.W_a = p->params + CF_NN_W_A;
+    p->w.b_a = p->params + CF_NN_B_A;
+    p->w.W_v = p->params + CF_NN_W_V;
+    p->w.b_v = p->params + CF_NN_B_V;
+
+    CU_CHECK(cudaMalloc(&p->h_state,
+                        (size_t)CF_NN_HIDDEN * num_envs * sizeof(float)));
+    CU_CHECK(cudaMemset(p->h_state, 0,
+                        (size_t)CF_NN_HIDDEN * num_envs * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->d_act, (size_t)num_envs * sizeof(int32_t)));
+    CU_CHECK(cudaMalloc(&p->d_logprob, (size_t)num_envs * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->d_value, (size_t)num_envs * sizeof(float)));
+}
+
+static void cu_policy_free(CuPolicy* p) {
+    cudaFree(p->params); cudaFree(p->h_state);
+    cudaFree(p->d_act); cudaFree(p->d_logprob); cudaFree(p->d_value);
+}
+
+// One policy+env step; no observation tensor is ever written on this path
+// (k_step_run skips the scalar tail, k_encode never runs).
+static void cu_rollout_step(
+    CuVec* v, CuPolicy* p, int fused, uint64_t seed, uint64_t step
+) {
+    int n = v->num_envs;
+    CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int)));
+    CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int)));
+    if (fused) {
+        k_step_policy<<<(n + 63) / 64, 64>>>(
+            v->d_envs, p->w, p->h_state, n, v->d_resets,
+            p->d_act, p->d_logprob, p->d_value, seed, step);
+    } else {
+        k_policy<<<(n + 63) / 64, 64>>>(
+            p->w, p->h_state, v->d_terminals, v->d_actions,
+            p->d_act, p->d_logprob, p->d_value, n, seed, step);
+        k_step_run<<<(n + 63) / 64, 64>>>(v->d_envs, n, v->d_resets);
+    }
+    {
+        int tail_blocks = (n * 32 + 255) / 256;
+        if (tail_blocks > 512) tail_blocks = 512;
+        k_spawn_tail<<<tail_blocks, 256>>>();
+    }
+    if (v->lazy) {
+        k_reset_list_warp<<<n, 32>>>(v->d_envs, v->d_resets);
+    } else {
+        k_reset_list<<<(n + 63) / 64, 64>>>(v->d_envs, v->d_resets);
+    }
+    CU_CHECK(cudaGetLastError());
+}
+
+static int cu_run_rollout_bench(
+    int num_envs, int iters, uint64_t seed, int fused
+) {
+    double t_init0 = cf_now_s();
+    CuVec v;
+    cu_vec_init(&v, num_envs, seed);
+    CuPolicy p;
+    cu_policy_init(&p, num_envs);
+    double t_init = cf_now_s() - t_init0;
+
+    uint64_t step = 0;
+    int warmup = iters / 20 > 10 ? 10 : (iters / 20 > 0 ? iters / 20 : 1);
+    for (int k = 0; k < warmup; k++) cu_rollout_step(&v, &p, fused, seed, step++);
+    CU_CHECK(cudaDeviceSynchronize());
+
+    double t0 = cf_now_s();
+    for (int k = 0; k < iters; k++) cu_rollout_step(&v, &p, fused, seed, step++);
+    CU_CHECK(cudaDeviceSynchronize());
+    double dt = cf_now_s() - t0;
+    double sps = (double)num_envs * (double)iters / dt;
+    printf("envs=%d iters=%d fused=%d\n", num_envs, iters, fused);
+    printf("init %.3fs  run %.3fs  SPS=%12.0f  (%.2f us/step/env)\n",
+           t_init, dt, sps, dt / (double)iters / (double)num_envs * 1e6);
+    cu_print_logs(&v, false);
+    cu_policy_free(&p);
+    cu_vec_free(&v);
+    return 0;
+}
+
+// Deterministic rollout hash: FNV over (actions, logprobs, values, rewards,
+// terminals) each step. Same seed => identical hash across runs; split
+// (fused=0) and fused (fused=1) must produce the same hash.
+static int cu_run_rollout_hash(
+    int num_envs, int num_steps, uint64_t seed, int fused
+) {
+    CuVec v;
+    cu_vec_init(&v, num_envs, seed);
+    CuPolicy p;
+    cu_policy_init(&p, num_envs);
+
+    int32_t* h_act = (int32_t*)malloc((size_t)num_envs * 4);
+    float* h_lp = (float*)malloc((size_t)num_envs * 4);
+    float* h_val = (float*)malloc((size_t)num_envs * 4);
+    uint64_t h = 0xcbf29ce484222325ULL;
+    double total_reward = 0.0;
+    for (int step = 0; step < num_steps; step++) {
+        cu_rollout_step(&v, &p, fused, seed, (uint64_t)step);
+        CU_CHECK(cudaMemcpy(h_act, p.d_act, (size_t)num_envs * 4,
+                            cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(h_lp, p.d_logprob, (size_t)num_envs * 4,
+                            cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(h_val, p.d_value, (size_t)num_envs * 4,
+                            cudaMemcpyDeviceToHost));
+        cu_copy_back(&v, false);
+        h = cf_fnv1a(h, h_act, (size_t)num_envs * 4);
+        h = cf_fnv1a(h, h_lp, (size_t)num_envs * 4);
+        h = cf_fnv1a(h, h_val, (size_t)num_envs * 4);
+        h = cf_fnv1a(h, v.h_rewards, (size_t)num_envs * sizeof(float));
+        h = cf_fnv1a(h, v.h_terminals, (size_t)num_envs * sizeof(float));
+        for (int i = 0; i < num_envs; i++)
+            total_reward += (double)v.h_rewards[i];
+    }
+    printf("rollout_hash 0x%016llx (envs=%d steps=%d seed=%llu fused=%d)\n",
+           (unsigned long long)h, num_envs, num_steps,
+           (unsigned long long)seed, fused);
+    printf("total_reward=%.3f\n", total_reward);
+    cu_print_logs(&v, false);
+    free(h_act); free(h_lp); free(h_val);
+    cu_policy_free(&p);
+    cu_vec_free(&v);
+    return 0;
+}
+
+// Bitwise check of the gathered forward against a dense reference forward
+// computed from the materialized observation tensor, along a live rollout
+// driven by the gathered path's actions.
+static int cu_run_rollout_verify(int num_envs, int num_steps, uint64_t seed) {
+    CuVec v;
+    cu_vec_init(&v, num_envs, seed);
+    CuPolicy p;
+    cu_policy_init(&p, num_envs);
+
+    float* h_state_ref;
+    int32_t* d_act_ref;
+    float* d_lp_ref;
+    float* d_val_ref;
+    CU_CHECK(cudaMalloc(&h_state_ref,
+                        (size_t)CF_NN_HIDDEN * num_envs * sizeof(float)));
+    CU_CHECK(cudaMemset(h_state_ref, 0,
+                        (size_t)CF_NN_HIDDEN * num_envs * sizeof(float)));
+    CU_CHECK(cudaMalloc(&d_act_ref, (size_t)num_envs * 4));
+    CU_CHECK(cudaMalloc(&d_lp_ref, (size_t)num_envs * 4));
+    CU_CHECK(cudaMalloc(&d_val_ref, (size_t)num_envs * 4));
+
+    size_t hs = (size_t)CF_NN_HIDDEN * num_envs;
+    int32_t* a1 = (int32_t*)malloc((size_t)num_envs * 4);
+    int32_t* a2 = (int32_t*)malloc((size_t)num_envs * 4);
+    float* f1 = (float*)malloc(hs * 4);
+    float* f2 = (float*)malloc(hs * 4);
+    float* l1 = (float*)malloc((size_t)num_envs * 4);
+    float* l2 = (float*)malloc((size_t)num_envs * 4);
+    float* v1 = (float*)malloc((size_t)num_envs * 4);
+    float* v2 = (float*)malloc((size_t)num_envs * 4);
+
+    int n = num_envs;
+    long bad = 0;
+    for (int step = 0; step < num_steps; step++) {
+        // Materialize the full obs for the dense reference.
+        dim3 enc_block(32, CRAFTAX_ENC_WARPS_PER_BLOCK);
+        int enc_grid = (n + CRAFTAX_ENC_WARPS_PER_BLOCK - 1)
+            / CRAFTAX_ENC_WARPS_PER_BLOCK;
+        k_encode<<<enc_grid, enc_block>>>(v.d_envs, n);
+        k_encode_tail<<<(n + 63) / 64, 64>>>(v.d_envs, n);
+        k_policy<<<(n + 63) / 64, 64>>>(
+            p.w, p.h_state, v.d_terminals, v.d_actions,
+            p.d_act, p.d_logprob, p.d_value, n, seed, (uint64_t)step);
+        k_policy_ref<<<(n + 255) / 256, 256>>>(
+            p.w, h_state_ref, v.d_terminals, v.d_obs,
+            d_act_ref, d_lp_ref, d_val_ref, n, seed, (uint64_t)step);
+        CU_CHECK(cudaGetLastError());
+        CU_CHECK(cudaMemcpy(a1, p.d_act, (size_t)n * 4, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(a2, d_act_ref, (size_t)n * 4, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(l1, p.d_logprob, (size_t)n * 4, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(l2, d_lp_ref, (size_t)n * 4, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(v1, p.d_value, (size_t)n * 4, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(v2, d_val_ref, (size_t)n * 4, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(f1, p.h_state, hs * 4, cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(f2, h_state_ref, hs * 4, cudaMemcpyDeviceToHost));
+        if (memcmp(a1, a2, (size_t)n * 4) != 0
+            || memcmp(l1, l2, (size_t)n * 4) != 0
+            || memcmp(v1, v2, (size_t)n * 4) != 0
+            || memcmp(f1, f2, hs * 4) != 0) {
+            bad++;
+        }
+        // Advance the env with the gathered path's actions.
+        CU_CHECK(cudaMemsetAsync(v.d_reset_count, 0, sizeof(int)));
+        CU_CHECK(cudaMemsetAsync(v.d_spawn_count, 0, sizeof(int)));
+        k_step_run<<<(n + 63) / 64, 64>>>(v.d_envs, n, v.d_resets);
+        {
+            int tail_blocks = (n * 32 + 255) / 256;
+            if (tail_blocks > 512) tail_blocks = 512;
+            k_spawn_tail<<<tail_blocks, 256>>>();
+        }
+        if (v.lazy) {
+            k_reset_list_warp<<<n, 32>>>(v.d_envs, v.d_resets);
+        } else {
+            k_reset_list<<<(n + 63) / 64, 64>>>(v.d_envs, v.d_resets);
+        }
+        CU_CHECK(cudaGetLastError());
+    }
+    printf("gathered vs dense forward: %s "
+           "(%ld/%d mismatching steps, %lld env-steps compared)\n",
+           bad == 0 ? "EXACT" : "MISMATCH", bad, num_steps,
+           (long long)num_envs * num_steps);
+    printf("envs=%d steps=%d seed=%llu  =>  %s\n", num_envs, num_steps,
+           (unsigned long long)seed, bad == 0 ? "PASS" : "FAIL");
+    free(a1); free(a2); free(f1); free(f2);
+    free(l1); free(l2); free(v1); free(v2);
+    cudaFree(h_state_ref); cudaFree(d_act_ref);
+    cudaFree(d_lp_ref); cudaFree(d_val_ref);
+    cu_policy_free(&p);
+    cu_vec_free(&v);
+    return bad == 0 ? 0 : 1;
+}
+
 static void cu_usage(const char* prog) {
     fprintf(stderr,
             "usage: %s hash  [--envs N] [--steps M] [--seed S]\n"
             "       %s cmp   --dump FILE [--seed S] [--max-report K]\n"
             "       %s stats [--envs N] [--steps M] [--seed S]\n"
-            "       %s bench [--envs N] [--iters M] [--seed S]\n",
-            prog, prog, prog, prog);
+            "       %s bench [--envs N] [--iters M] [--seed S]\n"
+            "       %s run       [--envs N] [--iters M] [--seed S] [--fused 0|1]\n"
+            "       %s runhash   [--envs N] [--steps M] [--seed S] [--fused 0|1]\n"
+            "       %s runverify [--envs N] [--steps M] [--seed S]\n",
+            prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) { cu_usage(argv[0]); return 1; }
     const char* mode = argv[1];
     int envs = !strcmp(mode, "bench") ? 8192 : 64;
+    if (!strncmp(mode, "run", 3)) envs = !strcmp(mode, "runverify") ? 1024 : 65536;
     int iters = 1000;
     int steps = 2000;
     uint64_t seed = 42;
     const char* dump = NULL;
     int max_report = 40;
+    int fused = 0;
 
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--envs") && i + 1 < argc) envs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fused") && i + 1 < argc) fused = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
@@ -9704,6 +10692,12 @@ int main(int argc, char** argv) {
     if (!strcmp(mode, "stats")) return cu_run_stats(envs, steps, seed);
     if (!strcmp(mode, "statehash")) return cu_run_statehash(envs, steps, seed);
     if (!strcmp(mode, "bench")) return cu_run_bench(envs, iters, seed);
+    if (!strcmp(mode, "run"))
+        return cu_run_rollout_bench(envs, iters, seed, fused);
+    if (!strcmp(mode, "runhash"))
+        return cu_run_rollout_hash(envs, steps == 2000 ? 500 : steps, seed, fused);
+    if (!strcmp(mode, "runverify"))
+        return cu_run_rollout_verify(envs, steps == 2000 ? 128 : steps, seed);
     cu_usage(argv[0]);
     return 1;
 }

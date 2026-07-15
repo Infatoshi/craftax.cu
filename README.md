@@ -27,19 +27,29 @@ Env steps per second:
 | CUDA, 1M envs | RTX 3090 | 127.9M | 116.2M @ 262k |
 | C, 32k envs | Ryzen 9 9950X3D | 47.8M | - |
 
-Full game (env only, random actions, auto-reset included):
+Full game (random actions for env-only, auto-reset included; env+policy
+is the `run` rollout path with the PufferLib default policy in the loop):
 
-| Backend | Hardware | SPS |
-|---|---|---:|
-| C, 8192 envs, 32T | Ryzen 9 9950X3D | 5.6M |
-| C, 1024 envs, 1T | Ryzen 9 9950X3D | 750K |
-| CUDA, 262k envs, compact obs | RTX PRO 6000 Blackwell | 104.5M |
-| CUDA, 262k envs | RTX PRO 6000 Blackwell | 94.3M |
-| CUDA, 65k envs, compact obs | RTX PRO 6000 Blackwell | 89.5M |
-| CUDA, 65k envs | RTX PRO 6000 Blackwell | 85.6M |
-| CUDA, 65k envs, compact obs | RTX 3090 | 18.8M |
-| CUDA, 65k envs | RTX 3090 | 18.3M |
-| CUDA (naive port, milestone 1), 65k envs | RTX 3090 | 454K |
+| Backend | Hardware | Env only | Env + policy rollout |
+|---|---|---:|---:|
+| CUDA, 655k envs, compact obs | RTX PRO 6000 Blackwell | 123.2M | 101.5M |
+| CUDA, 524k envs, compact obs | RTX PRO 6000 Blackwell | 122.3M | 103.0M |
+| CUDA, 524k envs | RTX PRO 6000 Blackwell | 102.0M | 103.0M |
+| CUDA, 262k envs, compact obs | RTX PRO 6000 Blackwell | 104.5M | - |
+| CUDA, 262k envs | RTX PRO 6000 Blackwell | 94.3M | 90.8M |
+| CUDA, 65k envs, compact obs | RTX PRO 6000 Blackwell | 89.5M | - |
+| CUDA, 65k envs | RTX PRO 6000 Blackwell | 85.6M | 69.2M |
+| CUDA, 186k envs, compact obs | RTX 3090 | 46.4M | 34.9M |
+| CUDA, 182k envs | RTX 3090 | 43.0M | 34.5M |
+| CUDA, 65k envs, compact obs | RTX 3090 | 40.4M | 29.3M |
+| CUDA, 65k envs | RTX 3090 | 38.2M | 28.9M |
+| C, 8192 envs, 32T | Ryzen 9 9950X3D | 5.6M | - |
+| C, 1024 envs, 1T | Ryzen 9 9950X3D | 750K | - |
+| CUDA (naive port, milestone 1), 65k envs | RTX 3090 | 454K | - |
+
+3090 env counts top out just under 192k (~184k default, ~187k compact):
+the worldgen scratch arena (~41.5KB/env) plus per-env state exhausts 24GB
+before the 262k the PRO 6000 fits.
 
 The full-game CUDA port is **bit-identical to the C build** -- the
 trajectory hash matches the CPU reference exactly at 64x2000 and
@@ -77,6 +87,28 @@ no trajectory bit:
   of floors actually generated during the dying episode (tracked in
   the pending-floor bitmask); never-visited floors provably still
   hold post-reset values
+- Mob-spawn request compaction: only ~2% of envs attempt a spawn per
+  step, so k_step keeps just the RNG draws and try-flags inline and
+  enqueues the rare candidate-scan tail into a worklist that a
+  warp-cooperative kernel drains densely between step and reset
+  (integer prefix-sum candidate selection, exact per-env draw order
+  preserved); spawn_mobs fell from 25.9% of k_step to ~1.4%, +6.6% SPS
+
+Full-game "env + policy" runs the same PufferLib default policy
+(Linear 843->32 encoder, MinGRU, actor/critic heads, categorical
+sampling) without ever materializing the observation tensor: the
+encoder gathers weight columns straight from SoA game state, skipping
+exact-zero features, which is bit-exact because only the set of
+skipped fmaf terms changes, never the summation order. Two
+hash-identical variants exist -- a split path (thread-per-env policy
+kernel + gameplay kernel) and a fused megakernel (`--fused 1`, policy
+forward + gameplay in one launch, the fastest path on the 3090). The
+gathered forward is verified bitwise against a dense reference from
+the materialized 843-float obs (`runverify`), and `runhash` seals the
+whole rollout (actions, logprobs, values, rewards, terminals) across
+fused/split, both obs builds, and repeated runs. Action sampling uses
+a dedicated Philox stream per (env, step), so the env's game RNG
+sequence is untouched -- random-action trajectory anchors still hold.
 
 "Env + policy" is a rollout megakernel: the PufferLib default craftax policy
 (Linear 1345->32 encoder, MinGRU, actor/critic heads), categorical sampling,
@@ -107,6 +139,9 @@ The classic CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 ./craftax_full hash --envs 64 --steps 2000           # full-game determinism anchor
 ./craftax_full_cuda hash --envs 64 --steps 2000      # CUDA port, same hash bit-exactly
 ./craftax_full_cuda bench --envs 65536 --iters 512   # full-game CUDA throughput
+./craftax_full_cuda run --envs 131072 --iters 500 --fused 1  # full-game env+policy rollouts
+./craftax_full_cuda runhash --envs 1024 --steps 500  # rollout determinism anchor
+./craftax_full_cuda runverify --envs 1024 --steps 128  # gathered vs dense forward, bitwise
 ```
 
 ## Verification
