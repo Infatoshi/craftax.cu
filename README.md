@@ -322,6 +322,23 @@ tree at this scale and capacity. There is no PufferLib baseline at
 these hypers for the full game; the classic-tuned coefficients
 transfer except for the entropy coefficient.
 
+`make full-h128` builds the hidden-128 full-game binary
+(`-DCRAFTAX_HIDDEN=128`, same flag as classic; the default hidden-32
+build is bit-identical to all canonicals). Its three policy paths --
+scalar split (`--fused 0`), scalar fused (`--fused 1`), and a
+warp-cooperative path (`--fused 2`: one warp per env, each lane owns
+4 hidden units, coalesced weight-column loads, GRU matvecs by warp
+broadcast in scalar accumulation order) -- produce bitwise-identical
+rollouts (h128 canonical runhash 1024x500 = 0x23288380b7245ff6), and
+gradcheck/replay/gathered-vs-dense all pass. Measured on an idle 3090
+at 65k envs: hidden-128 rollouts run 11.9M SPS (warp) / 11.8M (scalar
+fused) vs 29.8M at hidden 32 -- a 2.5x capacity tax, with the warp
+path only tying scalar (the step kernel, not the policy math,
+dominates). Training at 8192 envs: 0.46M SPS vs 3.05M at hidden 32.
+`--ent-anneal` (linear entropy-coefficient decay) is available for
+long runs; 1B-step hidden-128 runs targeting the stone/iron tier are
+the natural next experiment.
+
 ## Citation
 
 ```bibtex
