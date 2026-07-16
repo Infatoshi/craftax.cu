@@ -3,4 +3,3 @@ craftax_full
 craftax_full_cuda
 craftax_full_cuda_compact
 *.o
-craftax_full_cuda_h128*

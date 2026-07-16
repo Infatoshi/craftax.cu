@@ -9417,47 +9417,38 @@ __global__ void k_mega(
 }
 
 // ============================================================
-// NN-fused rollout path (run / runhash / runverify modes).
+// Batched policy + trainer kernels (run / runhash / runverify /
+// train / gradcheck modes).
 //
-// Policy = the PufferLib default for full craftax
-// (config/craftax.ini: hidden_size 32, num_layers 1):
-//   Linear(843 -> 32) encoder (no activation)
-//   MinGRU (1 layer, expansion_factor 1)
-//   actor Linear(32 -> 43) + value Linear(32 -> 1)
+// Policy (fixed, one architecture everywhere):
+//   Linear(843 -> 256) encoder (no activation)
+//   MinGRU x3 (hidden 256, expansion_factor 1)
+//   actor Linear(256 -> 43) + value Linear(256 -> 1)
 //
-// The fused forward NEVER materializes the 843-float observation: the
-// encoder gathers W_enc columns directly from SoA/AoS state, computing each
-// feature value with the exact expressions of k_encode / cf_encode_tail and
-// accumulating fmaf(x_f, W_enc[f], h) in dense feature order, skipping only
-// terms whose x_f is an exact float zero (invisible cells, absent mobs,
-// zero scalars). Skipping exact zeros with unchanged summation order leaves
-// the sum bit-identical to the dense loop (verified bitwise by runverify
-// against a dense reference forward computed from the materialized obs).
-// Explicit fmaf() is unaffected by -fmad=false.
+// The forward is BATCHED (ported from craftax_classic.cu /
+// main_classic.cu): a warp-per-env gather encoder writes col-major
+// activations, cuBLAS GEMMs compute the GRU pre-activations and
+// heads, and small elementwise epilogue kernels apply the MinGRU
+// cell. The encoder never materializes the 843-float observation:
+// it gathers W_enc columns directly from state, computing each
+// feature value with the exact expressions of k_encode /
+// cf_encode_tail and accumulating fmaf(x_f, W_enc[f], h) in dense
+// feature order, skipping only terms whose x_f is an exact float
+// zero. Skipping exact zeros with unchanged per-unit summation
+// order leaves each unit's sum bit-identical to the dense loop
+// (gated bitwise by runverify against a scalar L=3 reference
+// forward computed from the materialized obs).
 //
-// Sampling uses a dedicated Philox stream (seed ^ A5.., subsequence = env,
-// offset = global step): independent per (env, step) and fully disjoint
+// Sampling uses a dedicated Philox stream (seed ^ A5.., subsequence
+// = env, offset = a device step counter so CUDA graphs replay with
+// advancing offsets): independent per (env, step) and fully disjoint
 // from the env's threefry game RNG, which is never touched.
 // ============================================================
-// Compile-time hidden size. Default 32 (canonical hashes). Build a
-// hidden-128 binary with -DCRAFTAX_HIDDEN=128 (its runhash/verify/train
-// numbers live in a different universe; h32 anchors are unaffected).
-// Random-action env anchors (hash/statehash) are hidden-independent.
-#ifndef CRAFTAX_HIDDEN
-#define CRAFTAX_HIDDEN 32
-#endif
-#define CF_NN_HIDDEN CRAFTAX_HIDDEN
-#define CF_NN_GRU (3 * CF_NN_HIDDEN)
-// W_gru is 3*H*H floats: 12KB at hidden 32 (staged in shared memory) but
-// 192KB at hidden 128 -- over sm_86's 48KB static smem limit, so larger
-// builds read it straight from global (uniform across the block, so it
-// broadcasts through L1). s->W_gru[i] spelling works either way. Gate at
-// 24KB: k_ppo_backward must also fit W_a + the 16.9KB scatter tile.
-#if (3 * CF_NN_HIDDEN * CF_NN_HIDDEN * 4) <= 24576
-#define CF_GRU_SMEM 1
-#else
-#define CF_GRU_SMEM 0
-#endif
+#include <cublas_v2.h>
+
+#define CF_NN_HIDDEN 256
+#define CF_NN_LAYERS 3
+#define CF_NN_GRU (3 * CF_NN_HIDDEN)  // [zh|zg|zp] rows per layer
 #define CF_NN_OBS ((int)CRAFTAX_WG_PACKED_OBS_SIZE)  // 843
 #define CF_NN_MAP (CRAFTAX_WG_PACKED_MAP_OBS_SIZE)   // 792
 #define CF_NN_TAIL (CRAFTAX_WG_INVENTORY_OBS_SIZE)   // 51
@@ -9465,19 +9456,26 @@ __global__ void k_mega(
 #define CF_NN_W_ENC 0
 #define CF_NN_B_ENC (CF_NN_OBS * CF_NN_HIDDEN)
 #define CF_NN_W_GRU (CF_NN_B_ENC + CF_NN_HIDDEN)
-#define CF_NN_W_A (CF_NN_W_GRU + CF_NN_GRU * CF_NN_HIDDEN)
+#define CF_NN_W_GRU_ELEMS (CF_NN_LAYERS * CF_NN_GRU * CF_NN_HIDDEN)
+#define CF_NN_W_A (CF_NN_W_GRU + CF_NN_W_GRU_ELEMS)
 #define CF_NN_B_A (CF_NN_W_A + CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN)
 #define CF_NN_W_V (CF_NN_B_A + CRAFTAX_NUM_ACTIONS)
 #define CF_NN_B_V (CF_NN_W_V + CF_NN_HIDDEN)
 #define CF_NN_PARAM_COUNT (CF_NN_B_V + 1)
 
+// Training obs record: 792 uint8 packed-map bytes + 51 float scalar
+// tail (the CRAFTAX_WG_COMPACT_OBS_SIZE layout). Enough to recompute
+// the 843-float encoder input bit-exactly, independent of
+// CRAFTAX_COMPACT_OBS.
+#define CF_TRAIN_OBS ((int)CRAFTAX_WG_COMPACT_OBS_SIZE)  // 996
+
 typedef struct CfWeights {
-    const float* __restrict__ W_enc;  // [843][32], one row per input feature
-    const float* __restrict__ b_enc;  // [32]
-    const float* __restrict__ W_gru;  // [96][32]
-    const float* __restrict__ W_a;    // [43][32]
+    const float* __restrict__ W_enc;  // [843][256], one row per input feature
+    const float* __restrict__ b_enc;  // [256]
+    const float* __restrict__ W_gru;  // [3][768][256]
+    const float* __restrict__ W_a;    // [43][256]
     const float* __restrict__ b_a;    // [43]
-    const float* __restrict__ W_v;    // [32]
+    const float* __restrict__ W_v;    // [256]
     const float* __restrict__ b_v;    // [1]
 } CfWeights;
 
@@ -9491,254 +9489,16 @@ __global__ void k_nn_init_weights(
     w[i] = (2.0f * curand_uniform(&st) - 1.0f) * bound;
 }
 
-// Small weights staged in shared memory once per block (per-step kernel).
-typedef struct CfNNShared {
-#if CF_GRU_SMEM
-    float W_gru[CF_NN_GRU * CF_NN_HIDDEN];
-#else
-    const float* W_gru;
-#endif
-    float W_a[CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN];
-    float b_a[CRAFTAX_NUM_ACTIONS];
-    float W_v[CF_NN_HIDDEN];
-    float b_enc[CF_NN_HIDDEN];
-    float b_v;
-} CfNNShared;
-
-static __device__ void cf_nn_load_shared(CfNNShared* s, const CfWeights& w) {
-#if CF_GRU_SMEM
-    for (int i = threadIdx.x; i < CF_NN_GRU * CF_NN_HIDDEN; i += blockDim.x)
-        s->W_gru[i] = w.W_gru[i];
-#else
-    if (threadIdx.x == 0) s->W_gru = w.W_gru;
-#endif
-    for (int i = threadIdx.x; i < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN;
-         i += blockDim.x)
-        s->W_a[i] = w.W_a[i];
-    for (int i = threadIdx.x; i < CRAFTAX_NUM_ACTIONS; i += blockDim.x)
-        s->b_a[i] = w.b_a[i];
-    for (int i = threadIdx.x; i < CF_NN_HIDDEN; i += blockDim.x) {
-        s->W_v[i] = w.W_v[i];
-        s->b_enc[i] = w.b_enc[i];
-    }
-    if (threadIdx.x == 0) s->b_v = w.b_v[0];
-    __syncthreads();
-}
-
-// One weight-column FMA into the float4 accumulator. Loads are float4
-// (columns are 128B-aligned: W_enc starts a cudaMalloc'd arena and each
-// column is 32 floats); the per-component fmaf chains are the same
-// h[i] = fmaf(x, col[i], h[i]) as the scalar loop, so results are
-// bit-identical -- only the load width changes (4x fewer LSU ops).
-static __device__ __forceinline__ void cf_nn_fma_col(
-    float4* h4, float x, const float* __restrict__ colp
-) {
-    const float4* c4 = (const float4*)colp;
-    #pragma unroll
-    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
-        float4 cv = c4[b];
-        h4[b].x = fmaf(x, cv.x, h4[b].x);
-        h4[b].y = fmaf(x, cv.y, h4[b].y);
-        h4[b].z = fmaf(x, cv.z, h4[b].z);
-        h4[b].w = fmaf(x, cv.w, h4[b].w);
-    }
-}
-
-// Fused encoder: Linear(843 -> 32) gathered from state, feature values and
-// order exactly as k_encode + cf_encode_tail produce them.
-static __device__ void cf_nn_encoder_gather(
-    const CraftaxState* cs, const float* __restrict__ W_enc,
-    const float* __restrict__ b_enc, float* h
-) {
-    const CraftaxWorldState* state = (const CraftaxWorldState*)(const void*)cs;
-    float4 h4[CF_NN_HIDDEN / 4];
-    #pragma unroll
-    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
-        h4[b].x = b_enc[4 * b];
-        h4[b].y = b_enc[4 * b + 1];
-        h4[b].z = b_enc[4 * b + 2];
-        h4[b].w = b_enc[4 * b + 3];
-    }
-
-    const int level = CF(player_level, state);
-    const int mob_level =
-        craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
-    const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
-    const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
-
-    // Visible-mob list (same predicates and class/slot order as the
-    // k_encode scatter). Last-slot-wins per (cell, channel) is reproduced
-    // by overwriting an existing entry instead of appending.
-    int16_t mob_cell[14];
-    int8_t mob_ch[14];
-    float mob_val[14];
-    int nm = 0;
-    for (int c = 0; c < CRAFTAX_WG_NUM_MOB_CLASSES; c++) {
-        const int nslots = c == 2 ? 2 : 3;
-        for (int i = 0; i < nslots; i++) {
-            int type_id = MOB_TYPE(c, mob_level, i, state);
-            if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-                || !MOB_MASK(c, mob_level, i, state)) {
-                continue;
-            }
-            int mob_row = MOB_POS(c, mob_level, i, 0, state);
-            int mob_col = MOB_POS(c, mob_level, i, 1, state);
-            int local_row = mob_row - top;
-            int local_col = mob_col - left;
-            if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
-                || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
-                continue;
-            }
-            bool in_bounds = mob_row >= 0 && mob_row < CRAFTAX_WG_MAP_SIZE
-                && mob_col >= 0 && mob_col < CRAFTAX_WG_MAP_SIZE;
-            if (!in_bounds
-                || state->light_map[mob_level][mob_row][mob_col] <= 12) {
-                continue;
-            }
-            int16_t cell =
-                (int16_t)(local_row * CRAFTAX_WG_OBS_COLS + local_col);
-            int8_t ch = (int8_t)(3 + c);
-            int found = -1;
-            for (int j = 0; j < nm; j++)
-                if (mob_cell[j] == cell && mob_ch[j] == ch) found = j;
-            if (found >= 0) {
-                mob_val[found] = (float)(type_id + 1);
-            } else {
-                mob_cell[nm] = cell;
-                mob_ch[nm] = ch;
-                mob_val[nm] = (float)(type_id + 1);
-                nm++;
-            }
-        }
-    }
-
-    for (int cell = 0; cell < CRAFTAX_WG_OBS_ROWS * CRAFTAX_WG_OBS_COLS;
-         cell++) {
-        int row = cell / CRAFTAX_WG_OBS_COLS;
-        int col = cell % CRAFTAX_WG_OBS_COLS;
-        int world_row = top + row;
-        int world_col = left + col;
-        bool in_bounds = world_row >= 0 && world_row < CRAFTAX_WG_MAP_SIZE
-            && world_col >= 0 && world_col < CRAFTAX_WG_MAP_SIZE;
-        bool visible =
-            in_bounds && state->light_map[level][world_row][world_col] > 12;
-        int fbase = cell * CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
-        if (visible) {
-            float v0 = (float)state->map[level][world_row][world_col];
-            if (v0 != 0.0f)
-                cf_nn_fma_col(h4, v0, W_enc + (size_t)fbase * CF_NN_HIDDEN);
-            float v1 =
-                (float)state->item_map[level][world_row][world_col] + 1.0f;
-            if (v1 != 0.0f)
-                cf_nn_fma_col(h4, v1,
-                              W_enc + (size_t)(fbase + 1) * CF_NN_HIDDEN);
-            cf_nn_fma_col(h4, 1.0f,
-                          W_enc + (size_t)(fbase + 2) * CF_NN_HIDDEN);
-        }
-        for (int m = 0; m < nm; m++) {
-            if ((int)mob_cell[m] == cell) {
-                cf_nn_fma_col(
-                    h4, mob_val[m],
-                    W_enc + (size_t)(fbase + mob_ch[m]) * CF_NN_HIDDEN);
-            }
-        }
-    }
-
-    // Scalar tail: exact values of cf_encode_tail, zero terms skipped.
-    float tail[CF_NN_TAIL];
-    craftax_encode_scalar_observation_tail_at(state, tail, 0);
-    for (int j = 0; j < CF_NN_TAIL; j++) {
-        float x = tail[j];
-        if (x == 0.0f) continue;
-        cf_nn_fma_col(h4, x, W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN);
-    }
-
-    #pragma unroll
-    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
-        h[4 * b] = h4[b].x;
-        h[4 * b + 1] = h4[b].y;
-        h[4 * b + 2] = h4[b].z;
-        h[4 * b + 3] = h4[b].w;
-    }
-}
-
 static __device__ __forceinline__ float cf_nn_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 static __device__ __forceinline__ float cf_nn_mingru_g(float x) {
     return x >= 0.0f ? x + 0.5f : cf_nn_sigmoid(x);
 }
-
-// MinGRU cell + decoder heads (PufferLib MinGRU.forward_eval semantics:
-// out = lerp(state, g(hidden), sigmoid(gate)); highway on sigmoid(proj)).
-static __device__ void cf_nn_head(
-    const float* h_enc, float* state,
-    const float* __restrict__ W_gru, const float* __restrict__ W_a,
-    const float* __restrict__ b_a, const float* __restrict__ W_v, float b_v,
-    float* logits, float* value
-) {
-    // NOTE (register-pressure pass, 2026-07): fusing these two loops per-k
-    // (dropping the hidden/gate/proj arrays) cuts k_policy 255 -> 128 regs
-    // with zero spills -- and makes everything SLOWER on the 3090: the
-    // 128-reg k_policy runs 512 threads/SM and L1-thrashes (split run path
-    // 28.2 -> 19.4M SPS @65k); the fused k_step_policy stays at 4 blocks/SM
-    // and loses ~0.6%. The "wasteful" arrays are load-bearing: they pin
-    // register pressure high enough that occupancy stays at the L1-capacity
-    // optimum (256 threads/SM). Keep them.
-    float hout[CF_NN_HIDDEN];
-#if CF_NN_HIDDEN <= 64
-    float hidden[CF_NN_HIDDEN], gate[CF_NN_HIDDEN], proj[CF_NN_HIDDEN];
-    #pragma unroll
-    for (int k = 0; k < CF_NN_HIDDEN; k++) {
-        float zh = 0.0f, zg = 0.0f, zp = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < CF_NN_HIDDEN; j++) {
-            zh = fmaf(W_gru[k * CF_NN_HIDDEN + j], h_enc[j], zh);
-            zg = fmaf(W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], zg);
-            zp = fmaf(W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], zp);
-        }
-        hidden[k] = zh; gate[k] = zg; proj[k] = zp;
-    }
-    #pragma unroll
-    for (int k = 0; k < CF_NN_HIDDEN; k++) {
-        // torch.lerp(start, end, weight) = start + weight*(end-start)
-        float out = state[k]
-            + cf_nn_sigmoid(gate[k]) * (cf_nn_mingru_g(hidden[k]) - state[k]);
-        float p = cf_nn_sigmoid(proj[k]);
-        hout[k] = p * out + (1.0f - p) * h_enc[k];
-        state[k] = out;
-    }
-#else
-    // Large hidden: single fused loop over units (the staging arrays above
-    // are 3*H floats of pure register/local pressure at hidden 128; per-unit
-    // math and summation order are unchanged, so results are identical).
-    #pragma unroll
-    for (int k = 0; k < CF_NN_HIDDEN; k++) {
-        float zh = 0.0f, zg = 0.0f, zp = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < CF_NN_HIDDEN; j++) {
-            zh = fmaf(W_gru[k * CF_NN_HIDDEN + j], h_enc[j], zh);
-            zg = fmaf(W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], zg);
-            zp = fmaf(W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], zp);
-        }
-        float out = state[k]
-            + cf_nn_sigmoid(zg) * (cf_nn_mingru_g(zh) - state[k]);
-        float p = cf_nn_sigmoid(zp);
-        hout[k] = p * out + (1.0f - p) * h_enc[k];
-        state[k] = out;
-    }
-#endif
-    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
-        float z = b_a[a];
-        #pragma unroll
-        for (int j = 0; j < CF_NN_HIDDEN; j++)
-            z = fmaf(W_a[a * CF_NN_HIDDEN + j], hout[j], z);
-        logits[a] = z;
-    }
-    float v = b_v;
-    #pragma unroll
-    for (int j = 0; j < CF_NN_HIDDEN; j++) v = fmaf(W_v[j], hout[j], v);
-    *value = v;
+static __device__ __forceinline__ float cf_nn_dg_mingru(float x) {  // d/dx of cf_nn_mingru_g
+    if (x >= 0.0f) return 1.0f;
+    float s = cf_nn_sigmoid(x);
+    return s * (1.0f - s);
 }
 
 // Categorical sample from logits with one uniform; fills the sampled
@@ -9763,152 +9523,44 @@ static __device__ int cf_nn_sample_action(
     return action;
 }
 
-// Shared forward + sample tail used by every policy kernel: recurrent state
-// zeroing on the previous step's terminal, MinGRU + heads, Philox sample.
-static __device__ __forceinline__ int cf_nn_forward_tail(
-    const float* h_enc, float prev_terminal, float* __restrict__ h_state,
-    const float* W_gru, const float* W_a, const float* b_a,
-    const float* W_v, float b_v,
-    float* __restrict__ out_logprob, float* __restrict__ out_value,
-    int e, int num_envs, uint64_t seed, uint64_t step_count
+// ============================================================
+// Warp-cooperative live encoder: one warp per env, lane owns
+// CF_ENC_W = HIDDEN/32 = 8 hidden units. All 32 lanes redundantly
+// walk the same env's feature decode (uniform loads broadcast
+// through L1); each lane FMAs its W_enc row slice, so the warp
+// covers each 1-KB weight column line-exactly. Output is col-major
+// [HIDDEN][n]: h_enc[k + e*HIDDEN], fed straight to cuBLAS.
+// Feature values, order and zero-skip predicates are exactly
+// cf_encode / cf_encode_tail's (same walk the old scalar gather
+// used; only the unit->thread mapping changed, so per-unit fmaf
+// chains are bit-identical).
+// ============================================================
+#define CF_ENC_W (CF_NN_HIDDEN / 32)
+
+static __device__ __forceinline__ void cf_enc_acc(
+    float* hv, float x, const float* __restrict__ colp, int lane
 ) {
-    float st[CF_NN_HIDDEN];
-    if (prev_terminal != 0.0f) {
-        #pragma unroll
-        for (int i = 0; i < CF_NN_HIDDEN; i++) st[i] = 0.0f;
-    } else {
-        #pragma unroll
-        for (int i = 0; i < CF_NN_HIDDEN; i++)
-            st[i] = h_state[(size_t)e * CF_NN_HIDDEN + i];
-    }
-    float logits[CRAFTAX_NUM_ACTIONS], value, logprob;
-    cf_nn_head(h_enc, st, W_gru, W_a, b_a, W_v, b_v, logits, &value);
-    curandStatePhilox4_32_10_t sampler;
-    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, (uint64_t)e, step_count,
-                &sampler);
-    int action = cf_nn_sample_action(logits, curand_uniform(&sampler),
-                                     &logprob);
-    if (out_logprob) out_logprob[e] = logprob;
-    if (out_value) out_value[e] = value;
+    const float* col = colp + lane * CF_ENC_W;
     #pragma unroll
-    for (int i = 0; i < CF_NN_HIDDEN; i++)
-        h_state[(size_t)e * CF_NN_HIDDEN + i] = st[i];
-    return action;
+    for (int i = 0; i < CF_ENC_W; i++) hv[i] = fmaf(x, col[i], hv[i]);
 }
 
-// ------------------------------------------------------------
-// Production split-path policy kernel: thread-per-env scalar gather.
-// ~229 regs/thread caps it at 256 threads/SM (16.7% occupancy), but it is
-// issue-efficient: each warp advances 32 envs through the 843-feature loop
-// simultaneously. Two rejected alternatives, with numbers @65536 envs:
-//  - __launch_bounds__(256,2)/(256,3) to force occupancy: spills tanked the
-//    run path 29.7 -> 18.0 / 15.3M SPS.
-//  - warp-per-env (lane i owns hidden unit i, coalesced 128B column loads,
-//    smem-staged transposed weights, later smem-staged obs bytes): 20.9M
-//    then 19.6M SPS vs 29.7M scalar; ncu showed 2.00ms vs 1.07ms. The
-//    feature loop is serial per env, so a warp issues ~32x more uniform
-//    instructions per env than a thread does; hidden=32 is too narrow for
-//    warp-per-env to pay for itself.
-// ------------------------------------------------------------
-__global__ void k_policy(
-    CfWeights w, float* __restrict__ h_state,
-    const float* __restrict__ prev_terminals,
-    float* __restrict__ env_actions, int32_t* __restrict__ out_act,
-    float* __restrict__ out_logprob, float* __restrict__ out_value,
-    int num_envs, uint64_t seed, uint64_t step_count
+__global__ void k_encode_env_warp(
+    const float* __restrict__ W_enc, const float* __restrict__ b_enc,
+    float* __restrict__ h_enc, int num_envs
 ) {
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x & 31;
+    int e = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (e >= num_envs) return;
-    const CraftaxState* state = &((const CraftaxState*)g_cf_state_base)[e];
-    float h_enc[CF_NN_HIDDEN];
-    cf_nn_encoder_gather(state, w.W_enc, w.b_enc, h_enc);
-    int action = cf_nn_forward_tail(
-        h_enc, prev_terminals[e], h_state, w.W_gru, w.W_a, w.b_a, w.W_v,
-        w.b_v[0], out_logprob, out_value, e, num_envs, seed, step_count);
-    env_actions[e] = (float)action;
-    if (out_act) out_act[e] = action;
-}
-// Dense reference forward (runverify only): identical math from the
-// materialized observation tensor, dense feature loop skipping exact zeros.
-__global__ void k_policy_ref(
-    CfWeights w, float* __restrict__ h_state,
-    const float* __restrict__ prev_terminals,
-    const CraftaxObs* __restrict__ observations,
-    int32_t* __restrict__ out_act, float* __restrict__ out_logprob,
-    float* __restrict__ out_value,
-    int num_envs, uint64_t seed, uint64_t step_count
-) {
-    __shared__ CfNNShared s;
-    cf_nn_load_shared(&s, w);
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_envs) return;
-    const CraftaxObs* obs = observations + (size_t)e * CRAFTAX_OBS_SIZE;
-    float h_enc[CF_NN_HIDDEN];
-    #pragma unroll
-    for (int i = 0; i < CF_NN_HIDDEN; i++) h_enc[i] = s.b_enc[i];
-    for (int f = 0; f < CF_NN_MAP; f++) {
-        float xf = (float)obs[f];
-        if (xf == 0.0f) continue;
-        const float* colp = w.W_enc + (size_t)f * CF_NN_HIDDEN;
-        #pragma unroll
-        for (int i = 0; i < CF_NN_HIDDEN; i++)
-            h_enc[i] = fmaf(xf, colp[i], h_enc[i]);
-    }
-    for (int j = 0; j < CF_NN_TAIL; j++) {
-        float xf;
-#ifdef CRAFTAX_COMPACT_OBS
-        memcpy(&xf, obs + CF_NN_MAP + 4 * j, sizeof(float));
-#else
-        xf = obs[CF_NN_MAP + j];
-#endif
-        if (xf == 0.0f) continue;
-        const float* colp = w.W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN;
-        #pragma unroll
-        for (int i = 0; i < CF_NN_HIDDEN; i++)
-            h_enc[i] = fmaf(xf, colp[i], h_enc[i]);
-    }
-    int action = cf_nn_forward_tail(
-        h_enc, prev_terminals[e], h_state, s.W_gru, s.W_a, s.b_a, s.W_v,
-        s.b_v, out_logprob, out_value, e, num_envs, seed, step_count);
-    if (out_act) out_act[e] = action;
-}
-
-// ------------------------------------------------------------
-// Warp-cooperative policy forward (hidden % 128 == 0 builds only; the
-// h32 binary compiles none of this). One warp per env, lane l owns
-// hidden units [4l, 4l+4) as a float4. Bit-identical to k_policy:
-//  - encoder: same feature decode (duplicated below -- KEEP IN SYNC with
-//    cf_nn_encoder_gather) and the same per-unit fmaf chain; only the
-//    unit->thread mapping changes. W_enc column loads are one coalesced
-//    512B line per feature instead of a 32x broadcast loop.
-//  - GRU matvecs: j runs 0..H-1 sequentially per output unit (h_enc
-//    broadcast from the owning lane via shuffle), so each unit's
-//    accumulation order is exactly the scalar loop's.
-//  - heads: hout staged in shared memory; one lane per logit row, each
-//    row's j-chain sequential; lane 0 samples with the same Philox
-//    stream and writes the same outputs.
-// ------------------------------------------------------------
-#if CF_NN_HIDDEN == 128
-
-static __device__ __forceinline__ void cf_nn_warp_fma(
-    float4* acc, float x, const float* __restrict__ colp, int lane
-) {
-    float4 cv = ((const float4*)colp)[lane];
-    acc->x = fmaf(x, cv.x, acc->x);
-    acc->y = fmaf(x, cv.y, acc->y);
-    acc->z = fmaf(x, cv.z, acc->z);
-    acc->w = fmaf(x, cv.w, acc->w);
-}
-
-// KEEP IN SYNC with cf_nn_encoder_gather: identical predicates, feature
-// order, and skip conditions. The decode is computed redundantly by all
-// 32 lanes (uniform, so it broadcasts); only the FMA work is split.
-static __device__ void cf_nn_encoder_gather_warp(
-    const CraftaxState* cs, const float* __restrict__ W_enc,
-    const float* __restrict__ b_enc, int lane, float4* acc
-) {
+    const CraftaxState* cs = &((const CraftaxState*)g_cf_state_base)[e];
     const CraftaxWorldState* state = (const CraftaxWorldState*)(const void*)cs;
-    *acc = ((const float4*)b_enc)[lane];
+
+    float hv[CF_ENC_W];
+    {
+        const float* be = b_enc + lane * CF_ENC_W;
+        #pragma unroll
+        for (int i = 0; i < CF_ENC_W; i++) hv[i] = be[i];
+    }
 
     const int level = CF(player_level, state);
     const int mob_level =
@@ -9916,6 +9568,10 @@ static __device__ void cf_nn_encoder_gather_warp(
     const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
     const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
 
+    // Visible-mob list (same predicates and class/slot order as the
+    // k_encode scatter). Last-slot-wins per (cell, channel) is reproduced
+    // by overwriting an existing entry instead of appending. Built
+    // redundantly by every lane (uniform).
     int16_t mob_cell[14];
     int8_t mob_ch[14];
     float mob_val[14];
@@ -9973,145 +9629,281 @@ static __device__ void cf_nn_encoder_gather_warp(
         if (visible) {
             float v0 = (float)state->map[level][world_row][world_col];
             if (v0 != 0.0f)
-                cf_nn_warp_fma(acc, v0,
-                               W_enc + (size_t)fbase * CF_NN_HIDDEN, lane);
+                cf_enc_acc(hv, v0, W_enc + (size_t)fbase * CF_NN_HIDDEN, lane);
             float v1 =
                 (float)state->item_map[level][world_row][world_col] + 1.0f;
             if (v1 != 0.0f)
-                cf_nn_warp_fma(acc, v1,
-                               W_enc + (size_t)(fbase + 1) * CF_NN_HIDDEN,
-                               lane);
-            cf_nn_warp_fma(acc, 1.0f,
-                           W_enc + (size_t)(fbase + 2) * CF_NN_HIDDEN, lane);
+                cf_enc_acc(hv, v1,
+                           W_enc + (size_t)(fbase + 1) * CF_NN_HIDDEN, lane);
+            cf_enc_acc(hv, 1.0f,
+                       W_enc + (size_t)(fbase + 2) * CF_NN_HIDDEN, lane);
         }
         for (int m = 0; m < nm; m++) {
             if ((int)mob_cell[m] == cell) {
-                cf_nn_warp_fma(
-                    acc, mob_val[m],
+                cf_enc_acc(
+                    hv, mob_val[m],
                     W_enc + (size_t)(fbase + mob_ch[m]) * CF_NN_HIDDEN, lane);
             }
         }
     }
 
+    // Scalar tail: exact values of cf_encode_tail, zero terms skipped.
     float tail[CF_NN_TAIL];
     craftax_encode_scalar_observation_tail_at(state, tail, 0);
     for (int j = 0; j < CF_NN_TAIL; j++) {
         float x = tail[j];
         if (x == 0.0f) continue;
-        cf_nn_warp_fma(acc, x, W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN,
-                       lane);
+        cf_enc_acc(hv, x, W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN,
+                   lane);
     }
+
+    float4* dst = (float4*)(h_enc + (size_t)e * CF_NN_HIDDEN
+                            + lane * CF_ENC_W);
+    dst[0] = make_float4(hv[0], hv[1], hv[2], hv[3]);
+    dst[1] = make_float4(hv[4], hv[5], hv[6], hv[7]);
 }
 
-#define CF_POL_WARPS 4  // warps (envs) per block
-__global__ void k_policy_warp(
-    CfWeights w, float* __restrict__ h_state,
-    const float* __restrict__ prev_terminals,
-    float* __restrict__ env_actions, int32_t* __restrict__ out_act,
-    float* __restrict__ out_logprob, float* __restrict__ out_value,
-    int num_envs, uint64_t seed, uint64_t step_count
-) {
-    __shared__ float s_hout[CF_POL_WARPS][CF_NN_HIDDEN];
-    __shared__ float s_logits[CF_POL_WARPS][CRAFTAX_NUM_ACTIONS];
-    __shared__ float s_value[CF_POL_WARPS];
-    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int e = blockIdx.x * CF_POL_WARPS + warp;
+// Compact obs record for the training rollout (row t of r_obs).
+__global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_envs) return;
-    const CraftaxState* state = &((const CraftaxState*)g_cf_state_base)[e];
-
-    float4 h4;
-    cf_nn_encoder_gather_warp(state, w.W_enc, w.b_enc, lane, &h4);
-
-    float4 st;
-    if (prev_terminals[e] != 0.0f) {
-        st = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    } else {
-        st = ((const float4*)(h_state + (size_t)e * CF_NN_HIDDEN))[lane];
-    }
-
-    // GRU matvecs, j sequential via warp broadcast (scalar order per unit).
-    float zh[4] = {0, 0, 0, 0}, zg[4] = {0, 0, 0, 0}, zp[4] = {0, 0, 0, 0};
-    for (int jb = 0; jb < 32; jb++) {
-        float4 hj;
-        hj.x = __shfl_sync(0xffffffffu, h4.x, jb);
-        hj.y = __shfl_sync(0xffffffffu, h4.y, jb);
-        hj.z = __shfl_sync(0xffffffffu, h4.z, jb);
-        hj.w = __shfl_sync(0xffffffffu, h4.w, jb);
-        #pragma unroll
-        for (int u = 0; u < 4; u++) {
-            int k = 4 * lane + u;
-            float4 wh = ((const float4*)(w.W_gru
-                + (size_t)k * CF_NN_HIDDEN))[jb];
-            float4 wg = ((const float4*)(w.W_gru
-                + (size_t)(CF_NN_HIDDEN + k) * CF_NN_HIDDEN))[jb];
-            float4 wp = ((const float4*)(w.W_gru
-                + (size_t)(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN))[jb];
-            zh[u] = fmaf(wh.x, hj.x, zh[u]);
-            zh[u] = fmaf(wh.y, hj.y, zh[u]);
-            zh[u] = fmaf(wh.z, hj.z, zh[u]);
-            zh[u] = fmaf(wh.w, hj.w, zh[u]);
-            zg[u] = fmaf(wg.x, hj.x, zg[u]);
-            zg[u] = fmaf(wg.y, hj.y, zg[u]);
-            zg[u] = fmaf(wg.z, hj.z, zg[u]);
-            zg[u] = fmaf(wg.w, hj.w, zg[u]);
-            zp[u] = fmaf(wp.x, hj.x, zp[u]);
-            zp[u] = fmaf(wp.y, hj.y, zp[u]);
-            zp[u] = fmaf(wp.z, hj.z, zp[u]);
-            zp[u] = fmaf(wp.w, hj.w, zp[u]);
-        }
-    }
-    float4 hout4, stout;
-    #pragma unroll
-    for (int u = 0; u < 4; u++) {
-        float st_u = (&st.x)[u];
-        float he_u = (&h4.x)[u];
-        float out = st_u
-            + cf_nn_sigmoid(zg[u]) * (cf_nn_mingru_g(zh[u]) - st_u);
-        float p = cf_nn_sigmoid(zp[u]);
-        (&hout4.x)[u] = p * out + (1.0f - p) * he_u;
-        (&stout.x)[u] = out;
-    }
-    ((float4*)s_hout[warp])[lane] = hout4;
-    __syncwarp();
-
-    // Heads: lane a computes logits[a] (rows 0..31), then lanes 0..10 the
-    // remaining rows 32..42; lane 11 computes the value. Each row's
-    // j-chain is sequential from the staged hout: scalar order.
-    const float* hh = s_hout[warp];
-    {
-        float z = w.b_a[lane];
-        const float* wa = w.W_a + (size_t)lane * CF_NN_HIDDEN;
-        for (int j = 0; j < CF_NN_HIDDEN; j++) z = fmaf(wa[j], hh[j], z);
-        s_logits[warp][lane] = z;
-    }
-    if (lane < CRAFTAX_NUM_ACTIONS - 32) {
-        int a = 32 + lane;
-        float z = w.b_a[a];
-        const float* wa = w.W_a + (size_t)a * CF_NN_HIDDEN;
-        for (int j = 0; j < CF_NN_HIDDEN; j++) z = fmaf(wa[j], hh[j], z);
-        s_logits[warp][a] = z;
-    } else if (lane == CRAFTAX_NUM_ACTIONS - 32) {
-        float z = w.b_v[0];
-        for (int j = 0; j < CF_NN_HIDDEN; j++) z = fmaf(w.W_v[j], hh[j], z);
-        s_value[warp] = z;
-    }
-    __syncwarp();
-
-    if (lane == 0) {
-        curandStatePhilox4_32_10_t sampler;
-        curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, (uint64_t)e, step_count,
-                    &sampler);
-        float logprob;
-        int action = cf_nn_sample_action(s_logits[warp],
-                                         curand_uniform(&sampler), &logprob);
-        if (out_logprob) out_logprob[e] = logprob;
-        if (out_value) out_value[e] = s_value[warp];
-        env_actions[e] = (float)action;
-        if (out_act) out_act[e] = action;
-    }
-    ((float4*)(h_state + (size_t)e * CF_NN_HIDDEN))[lane] = stout;
+    const CraftaxState* cs = &((const CraftaxState*)g_cf_state_base)[e];
+    craftax_encode_compact_observation(
+        (const CraftaxWorldState*)(const void*)cs,
+        r_obs_row + (size_t)e * CF_TRAIN_OBS);
 }
-#endif  // CF_NN_HIDDEN == 128
+
+// ============================================================
+// MinGRU layer epilogue (elementwise, one thread per (unit, col)).
+// pre/x/state/h_out are col-major; HIDDEN is a power of two so the
+// (k, col) decode is a mask+shift. Semantics match the old scalar
+// cf_nn_head exactly: state zeroed when the env's previous terminal
+// is set (the post-zero input is what gets stored for BPTT),
+// out = st + sg*(g(zh)-st), h_out = p*out + (1-p)*x.
+// ============================================================
+__global__ void k_mingru_epi_fwd(
+    const float* __restrict__ pre,     // [GRU][cols] col-major
+    const float* __restrict__ x,       // [HIDDEN][cols]
+    float* __restrict__ state,         // [HIDDEN][cols] live, in/out
+    float* __restrict__ h_out,         // [HIDDEN][cols]
+    float* __restrict__ r_state_store, // [HIDDEN][cols] post-zero inputs, or null
+    const float* __restrict__ prev_terminals,  // [cols]
+    int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CF_NN_HIDDEN * cols) return;
+    int k = idx & (CF_NN_HIDDEN - 1);
+    int col = idx / CF_NN_HIDDEN;
+    size_t o = (size_t)col * CF_NN_HIDDEN + k;
+
+    float st = state[o];
+    if (prev_terminals[col] != 0.0f) st = 0.0f;
+    if (r_state_store) r_state_store[o] = st;
+
+    size_t o3 = (size_t)col * CF_NN_GRU + k;
+    float zh = pre[o3];
+    float zg = pre[o3 + CF_NN_HIDDEN];
+    float zp = pre[o3 + 2 * CF_NN_HIDDEN];
+    float out = st + cf_nn_sigmoid(zg) * (cf_nn_mingru_g(zh) - st);
+    float p = cf_nn_sigmoid(zp);
+    float xv = x[o];
+    h_out[o] = p * out + (1.0f - p) * xv;
+    state[o] = out;
+}
+
+// Live-recurrence replay for the backward's forward-recompute and
+// loss(): launched once per (t, layer) over one step's columns. At a
+// BPTT segment start the state input is reloaded from the stored slab
+// (env-major el*HIDDEN+k, same layout k_mingru_epi_fwd stores,
+// pointer pre-offset by env_start*HIDDEN -- the truncation constant,
+// matching the sweep's dcarry zeroing at segment boundaries); inside
+// a segment it carries live from the previous step's out, zeroed on
+// the done between the steps. The post-zero input state actually used
+// is optionally recorded in tight layout for the backward sweep.
+__global__ void k_mingru_epi_replay(
+    const float* __restrict__ pre,       // [GRU][mb] this step
+    const float* __restrict__ x,         // [HIDDEN][mb] this step
+    const float* __restrict__ r_state_t, // stored slab at (t, layer); segment start only, else null
+    float* __restrict__ live,            // [HIDDEN][mb] carry in/out
+    const uint8_t* __restrict__ prev_dones, // dones between t-1 and t (+env offset); null at segment start
+    float* __restrict__ st_store,        // [HIDDEN][mb] tight st record for the sweep, or null
+    float* __restrict__ x_next,          // [HIDDEN][mb]
+    int mb
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CF_NN_HIDDEN * mb) return;
+    int k = idx & (CF_NN_HIDDEN - 1);
+    int el = idx / CF_NN_HIDDEN;
+    size_t o = (size_t)el * CF_NN_HIDDEN + k;
+
+    float st;
+    if (r_state_t) {
+        st = r_state_t[o];
+    } else {
+        st = live[o];
+        if (prev_dones[el]) st = 0.0f;
+    }
+    if (st_store) st_store[o] = st;
+    size_t o3 = (size_t)el * CF_NN_GRU + k;
+    float zh = pre[o3];
+    float zg = pre[o3 + CF_NN_HIDDEN];
+    float zp = pre[o3 + 2 * CF_NN_HIDDEN];
+    float out = st + cf_nn_sigmoid(zg) * (cf_nn_mingru_g(zh) - st);
+    float p = cf_nn_sigmoid(zp);
+    x_next[o] = p * out + (1.0f - p) * x[o];
+    live[o] = out;
+}
+
+// ============================================================
+// Heads: value dot + categorical sample. One thread per env.
+// Also writes the env's action slot so k_step_run picks it up.
+// ============================================================
+__global__ void k_value_sample(
+    const float* __restrict__ h_out,   // [HIDDEN][cols] col-major
+    const float* __restrict__ logits,  // [NUM_ACTIONS][cols] col-major
+    const float* __restrict__ b_a,
+    const float* __restrict__ W_v, const float* __restrict__ b_v,
+    float* __restrict__ env_actions,
+    int32_t* __restrict__ actions, float* __restrict__ logprobs,
+    float* __restrict__ values,
+    int cols, uint64_t seed, const uint64_t* __restrict__ step_ctr
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= cols) return;
+
+    const float* h = h_out + (size_t)e * CF_NN_HIDDEN;
+    float v = b_v[0];
+    for (int i = 0; i < CF_NN_HIDDEN; i++) v = fmaf(W_v[i], h[i], v);
+    values[e] = v;
+
+    float logits_e[CRAFTAX_NUM_ACTIONS];
+    const float* lp = logits + (size_t)e * CRAFTAX_NUM_ACTIONS;
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++)
+        logits_e[a] = lp[a] + b_a[a];
+
+    curandStatePhilox4_32_10_t sampler;
+    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, (uint64_t)e, *step_ctr,
+                &sampler);
+    float logp;
+    int action = cf_nn_sample_action(logits_e, curand_uniform(&sampler),
+                                     &logp);
+    env_actions[e] = (float)action;
+    actions[e] = action;
+    logprobs[e] = logp;
+}
+
+// Value only (GAE bootstrap on the post-rollout state).
+__global__ void k_value_dot(
+    const float* __restrict__ h_out, const float* __restrict__ W_v,
+    const float* __restrict__ b_v, float* __restrict__ v_out, int cols
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= cols) return;
+    const float* h = h_out + (size_t)e * CF_NN_HIDDEN;
+    float v = b_v[0];
+    for (int i = 0; i < CF_NN_HIDDEN; i++) v = fmaf(W_v[i], h[i], v);
+    v_out[e] = v;
+}
+
+// Reward/done extraction into slab row t (right after k_step_run:
+// gameplay wrote this step's reward and terminal).
+__global__ void k_record_rd(
+    const float* __restrict__ rewards, const float* __restrict__ terminals,
+    float* __restrict__ r_reward_row, uint8_t* __restrict__ r_done_row,
+    int num_envs
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+    r_reward_row[e] = rewards[e];
+    r_done_row[e] = terminals[e] != 0.0f ? 1 : 0;
+}
+
+// Single-thread counter bump (graph node): step counter / adam step.
+__global__ void k_bump_ctr(uint64_t* __restrict__ ctr) { *ctr += 1; }
+
+// ============================================================
+// Scalar L=3 reference policy (runverify only): one thread per env,
+// dense feature walk from the MATERIALIZED observation tensor,
+// strictly fp32. h[HIDDEN] lives in local memory; use small env
+// counts. ref_state is the reference's own [L][H][n] buffer.
+// ============================================================
+__global__ void k_policy_ref_l3(
+    CfWeights w, float* __restrict__ ref_state,  // [L][H][n]
+    const float* __restrict__ prev_terminals,
+    const CraftaxObs* __restrict__ observations,
+    int32_t* __restrict__ r_act, float* __restrict__ r_logprob,
+    float* __restrict__ r_value, float* __restrict__ ref_h3,  // [H][n] col-major
+    int num_envs, uint64_t seed, const uint64_t* __restrict__ step_ctr
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs) return;
+    const int n = num_envs;
+    const CraftaxObs* obs = observations + (size_t)e * CRAFTAX_OBS_SIZE;
+
+    float h[CF_NN_HIDDEN], h2[CF_NN_HIDDEN];
+    for (int i = 0; i < CF_NN_HIDDEN; i++) h[i] = w.b_enc[i];
+    for (int f = 0; f < CF_NN_MAP; f++) {
+        float xf = (float)obs[f];
+        if (xf == 0.0f) continue;
+        const float* colp = w.W_enc + (size_t)f * CF_NN_HIDDEN;
+        for (int i = 0; i < CF_NN_HIDDEN; i++)
+            h[i] = fmaf(xf, colp[i], h[i]);
+    }
+    for (int j = 0; j < CF_NN_TAIL; j++) {
+        float xf;
+#ifdef CRAFTAX_COMPACT_OBS
+        memcpy(&xf, obs + CF_NN_MAP + 4 * j, sizeof(float));
+#else
+        xf = obs[CF_NN_MAP + j];
+#endif
+        if (xf == 0.0f) continue;
+        const float* colp = w.W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN;
+        for (int i = 0; i < CF_NN_HIDDEN; i++)
+            h[i] = fmaf(xf, colp[i], h[i]);
+    }
+
+    for (int l = 0; l < CF_NN_LAYERS; l++) {
+        const float* Wl = w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN;
+        bool dz = prev_terminals[e] != 0.0f;
+        for (int k = 0; k < CF_NN_HIDDEN; k++) {
+            float st =
+                dz ? 0.0f : ref_state[((size_t)l * CF_NN_HIDDEN + k) * n + e];
+            float zh = 0.0f, zg = 0.0f, zp = 0.0f;
+            for (int j = 0; j < CF_NN_HIDDEN; j++) {
+                zh = fmaf(Wl[k * CF_NN_HIDDEN + j], h[j], zh);
+                zg = fmaf(Wl[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h[j], zg);
+                zp = fmaf(Wl[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h[j],
+                          zp);
+            }
+            float out = st + cf_nn_sigmoid(zg) * (cf_nn_mingru_g(zh) - st);
+            float p = cf_nn_sigmoid(zp);
+            h2[k] = p * out + (1.0f - p) * h[k];
+            ref_state[((size_t)l * CF_NN_HIDDEN + k) * n + e] = out;
+        }
+        for (int i = 0; i < CF_NN_HIDDEN; i++) h[i] = h2[i];
+    }
+    for (int i = 0; i < CF_NN_HIDDEN; i++)
+        ref_h3[(size_t)e * CF_NN_HIDDEN + i] = h[i];
+
+    float logits[CRAFTAX_NUM_ACTIONS];
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        float z = w.b_a[a];
+        for (int j = 0; j < CF_NN_HIDDEN; j++)
+            z = fmaf(w.W_a[a * CF_NN_HIDDEN + j], h[j], z);
+        logits[a] = z;
+    }
+    float value = w.b_v[0];
+    for (int j = 0; j < CF_NN_HIDDEN; j++)
+        value = fmaf(w.W_v[j], h[j], value);
+
+    curandStatePhilox4_32_10_t sampler;
+    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, (uint64_t)e, *step_ctr,
+                &sampler);
+    float logp;
+    r_act[e] = cf_nn_sample_action(logits, curand_uniform(&sampler), &logp);
+    r_logprob[e] = logp;
+    r_value[e] = value;
+}
 
 // Step kernel for the rollout path: actions come from the policy (already
 // in env->actions), and no observation bytes are written at all.
@@ -10129,39 +9921,8 @@ __global__ void CRAFTAX_STEP_LB k_step_run(Craftax* envs, int num_envs, CraftaxR
     }
 }
 
-// Fused variant: policy forward + gameplay in one kernel (weights read
-// straight from global so k_step's occupancy is not smem-capped). Same
-// math, same buffers -- bitwise identical to k_policy; k_step_run.
-__global__ void CRAFTAX_STEP_LB k_step_policy(
-    Craftax* envs, CfWeights w, float* __restrict__ h_state, int num_envs,
-    CraftaxResetRec* resets, int32_t* __restrict__ out_act,
-    float* __restrict__ out_logprob, float* __restrict__ out_value,
-    uint64_t seed, uint64_t step_count
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_envs) return;
-    Craftax* env = &envs[i];
-    const CraftaxState* state = env->state;
-    float h_enc[CF_NN_HIDDEN];
-    cf_nn_encoder_gather(state, w.W_enc, w.b_enc, h_enc);
-    int action = cf_nn_forward_tail(
-        h_enc, env->terminals[0], h_state, w.W_gru, w.W_a, w.b_a, w.W_v,
-        w.b_v[0], out_logprob, out_value, i, num_envs, seed, step_count);
-    env->actions[0] = (float)action;
-    if (out_act) out_act[i] = action;
-
-    CraftaxThreefryKey reset_key;
-    bool done = c_step_gameplay_core(env, &reset_key);
-    if (done) {
-        int slot = atomicAdd(&g_reset_count, 1);
-        resets[slot].env = i;
-        resets[slot].key0 = reset_key.word[0];
-        resets[slot].key1 = reset_key.word[1];
-    }
-}
-
 // Scalar-tail encode as a standalone kernel (runverify materializes the
-// full obs; in the normal split path k_step writes the tail itself).
+// full obs; the batched rollout path never writes observation bytes).
 __global__ void k_encode_tail(Craftax* envs, int num_envs) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_envs) return;
@@ -10189,151 +9950,402 @@ __global__ void k_nan_scan(
 }
 
 // ============================================================
-// On-device PPO training (train / gradcheck modes).
-//
-// Per rollout step the training kernel stores, per env:
-//   - a 996-byte compact obs record (792 uint8 packed-map bytes +
-//     51 float scalar tail, the CRAFTAX_WG_COMPACT_OBS_SIZE layout):
-//     enough to recompute the 843-float encoder input bit-exactly,
-//     independent of CRAFTAX_COMPACT_OBS
-//   - the MinGRU state INPUT (post terminal-zeroing) [32 floats]
-//   - action, logprob, value, reward, done
-// Backward recomputes the forward from the record: the encoder's
-// active set is exactly the nonzero record entries (map features are
-// scalar-coded ids where x_f = (float)byte; tail features are
-// continuous floats used verbatim), so the W_enc gradient scatters
-// x_f * dh_enc into exactly the columns the forward touched.
-// Parameter layout is the flat CF_NN_* arena of the run path.
+// Training: PPO with a batched-GEMM backward, entirely on device
+// (ported from main_classic.cu). The rollout stores r_obs (996
+// B/sample), r_state (per-layer post-zero state inputs, 3
+// KB/sample) and the small scalars. Each minibatch recomputes the
+// forward at the current theta from r_obs with live recurrence
+// inside each BPTT segment (stored r_state used only as the
+// constant at segment starts -- the truncation point where the
+// sweep zeroes dcarry), then:
+//   - head grads per sample (k_head_bwd)
+//   - dh chain up the layers via cuBLAS (W^T @ dpre GEMMs)
+//   - per-layer backward sweeps, thread per (unit, env), dcarry as
+//     the only sequential part (k_mingru_sweep_bwd)
+//   - weight grads as flat GEMMs over samples (beta=1 accumulation)
+//   - dW_enc as a thread-per-(unit, sample) sparse scatter (k_enc_bwd)
+// dpre aliases pre (each sweep element is read before written).
 // ============================================================
-#define CF_TRAIN_OBS ((int)CRAFTAX_WG_COMPACT_OBS_SIZE)  // 996
 
-// Encoder forward from a stored compact record. Feature order and fmaf
-// order match cf_nn_encoder_gather / k_policy_ref exactly (dense
-// ascending feature index, exact-zero terms skipped), so h_enc is
-// bit-identical to the value the rollout computed.
-static __device__ void cf_nn_encoder_from_record(
-    const uint8_t* __restrict__ rec, const float* __restrict__ W_enc,
-    const float* __restrict__ b_enc, float* h
+// Encoder from stored compact obs records (backward recompute, loss).
+// One thread per (hidden unit k, sample w); sample w maps to
+// (t = t0 + w / mb, env offset env_start + w % mb). Output column w
+// (tight [HIDDEN][count]). Dense ascending feature walk, exact-zero
+// terms skipped: bit-identical to k_encode_env_warp's per-unit sums.
+// NOTE: thread-per-unit on purpose. The classic warp-cooperative
+// form of this stored-obs kernel (and its backward twin) miscompiled
+// under nvcc 13.2 sm_120 -O3 (garbage tail reads, dropped final
+// float4 store, compilation-context-dependent); do NOT
+// re-warp-cooperatize this pair.
+__global__ void k_encode_obs(
+    const uint8_t* __restrict__ r_obs,
+    const float* __restrict__ W_enc, const float* __restrict__ b_enc,
+    float* __restrict__ h_enc,
+    int t0, int count, int mb, int n, int env_start
 ) {
-    float4 h4[CF_NN_HIDDEN / 4];
-    #pragma unroll
-    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
-        h4[b].x = b_enc[4 * b];
-        h4[b].y = b_enc[4 * b + 1];
-        h4[b].z = b_enc[4 * b + 2];
-        h4[b].w = b_enc[4 * b + 3];
-    }
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CF_NN_HIDDEN * count) return;
+    int k = idx & (CF_NN_HIDDEN - 1);
+    int w = idx / CF_NN_HIDDEN;
+    int t = t0 + w / mb;
+    int el = w - (w / mb) * mb;
+    const uint8_t* rec =
+        r_obs + ((size_t)t * n + env_start + el) * CF_TRAIN_OBS;
+    const float* Wk = W_enc + k;
+
+    float hv = b_enc[k];
     for (int f = 0; f < CF_NN_MAP; f++) {
         float x = (float)rec[f];
         if (x == 0.0f) continue;
-        cf_nn_fma_col(h4, x, W_enc + (size_t)f * CF_NN_HIDDEN);
+        hv = fmaf(x, Wk[(size_t)f * CF_NN_HIDDEN], hv);
     }
     for (int j = 0; j < CF_NN_TAIL; j++) {
         float x;
         memcpy(&x, rec + CF_NN_MAP + 4 * j, sizeof(float));
         if (x == 0.0f) continue;
-        cf_nn_fma_col(h4, x, W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN);
+        hv = fmaf(x, Wk[(size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN], hv);
     }
-    #pragma unroll
-    for (int b = 0; b < CF_NN_HIDDEN / 4; b++) {
-        h[4 * b] = h4[b].x;
-        h[4 * b + 1] = h4[b].y;
-        h[4 * b + 2] = h4[b].z;
-        h[4 * b + 3] = h4[b].w;
-    }
+    h_enc[(size_t)w * CF_NN_HIDDEN + k] = hv;
 }
 
-// Fused rollout step with training storage: k_step_policy plus the
-// per-step record writes. The inference-only k_step_policy is untouched
-// (same math; runhash canonicals stay in their own universe).
-__global__ void CRAFTAX_STEP_LB k_step_policy_train(
-    Craftax* envs, CfWeights w, float* __restrict__ h_state, int num_envs,
-    CraftaxResetRec* resets,
-    uint8_t* __restrict__ r_obs,      // row t: [n][CF_TRAIN_OBS]
-    float* __restrict__ r_state_row,  // row t: [n][CF_NN_HIDDEN] state inputs
-    int32_t* __restrict__ r_act, float* __restrict__ r_logprob,
-    float* __restrict__ r_value, float* __restrict__ r_reward,
-    uint8_t* __restrict__ r_done,
-    uint64_t seed, uint64_t step_count
+// Head gradients for one sample column: softmax policy loss (clipped
+// ratio), entropy bonus and value loss grads, writing dlogits (tight
+// [NUM_ACTIONS][T*mb]) and dvalue ([T*mb]) for the GEMM chain.
+// Optional loss_acc adds raw (unnormalized) double sums for logging.
+// ent_coef comes from device memory so entropy annealing is a single
+// float write into a captured graph.
+__global__ void k_head_bwd(
+    const float* __restrict__ logits,   // tight [NUM_ACTIONS][T*mb]
+    const float* __restrict__ h_out,    // tight [HIDDEN][T*mb]
+    const float* __restrict__ b_a,
+    const float* __restrict__ W_v, const float* __restrict__ b_v,
+    const int32_t* __restrict__ r_act,      // slab + env_start
+    const float* __restrict__ r_logprob,    // slab + env_start
+    const float* __restrict__ adv, const float* __restrict__ ret,  // slab + env_start
+    const double* __restrict__ adv_stats,
+    float* __restrict__ dlogits,        // tight [NUM_ACTIONS][T*mb]
+    float* __restrict__ dvalue,         // [T*mb]
+    double* __restrict__ loss_acc,      // [3] pg/v/ent raw sums, or null
+    int T, int mb, int n,
+    float clip_eps, float vf_coef, const float* __restrict__ ent_coef_p
 ) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_envs) return;
-    Craftax* env = &envs[i];
-    const CraftaxState* state = env->state;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int cols = T * mb;
+    if (c >= cols) return;
+    int t = c / mb;
+    size_t o = (size_t)t * n + (c - t * mb);
+    float ent_coef = *ent_coef_p;
 
-    craftax_encode_compact_observation(
-        (const CraftaxWorldState*)(const void*)state,
-        r_obs + (size_t)i * CF_TRAIN_OBS);
+    double inv_count = 1.0 / ((double)n * (double)T);
+    float adv_mean = (float)(adv_stats[0] * inv_count);
+    double m = adv_stats[0] * inv_count;
+    double var = adv_stats[1] * inv_count - m * m;
+    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+    float inv_batch = 1.0f / (float)cols;
 
-    float h_enc[CF_NN_HIDDEN];
-    cf_nn_encoder_gather(state, w.W_enc, w.b_enc, h_enc);
-
-    float st[CF_NN_HIDDEN];
-    if (env->terminals[0] != 0.0f) {
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++) st[k] = 0.0f;
-    } else {
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++)
-            st[k] = h_state[(size_t)i * CF_NN_HIDDEN + k];
-    }
+    const float* lp = logits + (size_t)c * CRAFTAX_NUM_ACTIONS;
+    float lg[CRAFTAX_NUM_ACTIONS], pi[CRAFTAX_NUM_ACTIONS];
+    float mx = -1e30f;
     #pragma unroll
-    for (int k = 0; k < CF_NN_HIDDEN; k++)
-        r_state_row[(size_t)i * CF_NN_HIDDEN + k] = st[k];
-
-    float logits[CRAFTAX_NUM_ACTIONS], value, logprob;
-    cf_nn_head(h_enc, st, w.W_gru, w.W_a, w.b_a, w.W_v, w.b_v[0],
-               logits, &value);
-    curandStatePhilox4_32_10_t sampler;
-    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, (uint64_t)i, step_count,
-                &sampler);
-    int action = cf_nn_sample_action(logits, curand_uniform(&sampler),
-                                     &logprob);
-    r_act[i] = action;
-    r_logprob[i] = logprob;
-    r_value[i] = value;
-    #pragma unroll
-    for (int k = 0; k < CF_NN_HIDDEN; k++)
-        h_state[(size_t)i * CF_NN_HIDDEN + k] = st[k];
-    env->actions[0] = (float)action;
-
-    CraftaxThreefryKey reset_key;
-    bool done = c_step_gameplay_core(env, &reset_key);
-    if (done) {
-        int slot = atomicAdd(&g_reset_count, 1);
-        resets[slot].env = i;
-        resets[slot].key0 = reset_key.word[0];
-        resets[slot].key1 = reset_key.word[1];
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        lg[a] = lp[a] + b_a[a];
+        mx = fmaxf(mx, lg[a]);
     }
-    r_reward[i] = env->rewards[0];
-    r_done[i] = done ? 1 : 0;
+    float total = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        pi[a] = expf(lg[a] - mx);
+        total += pi[a];
+    }
+    float inv_total = 1.0f / total;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) pi[a] *= inv_total;
+    float lse = mx + logf(total);
+
+    int act = r_act[o];
+    float logp_new = lg[act] - lse;
+    float ratio = expf(logp_new - r_logprob[o]);
+    float A = (adv[o] - adv_mean) * adv_inv_std;
+    float u1 = ratio * A;
+    float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+    float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
+    float H = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) H -= pi[a] * (lg[a] - lse);
+
+    const float* h3 = h_out + (size_t)c * CF_NN_HIDDEN;
+    float v = b_v[0];
+    #pragma unroll 4
+    for (int j = 0; j < CF_NN_HIDDEN; j++) v = fmaf(W_v[j], h3[j], v);
+    float dv = inv_batch * vf_coef * (v - ret[o]);
+    dvalue[c] = dv;
+
+    float* dq = dlogits + (size_t)c * CRAFTAX_NUM_ACTIONS;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        float d = dlogp * ((a == act ? 1.0f : 0.0f) - pi[a]);
+        d += ent_coef * pi[a] * ((lg[a] - lse) + H);
+        dq[a] = d * inv_batch;
+    }
+
+    if (loss_acc) {
+        __shared__ double s_pg, s_v, s_e;
+        if (threadIdx.x == 0) { s_pg = 0.0; s_v = 0.0; s_e = 0.0; }
+        __syncthreads();
+        atomicAdd(&s_pg, -fminf(u1, u2));
+        float ve = 0.5f * (v - ret[o]) * (v - ret[o]);
+        atomicAdd(&s_v, ve);
+        atomicAdd(&s_e, H);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            atomicAdd(&loss_acc[0], s_pg);
+            atomicAdd(&loss_acc[1], s_v);
+            atomicAdd(&loss_acc[2], s_e);
+        }
+    }
 }
 
-// Value of the current (post-rollout) env state: V(s_T) for the GAE
-// bootstrap. Envs that finished on the last step get masked by
-// (1 - done) in the GAE scan, so their (reset-state) value is unused.
-__global__ void k_nn_bootstrap(
-    Craftax* envs, CfWeights w, const float* __restrict__ h_state,
-    float* __restrict__ v_boot, int num_envs
+// dh_out after the heads: dh3 = W_a^T @ dlogits (cuBLAS) plus the
+// value-head contribution dv * W_v, added here with one add per elt.
+__global__ void k_add_dv_wv(
+    float* __restrict__ dh,            // [HIDDEN][T*mb]
+    const float* __restrict__ dv,      // [T*mb]
+    const float* __restrict__ W_v,
+    int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CF_NN_HIDDEN * cols) return;
+    int k = idx & (CF_NN_HIDDEN - 1);
+    int col = idx / CF_NN_HIDDEN;
+    dh[idx] += dv[col] * W_v[k];
+}
+
+// Backward sweep for one MinGRU layer over one minibatch. Thread per
+// (unit k, env el), descending t with the scalar dcarry; everything
+// else is column-parallel. bptt-split truncation = dcarry zeroed at
+// each segment boundary. dhGEMM carries W_{l+1}^T @ dpre_{l+1} (or the
+// head-side dh for the top layer), dhExtra the highway term from the
+// layer above ({1-p} * dhout), st_used the post-zero input states the
+// live replay actually consumed (tight layout, recorded by
+// k_mingru_epi_replay). dpre aliases pre in place (read before
+// write per element).
+__global__ void k_mingru_sweep_bwd(
+    const float* __restrict__ pre,      // tight [GRU][T*mb] (aliased out)
+    const float* __restrict__ x,        // tight [HIDDEN][T*mb] layer input
+    const float* __restrict__ dhGEMM,   // tight [HIDDEN][T*mb]
+    const float* __restrict__ dhExtra,  // tight [HIDDEN][T*mb] or null
+    const float* __restrict__ st_used,  // tight [HIDDEN][T*mb] post-zero input states from replay
+    const uint8_t* __restrict__ r_done, // slab base + env_start
+    float* __restrict__ dpre,           // tight [GRU][T*mb] (may alias pre)
+    float* __restrict__ dhExtraOut,     // tight [HIDDEN][T*mb] or null
+    int T, int mb, int n, int seg_len
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CF_NN_HIDDEN * mb) return;
+    int k = idx & (CF_NN_HIDDEN - 1);
+    int el = idx / CF_NN_HIDDEN;
+
+    float dcarry = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        if (t == T - 1 || ((t + 1) % seg_len) == 0) dcarry = 0.0f;
+        size_t col = (size_t)t * mb + el;
+        size_t o3 = col * CF_NN_GRU + k;
+        size_t o = col * CF_NN_HIDDEN + k;
+        float zh = pre[o3];
+        float zg = pre[o3 + CF_NN_HIDDEN];
+        float zp = pre[o3 + 2 * CF_NN_HIDDEN];
+        float dhout = dhGEMM[o];
+        if (dhExtra) dhout += dhExtra[o];
+        float s_in = st_used[o];
+        float xv = x[o];
+        bool done_t = r_done[(size_t)t * n + el] != 0;
+
+        float sg = cf_nn_sigmoid(zg);
+        float gh = cf_nn_mingru_g(zh);
+        float p = cf_nn_sigmoid(zp);
+        float out_k = s_in + sg * (gh - s_in);
+        float dout = dhout * p + (done_t ? 0.0f : dcarry);
+        float dp_ = dhout * (out_k - xv);
+        dpre[o3 + 2 * CF_NN_HIDDEN] = dp_ * p * (1.0f - p);
+        if (dhExtraOut) dhExtraOut[o] = dhout * (1.0f - p);
+        dcarry = dout * (1.0f - sg);
+        float dsg = dout * (gh - s_in);
+        dpre[o3 + CF_NN_HIDDEN] = dsg * sg * (1.0f - sg);
+        dpre[o3] = dout * sg * cf_nn_dg_mingru(zh);
+    }
+}
+
+// Sparse encoder backward: one thread per (hidden unit k, sample
+// column w), scalar atomicAdds into dW_enc row entries and db_enc.
+// Thread-per-unit matches k_encode_obs's walk; see the sm_120
+// miscompile note there before "optimizing" this.
+__global__ void k_enc_bwd(
+    const uint8_t* __restrict__ r_obs,
+    const float* __restrict__ dhGEMM,   // W_0^T @ dpre_0, tight [HIDDEN][T*mb]
+    const float* __restrict__ dhExtra,  // highway term from layer 0, tight
+    float* __restrict__ dW_enc,         // [OBS][HIDDEN] row-major
+    float* __restrict__ db_enc,
+    int T, int mb, int n, int env_start
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CF_NN_HIDDEN * T * mb) return;
+    int k = idx & (CF_NN_HIDDEN - 1);
+    int w = idx / CF_NN_HIDDEN;
+    int t = w / mb;
+    int el = w - t * mb;
+    const uint8_t* rec =
+        r_obs + ((size_t)t * n + env_start + el) * CF_TRAIN_OBS;
+
+    size_t o = (size_t)w * CF_NN_HIDDEN + k;
+    float dh = dhGEMM[o];
+    if (dhExtra) dh += dhExtra[o];
+    atomicAdd(&db_enc[k], dh);
+
+    for (int f = 0; f < CF_NN_MAP; f++) {
+        float x = (float)rec[f];
+        if (x != 0.0f)
+            atomicAdd(&dW_enc[(size_t)f * CF_NN_HIDDEN + k], dh * x);
+    }
+    for (int j = 0; j < CF_NN_TAIL; j++) {
+        float x;
+        memcpy(&x, rec + CF_NN_MAP + 4 * j, sizeof(float));
+        if (x != 0.0f)
+            atomicAdd(&dW_enc[(size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN + k],
+                      dh * x);
+    }
+}
+
+// Column sums of a [rows][cols] col-major matrix, accumulated into
+// out (one block per row). Used for db_a and db_v.
+__global__ void k_colsum(
+    const float* __restrict__ M, float* __restrict__ out, int rows, int cols
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    __shared__ float red[128];
+    float acc = 0.0f;
+    const float* col = M + r;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        acc += col[(size_t)c * rows];
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(&out[r], red[0]);
+}
+
+// Loss accumulation over one step of a full-batch loss evaluation.
+// logits_t/h3_t are the tight per-step buffers; r_* are the full
+// rollout slabs (+ env chunk offset). Adds raw double sums into
+// loss_acc[3] (pg, v, ent); host divides by n*T and applies
+// coefficients. Same per-term formulas as k_head_bwd.
+__global__ void k_loss_accum(
+    const float* __restrict__ logits_t,  // tight [NUM_ACTIONS][cn]
+    const float* __restrict__ h3_t,      // tight [HIDDEN][cn]
+    const float* __restrict__ b_a,
+    const float* __restrict__ W_v, const float* __restrict__ b_v,
+    const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob,
+    const float* __restrict__ adv, const float* __restrict__ ret,
+    const double* __restrict__ adv_stats,
+    double* __restrict__ loss_acc,       // [3] pg/v/ent raw sums
+    int t, int cn, int n, int T_total,
+    float clip_eps
 ) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_envs) return;
-    Craftax* env = &envs[e];
-    float h_enc[CF_NN_HIDDEN];
-    cf_nn_encoder_gather(env->state, w.W_enc, w.b_enc, h_enc);
-    float st[CF_NN_HIDDEN];
-    if (env->terminals[0] != 0.0f) {
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++) st[k] = 0.0f;
-    } else {
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++)
-            st[k] = h_state[(size_t)e * CF_NN_HIDDEN + k];
+    if (e >= cn) return;
+    size_t o = (size_t)t * n + e;
+
+    double inv_count = 1.0 / ((double)n * (double)T_total);
+    float amean = (float)(adv_stats[0] * inv_count);
+    double m = adv_stats[0] * inv_count;
+    double var = adv_stats[1] * inv_count - m * m;
+    float ainv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+
+    const float* lp = logits_t + (size_t)e * CRAFTAX_NUM_ACTIONS;
+    float lg[CRAFTAX_NUM_ACTIONS], pi[CRAFTAX_NUM_ACTIONS];
+    float mx = -1e30f;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        lg[a] = lp[a] + b_a[a];
+        mx = fmaxf(mx, lg[a]);
     }
-    float logits[CRAFTAX_NUM_ACTIONS], value;
-    cf_nn_head(h_enc, st, w.W_gru, w.W_a, w.b_a, w.W_v, w.b_v[0],
-               logits, &value);
-    v_boot[e] = value;
+    float total = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        pi[a] = expf(lg[a] - mx);
+        total += pi[a];
+    }
+    float inv_total = 1.0f / total;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) pi[a] *= inv_total;
+    float lse = mx + logf(total);
+
+    float A = (adv[o] - amean) * ainv_std;
+    float ratio = expf((lg[r_act[o]] - lse) - r_logprob[o]);
+    float u1 = ratio * A;
+    float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+
+    const float* h3 = h3_t + (size_t)e * CF_NN_HIDDEN;
+    float v = b_v[0];
+    #pragma unroll 4
+    for (int j = 0; j < CF_NN_HIDDEN; j++) v = fmaf(W_v[j], h3[j], v);
+
+    float H = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) H -= pi[a] * (lg[a] - lse);
+
+    __shared__ double s_pg, s_v, s_e;
+    if (threadIdx.x == 0) { s_pg = 0.0; s_v = 0.0; s_e = 0.0; }
+    __syncthreads();
+    atomicAdd(&s_pg, -fminf(u1, u2));
+    float ve = 0.5f * (v - ret[o]) * (v - ret[o]);
+    atomicAdd(&s_v, ve);
+    atomicAdd(&s_e, H);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        atomicAdd(&loss_acc[0], s_pg);
+        atomicAdd(&loss_acc[1], s_v);
+        atomicAdd(&loss_acc[2], s_e);
+    }
+}
+
+// Replay fidelity check (gradcheck, minibatches == 1 so column c of
+// the recomputed forward maps to slab index c): recompute logprob
+// (exactly as k_value_sample computed it: max/sum in ascending a,
+// logits[act]-m-log(total)) and value from the backward's recomputed
+// logits/h3 and compare BITWISE against what the rollout stored.
+// Proves the record encoder + live-recurrence replay reproduce the
+// rollout forward exactly (including the stored segment-start
+// constants).
+__global__ void k_replay_cmp(
+    const float* __restrict__ logitsb,  // tight [NUM_ACTIONS][T*n]
+    const float* __restrict__ h3,       // tight [HIDDEN][T*n]
+    const float* __restrict__ b_a,
+    const float* __restrict__ W_v, const float* __restrict__ b_v,
+    const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob, const float* __restrict__ r_value,
+    int cols, int* __restrict__ mismatches
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const float* lp = logitsb + (size_t)c * CRAFTAX_NUM_ACTIONS;
+    float lg[CRAFTAX_NUM_ACTIONS];
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) lg[a] = lp[a] + b_a[a];
+    float m = lg[0];
+    for (int a = 1; a < CRAFTAX_NUM_ACTIONS; a++) m = fmaxf(m, lg[a]);
+    float total = 0.0f;
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) total += expf(lg[a] - m);
+    float logp = lg[r_act[c]] - m - logf(total);
+    const float* h = h3 + (size_t)c * CF_NN_HIDDEN;
+    float v = b_v[0];
+    for (int i = 0; i < CF_NN_HIDDEN; i++) v = fmaf(W_v[i], h[i], v);
+    if (__float_as_uint(logp) != __float_as_uint(r_logprob[c])
+        || __float_as_uint(v) != __float_as_uint(r_value[c])) {
+        atomicAdd(mismatches, 1);
+    }
 }
 
 // GAE scan, one thread per env, t = T-1 .. 0.
@@ -10383,905 +10395,25 @@ __global__ void k_adv_stats(
     }
 }
 
-static __device__ __forceinline__ float cf_nn_dg_mingru(float x) {  // d/dx of cf_nn_mingru_g
-    if (x >= 0.0f) return 1.0f;
-    float s = cf_nn_sigmoid(x);
-    return s * (1.0f - s);
-}
-
-// Replay check (gradcheck mode): recompute logprob/value at each stored
-// step from the record + stored state input and compare bitwise against
-// what the rollout stored. Proves the record encoder and stored-state
-// discipline reproduce the rollout forward exactly.
-__global__ void k_train_replay_check(
-    CfWeights w,
-    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
-    const float* __restrict__ r_logprob, const float* __restrict__ r_value,
-    const float* __restrict__ r_state,
-    int num_envs, int T, int* __restrict__ mismatches
-) {
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_envs) return;
-    for (int t = 0; t < T; t++) {
-        size_t o = (size_t)t * num_envs + e;
-        float h_enc[CF_NN_HIDDEN], st[CF_NN_HIDDEN];
-        cf_nn_encoder_from_record(r_obs + o * CF_TRAIN_OBS, w.W_enc, w.b_enc,
-                                  h_enc);
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++)
-            st[k] = r_state[o * CF_NN_HIDDEN + k];
-        float logits[CRAFTAX_NUM_ACTIONS], value;
-        cf_nn_head(h_enc, st, w.W_gru, w.W_a, w.b_a, w.W_v, w.b_v[0],
-                   logits, &value);
-        float m = logits[0];
-        for (int a = 1; a < CRAFTAX_NUM_ACTIONS; a++) m = fmaxf(m, logits[a]);
-        float total = 0.0f;
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++)
-            total += expf(logits[a] - m);
-        float logprob = logits[r_act[o]] - m - logf(total);
-        if (__float_as_uint(value) != __float_as_uint(r_value[o])
-            || __float_as_uint(logprob) != __float_as_uint(r_logprob[o])) {
-            atomicAdd(mismatches, 1);
-        }
-    }
-}
-
-// PPO loss on stored rollout data (actions/old-logprobs/adv/ret fixed),
-// recomputing the recurrent forward from the stored t=0 state input so
-// the loss is a pure function of the parameters. Double accumulators:
-// this is the reference for finite-difference gradient checking.
-// losses[0] += policy loss, [1] += 0.5*(v-ret)^2, [2] += entropy
-// (all sums; host divides by n*T and applies coefficients).
-__global__ void k_ppo_loss(
-    CfWeights w,
-    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
-    const float* __restrict__ r_logprob, const uint8_t* __restrict__ r_done,
-    const float* __restrict__ r_state,   // [T][n][CF_NN_HIDDEN]; t=0 row used
-    const float* __restrict__ adv, const float* __restrict__ ret,
-    double* __restrict__ losses,
-    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the batch
-    int num_envs, int T, float clip_eps
-) {
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_envs) return;
-
-    double inv_count = 1.0 / ((double)num_envs * T);
-    float adv_mean = (float)(adv_stats[0] * inv_count);
-    double var = adv_stats[1] * inv_count
-        - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
-    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
-
-    float state[CF_NN_HIDDEN];
-    #pragma unroll
-    for (int k = 0; k < CF_NN_HIDDEN; k++)
-        state[k] = r_state[(size_t)e * CF_NN_HIDDEN + k];
-
-    double pg_sum = 0.0, v_sum = 0.0, ent_sum = 0.0;
-    for (int t = 0; t < T; t++) {
-        size_t o = (size_t)t * num_envs + e;
-        if (t > 0 && r_done[o - num_envs]) {
-            #pragma unroll
-            for (int k = 0; k < CF_NN_HIDDEN; k++) state[k] = 0.0f;
-        }
-        float h_enc[CF_NN_HIDDEN], logits[CRAFTAX_NUM_ACTIONS], value;
-        cf_nn_encoder_from_record(r_obs + o * CF_TRAIN_OBS, w.W_enc, w.b_enc,
-                                  h_enc);
-        cf_nn_head(h_enc, state, w.W_gru, w.W_a, w.b_a, w.W_v, w.b_v[0],
-                   logits, &value);
-
-        float mx = logits[0];
-        for (int a = 1; a < CRAFTAX_NUM_ACTIONS; a++) mx = fmaxf(mx, logits[a]);
-        float total = 0.0f;
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++)
-            total += expf(logits[a] - mx);
-        float lse = mx + logf(total);
-
-        float logp_new = logits[r_act[o]] - lse;
-        float ratio = expf(logp_new - r_logprob[o]);
-        float A = (adv[o] - adv_mean) * adv_inv_std;
-        float u1 = ratio * A;
-        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
-        pg_sum += -fminf(u1, u2);
-
-        float dv = value - ret[o];
-        v_sum += 0.5 * (double)dv * (double)dv;
-
-        float H = 0.0f;
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
-            float lp = logits[a] - lse;
-            H -= expf(lp) * lp;
-        }
-        ent_sum += H;
-    }
-    atomicAdd(&losses[0], pg_sum);
-    atomicAdd(&losses[1], v_sum);
-    atomicAdd(&losses[2], ent_sum);
-}
-
-static __device__ __forceinline__ float cf_warp_sum(float v) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
-    return v;
-}
-
-// PPO backward: one thread per (env, BPTT segment) walks its segment
-// t = t_hi-1 .. t_lo, recomputing the forward at each step from the
-// stored record and stored per-step state input (bit-identical to the
-// rollout), then backpropagating through heads, MinGRU (BPTT across
-// the horizon, cut at done boundaries and segment cuts), and the
-// encoder. Encoder backward is a scatter-add of x_f * dh_enc into the
-// active feature columns (nonzero record entries): the map features'
-// scalar ids and the continuous tail floats both take gradient through
-// their actual value x_f; the dense 843-float obs never exists.
-//
-// Dense grads (b_enc, W_gru, heads) are shuffle-reduced across the
-// warp so only lane 0 issues one atomicAdd per element; the W_enc
-// scatter is warp-cooperative and smem-staged (each lane's dh_enc is
-// staged, then the warp walks its 32 samples together: one coalesced
-// line-atomic per active feature). Both go into a per-block global
-// copy (grads + (blockIdx.x % grad_copies) * CF_NN_PARAM_COUNT);
-// k_adam reduces the copies. Out-of-range threads run the whole loop
-// with e clamped and zeroed gradients so warps stay converged at the
-// shuffles. Requires env_count % 32 == 0 and T % bptt_split == 0.
-//
-// Block is 128 (not 256): CfNNShared (18.2KB) + the [4][32][33] W_enc
-// staging tile (16.9KB) must fit sm_86's 48KB static smem.
-#define CF_BWD_BLOCK 128
-__global__ void k_ppo_backward(
-    CfWeights w,
-    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
-    const float* __restrict__ r_logprob, const uint8_t* __restrict__ r_done,
-    const float* __restrict__ r_state,   // [T][n][CF_NN_HIDDEN]
-    const float* __restrict__ adv, const float* __restrict__ ret,
-    float* __restrict__ grads, int grad_copies,
-    float* __restrict__ loss_acc,        // [3] or nullptr
-    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the FULL batch
-    int num_envs, int T,
-    int env_start, int env_count,  // minibatch = contiguous env range
-    int bptt_split,                // S segments per env (1 = exact)
-    float clip_eps, float vf_coef, float ent_coef
-) {
-    __shared__ CfNNShared snn;
-    __shared__ float sdh_all[CF_BWD_BLOCK / 32][32][32 + 1];
-    cf_nn_load_shared(&snn, w);
-    int lane = threadIdx.x & 31;
-    int et = blockIdx.x * blockDim.x + threadIdx.x;
-    bool active = et < env_count * bptt_split;
-    // clamp: inactive lanes run zeroed (env_count % 32 == 0 keeps every
-    // warp inside one segment, so warps stay converged at the shuffles)
-    if (!active) et = env_count * bptt_split - 1;
-    int seg = et / env_count;
-    int ei = et % env_count;
-    int e = env_start + ei;
-    int seg_len = T / bptt_split;
-    int t_lo = seg * seg_len;
-    int t_hi = t_lo + seg_len;
-
-    float* gr = grads + (size_t)(blockIdx.x % grad_copies) * CF_NN_PARAM_COUNT;
-
-    // Advantage normalization always uses full-batch stats; the loss
-    // mean is over the minibatch (env_count * T samples).
-    double inv_count = 1.0 / ((double)num_envs * T);
-    float inv_batch = (float)(1.0 / ((double)env_count * T));
-    float adv_mean = (float)(adv_stats[0] * inv_count);
-    double var = adv_stats[1] * inv_count
-        - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
-    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
-
-    float dstate[CF_NN_HIDDEN];  // dL/d(state output of step t), carried backward
-    #pragma unroll
-    for (int k = 0; k < CF_NN_HIDDEN; k++) dstate[k] = 0.0f;
-
-    float pg_sum = 0.0f, v_sum = 0.0f, ent_sum = 0.0f;
-
-    for (int t = t_hi - 1; t >= t_lo; t--) {
-        size_t o = (size_t)t * num_envs + e;
-        const uint8_t* rec = r_obs + o * CF_TRAIN_OBS;
-
-        // ---- Recompute forward at step t ----
-        float h_enc[CF_NN_HIDDEN], s_in[CF_NN_HIDDEN];
-        cf_nn_encoder_from_record(rec, w.W_enc, snn.b_enc, h_enc);
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++)
-            s_in[k] = r_state[o * CF_NN_HIDDEN + k];
-
-        float hout[CF_NN_HIDDEN];
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++) {
-            float ah = 0.0f, ag = 0.0f, ap = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < CF_NN_HIDDEN; j++) {
-                ah = fmaf(snn.W_gru[k * CF_NN_HIDDEN + j], h_enc[j], ah);
-                ag = fmaf(snn.W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], ag);
-                ap = fmaf(snn.W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], ap);
-            }
-            float sg = cf_nn_sigmoid(ag);
-            float o_k = s_in[k] + sg * (cf_nn_mingru_g(ah) - s_in[k]);
-            float p = cf_nn_sigmoid(ap);
-            hout[k] = p * o_k + (1.0f - p) * h_enc[k];
-        }
-
-        float logits[CRAFTAX_NUM_ACTIONS], value;
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
-            float z = snn.b_a[a];
-            #pragma unroll
-            for (int j = 0; j < CF_NN_HIDDEN; j++)
-                z = fmaf(snn.W_a[a * CF_NN_HIDDEN + j], hout[j], z);
-            logits[a] = z;
-        }
-        {
-            float z = snn.b_v;
-            #pragma unroll
-            for (int j = 0; j < CF_NN_HIDDEN; j++)
-                z = fmaf(snn.W_v[j], hout[j], z);
-            value = z;
-        }
-
-        // ---- Loss gradients at the heads ----
-        float mx = logits[0];
-        for (int a = 1; a < CRAFTAX_NUM_ACTIONS; a++) mx = fmaxf(mx, logits[a]);
-        float total = 0.0f, pi[CRAFTAX_NUM_ACTIONS];
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
-            pi[a] = expf(logits[a] - mx);
-            total += pi[a];
-        }
-        float inv_total = 1.0f / total;
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) pi[a] *= inv_total;
-        float lse = mx + logf(total);
-
-        int act = r_act[o];
-        float logp_new = logits[act] - lse;
-        float ratio = expf(logp_new - r_logprob[o]);
-        float A = (adv[o] - adv_mean) * adv_inv_std;
-        float u1 = ratio * A;
-        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
-        // d(-min(u1,u2))/dlogp_new: if min picks u1, -A*ratio; else the
-        // clamp is active and the gradient is blocked.
-        float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
-
-        float H = 0.0f;
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
-            float lp = logits[a] - lse;
-            H -= pi[a] * lp;
-        }
-
-        float dvalue = inv_batch * vf_coef * (value - ret[o]);
-        float dlogits[CRAFTAX_NUM_ACTIONS];
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
-            float d = dlogp * (((a == act) ? 1.0f : 0.0f) - pi[a]);  // policy term
-            d += ent_coef * pi[a] * ((logits[a] - lse) + H);         // d(-ent_coef*H)
-            dlogits[a] = d * inv_batch;
-        }
-        if (!active) {
-            dvalue = 0.0f;
-            for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) dlogits[a] = 0.0f;
-        }
-
-        if (active) {
-            pg_sum += -fminf(u1, u2);
-            v_sum += 0.5f * (value - ret[o]) * (value - ret[o]);
-            ent_sum += H;
-        }
-
-        // ---- Heads backward ----
-        float dhout[CF_NN_HIDDEN];
-        #pragma unroll
-        for (int j = 0; j < CF_NN_HIDDEN; j++) dhout[j] = dvalue * snn.W_v[j];
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
-            float da = dlogits[a];
-            #pragma unroll
-            for (int j = 0; j < CF_NN_HIDDEN; j++) {
-                dhout[j] = fmaf(da, snn.W_a[a * CF_NN_HIDDEN + j], dhout[j]);
-                float g = cf_warp_sum(da * hout[j]);
-                if (lane == 0) atomicAdd(&gr[CF_NN_W_A + a * CF_NN_HIDDEN + j], g);
-            }
-            float gb = cf_warp_sum(da);
-            if (lane == 0) atomicAdd(&gr[CF_NN_B_A + a], gb);
-        }
-        #pragma unroll
-        for (int j = 0; j < CF_NN_HIDDEN; j++) {
-            float g = cf_warp_sum(dvalue * hout[j]);
-            if (lane == 0) atomicAdd(&gr[CF_NN_W_V + j], g);
-        }
-        {
-            float g = cf_warp_sum(dvalue);
-            if (lane == 0) atomicAdd(&gr[CF_NN_B_V], g);
-        }
-
-        // ---- MinGRU backward ----
-        bool done_t = r_done[o] != 0;  // done at t: step t+1's state input was zeroed
-        float dh_enc[CF_NN_HIDDEN];
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++) dh_enc[k] = 0.0f;
-
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++) {
-            // Recompute this unit's pre-activations (cheaper than
-            // carrying zh/zg/zp/out across the heads backward).
-            float ah = 0.0f, ag = 0.0f, ap = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < CF_NN_HIDDEN; j++) {
-                ah = fmaf(snn.W_gru[k * CF_NN_HIDDEN + j], h_enc[j], ah);
-                ag = fmaf(snn.W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], ag);
-                ap = fmaf(snn.W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], h_enc[j], ap);
-            }
-            float p = cf_nn_sigmoid(ap);
-            float sg = cf_nn_sigmoid(ag);
-            float gh = cf_nn_mingru_g(ah);
-            float out_k = s_in[k] + sg * (gh - s_in[k]);
-
-            float dout = dhout[k] * p + (done_t ? 0.0f : dstate[k]);
-            float dp = dhout[k] * (out_k - h_enc[k]);
-            float dzp_k = dp * p * (1.0f - p);
-            dh_enc[k] += dhout[k] * (1.0f - p);
-
-            dstate[k] = dout * (1.0f - sg);  // ds_prev, safe in place
-            float dsg = dout * (gh - s_in[k]);
-            float dzg_k = dsg * sg * (1.0f - sg);
-            float dzh_k = dout * sg * cf_nn_dg_mingru(ah);
-
-            #pragma unroll
-            for (int j = 0; j < CF_NN_HIDDEN; j++) {
-                dh_enc[j] = fmaf(dzh_k, snn.W_gru[k * CF_NN_HIDDEN + j], dh_enc[j]);
-                dh_enc[j] = fmaf(dzg_k, snn.W_gru[(CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], dh_enc[j]);
-                dh_enc[j] = fmaf(dzp_k, snn.W_gru[(2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], dh_enc[j]);
-                float gh_ = cf_warp_sum(dzh_k * h_enc[j]);
-                float gg_ = cf_warp_sum(dzg_k * h_enc[j]);
-                float gp_ = cf_warp_sum(dzp_k * h_enc[j]);
-                if (lane == 0) {
-                    atomicAdd(&gr[CF_NN_W_GRU + k * CF_NN_HIDDEN + j], gh_);
-                    atomicAdd(&gr[CF_NN_W_GRU + (CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], gg_);
-                    atomicAdd(&gr[CF_NN_W_GRU + (2 * CF_NN_HIDDEN + k) * CF_NN_HIDDEN + j], gp_);
-                }
-            }
-        }
-
-        // ---- Encoder backward: scatter dh_enc into active columns ----
-        #pragma unroll
-        for (int k = 0; k < CF_NN_HIDDEN; k++) {
-            float g = cf_warp_sum(dh_enc[k]);
-            if (lane == 0) atomicAdd(&gr[CF_NN_B_ENC + k], g);
-        }
-
-        // Warp-cooperative W_enc scatter: stage each lane's dh_enc in
-        // shared memory, then walk the warp's 32 samples together.
-        // For each active (nonzero) feature f of sample m, all 32
-        // lanes add x_f * sdh[m][lane] to the contiguous column
-        // gr[f*HIDDEN + lane]: one coalesced line-atomic per feature.
-        // Feature decode is uniform across the warp (every lane reads
-        // sample m's record, broadcast through L1).
-        {
-            float (*sdh)[32 + 1] = sdh_all[threadIdx.x >> 5];
-            int ebase = e - lane;
-            // Fixed 32-wide hidden tile per pass (a full [32][HIDDEN+1]
-            // stage is 132KB at hidden 128 -- over the smem budget);
-            // HIDDEN > 32 builds loop the scatter over HIDDEN/32 tiles.
-            for (int hc = 0; hc < CF_NN_HIDDEN; hc += 32) {
-            #pragma unroll
-            for (int k = 0; k < 32; k++) sdh[lane][k] = dh_enc[hc + k];
-            __syncwarp();
-            for (int m = 0; m < 32 && ebase + m < env_start + env_count; m++) {
-                const uint8_t* rm =
-                    r_obs + ((size_t)t * num_envs + ebase + m) * CF_TRAIN_OBS;
-                float dv = sdh[m][lane];
-                float* gcol = gr + CF_NN_W_ENC + hc + lane;
-                for (int f = 0; f < CF_NN_MAP; f++) {
-                    float x = (float)rm[f];
-                    if (x != 0.0f)
-                        atomicAdd(gcol + (size_t)f * CF_NN_HIDDEN, x * dv);
-                }
-                for (int j = 0; j < CF_NN_TAIL; j++) {
-                    float x;
-                    memcpy(&x, rm + CF_NN_MAP + 4 * j, sizeof(float));
-                    if (x != 0.0f)
-                        atomicAdd(gcol + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN,
-                                  x * dv);
-                }
-            }
-            __syncwarp();  // sdh reused next tile / next t
-            }
-        }
-    }
-
-    if (active && loss_acc) {
-        atomicAdd(&loss_acc[0], pg_sum);
-        atomicAdd(&loss_acc[1], v_sum);
-        atomicAdd(&loss_acc[2], ent_sum);
-    }
-}
-
-// ============================================================
-// Warp-cooperative PPO backward (default path; k_ppo_backward above is
-// the thread-per-env reference, selectable with CRAFTAX_CU_BWD=thread).
-//
-// One WARP per (env, BPTT segment): lane l owns hidden units
-// [U*l, U*(l+1)) with U = HIDDEN/32 (h32: 1 unit/lane, h128: 4). The
-// serial per-thread H^2 walk of k_ppo_backward becomes 32-wide:
-//  - encoder recompute: uniform record decode, each lane FMAs its own
-//    W_enc column slice (coalesced 128B/512B line loads); per-unit fmaf
-//    chains are bit-identical to cf_nn_encoder_from_record.
-//  - GRU matvecs: j ascending via warp broadcast (k_policy_warp
-//    discipline), so each unit's accumulation order is exactly the
-//    scalar loop's (bit-identical pre-activations).
-//  - heads: hout staged in shared; one lane per logit row (rows 32..42
-//    on lanes 0..10, second pass); softmax max/sum and the value dot
-//    are warp butterfly reductions (max exact; sums reassociated --
-//    inside gradcheck FD tolerance, no bitwise canonical exists here).
-//  - dh_enc = W_gru^T dz: k ascending via warp broadcast of each
-//    lane's dz, weight reads coalesced along j.
-//  - W_enc scatter: no staging needed (the warp IS one sample): each
-//    lane scatters x_f * dh_enc[its units] straight to gr[f*H + unit],
-//    one coalesced line atomic per active feature (same atomic traffic
-//    as the staged 32-sample walk of k_ppo_backward).
-//  - dense grads (W_gru/W_a/W_v/b_a/b_v): per timestep each warp
-//    stages dz [3H], h_enc [H], hout [H], dlogits+dvalue [44] in
-//    shared; after __syncthreads the block reduces the outer product
-//    across its CF_BWDW_WARPS samples cooperatively. At h32 every
-//    element accumulates in a fixed per-thread REGISTER across the
-//    whole segment (one atomic flush per block at the end: ~30x less
-//    global atomic traffic than k_ppo_backward). At h128 the 3H*H
-//    W_gru gradient (48K floats) exceeds the register/smem budget, so
-//    it is a per-timestep coalesced atomicAdd sweep (still reduced
-//    CF_BWDW_WARPS-fold by the staging); the smaller segments stay in
-//    registers. b_enc accumulates per-lane in registers.
-// Inactive warps (grid tail) run clamped with zeroed dlogits/dvalue,
-// which zeroes everything they stage; blocks never straddle a segment
-// boundary (env_count % 32 == 0 >= CF_BWDW_WARPS), so the per-timestep
-// __syncthreads stays uniform.
-// ============================================================
-#ifndef CF_BWDW_WARPS
-#if CF_GRU_SMEM
-#define CF_BWDW_WARPS 4   // block smem: padded W_gru+W_a copies + staging
-#else
-#define CF_BWDW_WARPS 8   // weights read from global; staging only
-#endif
-#endif
-// The warp kernel is only compiled for hidden <= 32: at hidden 128 the
-// lane-sliced formulation drives cicc into a multi-hour optimization
-// blowup (measured: >3h at -O3 AND -O1, sm_120, CUDA 13.2). h128 keeps
-// the thread backward; a warp variant for wide hidden needs a different
-// accumulator design, not this kernel with bigger loops.
-#define CF_BWDW_ENABLE (CF_NN_HIDDEN <= 32)
-#if CF_BWDW_ENABLE
-#define CF_BWDW_U (CF_NN_HIDDEN / 32)
-#define CF_BWDW_BD (32 * CF_BWDW_WARPS)
-#define CF_BWDW_NWA \
-    ((CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN + CF_BWDW_BD - 1) / CF_BWDW_BD)
-#if CF_GRU_SMEM && ((CF_NN_GRU * CF_NN_HIDDEN) % CF_BWDW_BD) != 0
-#error "W_gru register tile needs 3H^2 % blockDim == 0"
-#endif
-
-typedef struct CfBwdShared {
-#if CF_GRU_SMEM
-    float W_gru[CF_NN_GRU * (CF_NN_HIDDEN + 1)];   // +1 pad: conflict-free
-    float W_a[CRAFTAX_NUM_ACTIONS * (CF_NN_HIDDEN + 1)];  // row streams
-#endif
-    float W_v[CF_NN_HIDDEN];
-    float b_a[CRAFTAX_NUM_ACTIONS];
-    float b_enc[CF_NN_HIDDEN];
-    float b_v;
-    // Per-timestep cross-warp staging for the dense-grad reduction.
-    float dz[CF_BWDW_WARPS][CF_NN_GRU];
-    float henc[CF_BWDW_WARPS][CF_NN_HIDDEN];
-    float hout[CF_BWDW_WARPS][CF_NN_HIDDEN];
-    float dlog[CF_BWDW_WARPS][CRAFTAX_NUM_ACTIONS + 1];  // [43] = dvalue
-} CfBwdShared;
-
-#if CF_GRU_SMEM
-#define CF_BWDW_WG(s, k, j) ((s).W_gru[(k) * (CF_NN_HIDDEN + 1) + (j)])
-#define CF_BWDW_WA(s, a, j) ((s).W_a[(a) * (CF_NN_HIDDEN + 1) + (j)])
-#else
-#define CF_BWDW_WG(s, k, j) (w.W_gru[(size_t)(k) * CF_NN_HIDDEN + (j)])
-#define CF_BWDW_WA(s, a, j) (w.W_a[(size_t)(a) * CF_NN_HIDDEN + (j)])
-#endif
-
-static __device__ __forceinline__ float cf_warp_bsum(float v) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
-static __device__ __forceinline__ float cf_warp_bmax(float v) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-    return v;
-}
-
-// Encoder recompute, lane-sliced: bit-identical per hidden unit to
-// cf_nn_encoder_from_record (same fmaf chain, only the unit->lane
-// mapping changes; W_enc line loads are coalesced across the warp).
-static __device__ __forceinline__ void cf_nn_encoder_from_record_lane(
-    const uint8_t* __restrict__ rec, const float* __restrict__ W_enc,
-    const float* __restrict__ b_enc_s, int lane, float* h  // h[CF_BWDW_U]
-) {
-    #pragma unroll
-    for (int u = 0; u < CF_BWDW_U; u++)
-        h[u] = b_enc_s[CF_BWDW_U * lane + u];
-    for (int f = 0; f < CF_NN_MAP; f++) {
-        float x = (float)rec[f];
-        if (x == 0.0f) continue;
-        const float* col =
-            W_enc + (size_t)f * CF_NN_HIDDEN + CF_BWDW_U * lane;
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++) h[u] = fmaf(x, col[u], h[u]);
-    }
-    for (int j = 0; j < CF_NN_TAIL; j++) {
-        float x;
-        memcpy(&x, rec + CF_NN_MAP + 4 * j, sizeof(float));
-        if (x == 0.0f) continue;
-        const float* col =
-            W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN + CF_BWDW_U * lane;
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++) h[u] = fmaf(x, col[u], h[u]);
-    }
-}
-
-__global__ void __launch_bounds__(CF_BWDW_BD) k_ppo_backward_warp(
-    CfWeights w,
-    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
-    const float* __restrict__ r_logprob, const uint8_t* __restrict__ r_done,
-    const float* __restrict__ r_state,   // [T][n][CF_NN_HIDDEN]
-    const float* __restrict__ adv, const float* __restrict__ ret,
-    float* __restrict__ grads, int grad_copies,
-    float* __restrict__ loss_acc,        // [3] or nullptr
-    const double* __restrict__ adv_stats,  // [2] sum, sumsq (FULL batch)
-    int num_envs, int T,
-    int env_start, int env_count,  // minibatch = contiguous env range
-    int bptt_split,                // S segments per env (1 = exact)
-    float clip_eps, float vf_coef, float ent_coef
-) {
-    __shared__ CfBwdShared s;
-    const int tid = threadIdx.x;
-#if CF_GRU_SMEM
-    for (int i = tid; i < CF_NN_GRU * CF_NN_HIDDEN; i += CF_BWDW_BD)
-        s.W_gru[(i / CF_NN_HIDDEN) * (CF_NN_HIDDEN + 1) + i % CF_NN_HIDDEN] =
-            w.W_gru[i];
-    for (int i = tid; i < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN;
-         i += CF_BWDW_BD)
-        s.W_a[(i / CF_NN_HIDDEN) * (CF_NN_HIDDEN + 1) + i % CF_NN_HIDDEN] =
-            w.W_a[i];
-#endif
-    for (int i = tid; i < CF_NN_HIDDEN; i += CF_BWDW_BD) {
-        s.W_v[i] = w.W_v[i];
-        s.b_enc[i] = w.b_enc[i];
-    }
-    for (int i = tid; i < CRAFTAX_NUM_ACTIONS; i += CF_BWDW_BD)
-        s.b_a[i] = w.b_a[i];
-    if (tid == 0) s.b_v = w.b_v[0];
-    __syncthreads();
-
-    const int warp = tid >> 5, lane = tid & 31;
-    int wt = blockIdx.x * CF_BWDW_WARPS + warp;
-    bool active = wt < env_count * bptt_split;
-    if (!active) wt = env_count * bptt_split - 1;
-    int seg = wt / env_count;
-    int e = env_start + wt % env_count;
-    int seg_len = T / bptt_split;
-    int t_lo = seg * seg_len;
-    int t_hi = t_lo + seg_len;
-
-    float* gr = grads + (size_t)(blockIdx.x % grad_copies) * CF_NN_PARAM_COUNT;
-
-    double inv_count = 1.0 / ((double)num_envs * T);
-    float inv_batch = (float)(1.0 / ((double)env_count * T));
-    float adv_mean = (float)(adv_stats[0] * inv_count);
-    double var = adv_stats[1] * inv_count
-        - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
-    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
-
-    // Segment-persistent register accumulators.
-#if CF_GRU_SMEM
-    float raccA[(CF_NN_GRU * CF_NN_HIDDEN) / CF_BWDW_BD];
-    #pragma unroll
-    for (int q = 0; q < (CF_NN_GRU * CF_NN_HIDDEN) / CF_BWDW_BD; q++)
-        raccA[q] = 0.0f;
-#endif
-    float raccWa[CF_BWDW_NWA];
-    #pragma unroll
-    for (int q = 0; q < CF_BWDW_NWA; q++) raccWa[q] = 0.0f;
-    float raccWv = 0.0f, raccBa = 0.0f, raccBv = 0.0f;
-    float bencacc[CF_BWDW_U], dstate[CF_BWDW_U];
-    #pragma unroll
-    for (int u = 0; u < CF_BWDW_U; u++) {
-        bencacc[u] = 0.0f;
-        dstate[u] = 0.0f;
-    }
-    float pg_sum = 0.0f, v_sum = 0.0f, ent_sum = 0.0f;
-
-    for (int t = t_hi - 1; t >= t_lo; t--) {
-        size_t o = (size_t)t * num_envs + e;
-        const uint8_t* rec = r_obs + o * CF_TRAIN_OBS;
-
-        // ---- Forward recompute (lane-sliced) ----
-        float henc[CF_BWDW_U], s_in[CF_BWDW_U];
-        cf_nn_encoder_from_record_lane(rec, w.W_enc, s.b_enc, lane, henc);
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++)
-            s_in[u] = r_state[o * CF_NN_HIDDEN + CF_BWDW_U * lane + u];
-
-        float ah[CF_BWDW_U], ag[CF_BWDW_U], ap[CF_BWDW_U];
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++) ah[u] = ag[u] = ap[u] = 0.0f;
-        for (int jb = 0; jb < 32; jb++) {
-            float hj[CF_BWDW_U];
-            #pragma unroll
-            for (int v_ = 0; v_ < CF_BWDW_U; v_++)
-                hj[v_] = __shfl_sync(0xffffffffu, henc[v_], jb);
-            #pragma unroll
-            for (int u = 0; u < CF_BWDW_U; u++) {
-                int k = CF_BWDW_U * lane + u;
-                #pragma unroll
-                for (int v_ = 0; v_ < CF_BWDW_U; v_++) {
-                    int j = CF_BWDW_U * jb + v_;
-                    ah[u] = fmaf(CF_BWDW_WG(s, k, j), hj[v_], ah[u]);
-                    ag[u] = fmaf(CF_BWDW_WG(s, CF_NN_HIDDEN + k, j), hj[v_],
-                                 ag[u]);
-                    ap[u] = fmaf(CF_BWDW_WG(s, 2 * CF_NN_HIDDEN + k, j),
-                                 hj[v_], ap[u]);
-                }
-            }
-        }
-
-        float sg[CF_BWDW_U], pp[CF_BWDW_U], outk[CF_BWDW_U], hout[CF_BWDW_U];
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++) {
-            sg[u] = cf_nn_sigmoid(ag[u]);
-            float gh = cf_nn_mingru_g(ah[u]);
-            outk[u] = s_in[u] + sg[u] * (gh - s_in[u]);
-            pp[u] = cf_nn_sigmoid(ap[u]);
-            hout[u] = pp[u] * outk[u] + (1.0f - pp[u]) * henc[u];
-            s.hout[warp][CF_BWDW_U * lane + u] = hout[u];
-        }
-        __syncwarp();
-
-        // ---- Heads forward: lane-per-logit-row, value by reduction ----
-        float l0, l1 = -3.402823466e38f;
-        {
-            float z = s.b_a[lane];
-            for (int j = 0; j < CF_NN_HIDDEN; j++)
-                z = fmaf(CF_BWDW_WA(s, lane, j), s.hout[warp][j], z);
-            l0 = z;
-        }
-        if (lane + 32 < CRAFTAX_NUM_ACTIONS) {
-            float z = s.b_a[lane + 32];
-            for (int j = 0; j < CF_NN_HIDDEN; j++)
-                z = fmaf(CF_BWDW_WA(s, lane + 32, j), s.hout[warp][j], z);
-            l1 = z;
-        }
-        float vpart = 0.0f;
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++)
-            vpart = fmaf(s.W_v[CF_BWDW_U * lane + u], hout[u], vpart);
-        float value = s.b_v + cf_warp_bsum(vpart);
-
-        // ---- Softmax stats + loss gradients (uniform across the warp) ----
-        float mx = cf_warp_bmax(fmaxf(l0, l1));
-        float e0 = expf(l0 - mx);
-        float e1 = lane + 32 < CRAFTAX_NUM_ACTIONS ? expf(l1 - mx) : 0.0f;
-        float total = cf_warp_bsum(e0 + e1);
-        float inv_total = 1.0f / total;
-        float lse = mx + logf(total);
-        float pi0 = e0 * inv_total, pi1 = e1 * inv_total;
-
-        int act = r_act[o];
-        float lact_v = act < 32 ? l0 : l1;
-        float logit_act = __shfl_sync(0xffffffffu, lact_v, act & 31);
-        float logp_new = logit_act - lse;
-        float ratio = expf(logp_new - r_logprob[o]);
-        float A = (adv[o] - adv_mean) * adv_inv_std;
-        float u1 = ratio * A;
-        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
-        float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
-
-        float hp = -pi0 * (l0 - lse);
-        if (lane + 32 < CRAFTAX_NUM_ACTIONS) hp -= pi1 * (l1 - lse);
-        float Hent = cf_warp_bsum(hp);
-
-        float dvalue = inv_batch * vf_coef * (value - ret[o]);
-        float dl0 = (dlogp * ((lane == act ? 1.0f : 0.0f) - pi0)
-                     + ent_coef * pi0 * ((l0 - lse) + Hent)) * inv_batch;
-        float dl1 = (dlogp * ((lane + 32 == act ? 1.0f : 0.0f) - pi1)
-                     + ent_coef * pi1 * ((l1 - lse) + Hent)) * inv_batch;
-        if (!active) {
-            dvalue = 0.0f;
-            dl0 = 0.0f;
-            dl1 = 0.0f;
-        } else {
-            pg_sum += -fminf(u1, u2);
-            v_sum += 0.5f * (value - ret[o]) * (value - ret[o]);
-            ent_sum += Hent;
-        }
-        s.dlog[warp][lane] = dl0;
-        if (lane + 32 < CRAFTAX_NUM_ACTIONS) s.dlog[warp][lane + 32] = dl1;
-        if (lane == 0) s.dlog[warp][CRAFTAX_NUM_ACTIONS] = dvalue;
-        __syncwarp();
-
-        // ---- Heads backward: dhout for this lane's units ----
-        float dhout[CF_BWDW_U];
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++)
-            dhout[u] = dvalue * s.W_v[CF_BWDW_U * lane + u];
-        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
-            float da = s.dlog[warp][a];
-            #pragma unroll
-            for (int u = 0; u < CF_BWDW_U; u++)
-                dhout[u] = fmaf(da, CF_BWDW_WA(s, a, CF_BWDW_U * lane + u),
-                                dhout[u]);
-        }
-
-        // ---- MinGRU backward (elementwise on this lane's units) ----
-        bool done_t = r_done[o] != 0;
-        float dh[CF_BWDW_U], dzh[CF_BWDW_U], dzg[CF_BWDW_U], dzp[CF_BWDW_U];
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++) {
-            float dout = dhout[u] * pp[u] + (done_t ? 0.0f : dstate[u]);
-            float dp = dhout[u] * (outk[u] - henc[u]);
-            dzp[u] = dp * pp[u] * (1.0f - pp[u]);
-            dh[u] = dhout[u] * (1.0f - pp[u]);
-            dstate[u] = dout * (1.0f - sg[u]);
-            float dsg = dout * (cf_nn_mingru_g(ah[u]) - s_in[u]);
-            dzg[u] = dsg * sg[u] * (1.0f - sg[u]);
-            dzh[u] = dout * sg[u] * cf_nn_dg_mingru(ah[u]);
-            int k = CF_BWDW_U * lane + u;
-            s.dz[warp][k] = dzh[u];
-            s.dz[warp][CF_NN_HIDDEN + k] = dzg[u];
-            s.dz[warp][2 * CF_NN_HIDDEN + k] = dzp[u];
-            s.henc[warp][k] = henc[u];
-        }
-
-        // dh_enc += W_gru^T dz, k ascending via warp broadcast.
-        for (int kb = 0; kb < 32; kb++) {
-            float bzh[CF_BWDW_U], bzg[CF_BWDW_U], bzp[CF_BWDW_U];
-            #pragma unroll
-            for (int v_ = 0; v_ < CF_BWDW_U; v_++) {
-                bzh[v_] = __shfl_sync(0xffffffffu, dzh[v_], kb);
-                bzg[v_] = __shfl_sync(0xffffffffu, dzg[v_], kb);
-                bzp[v_] = __shfl_sync(0xffffffffu, dzp[v_], kb);
-            }
-            #pragma unroll
-            for (int v_ = 0; v_ < CF_BWDW_U; v_++) {
-                int k = CF_BWDW_U * kb + v_;
-                #pragma unroll
-                for (int u = 0; u < CF_BWDW_U; u++) {
-                    int j = CF_BWDW_U * lane + u;
-                    dh[u] = fmaf(bzh[v_], CF_BWDW_WG(s, k, j), dh[u]);
-                    dh[u] = fmaf(bzg[v_],
-                                 CF_BWDW_WG(s, CF_NN_HIDDEN + k, j), dh[u]);
-                    dh[u] = fmaf(bzp[v_],
-                                 CF_BWDW_WG(s, 2 * CF_NN_HIDDEN + k, j),
-                                 dh[u]);
-                }
-            }
-        }
-
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++) bencacc[u] += dh[u];
-
-        // ---- W_enc scatter: lane-owned slice, coalesced line atomics ----
-        if (active) {
-            for (int f = 0; f < CF_NN_MAP; f++) {
-                float x = (float)rec[f];
-                if (x == 0.0f) continue;
-                float* gcol =
-                    gr + CF_NN_W_ENC + (size_t)f * CF_NN_HIDDEN
-                    + CF_BWDW_U * lane;
-                #pragma unroll
-                for (int u = 0; u < CF_BWDW_U; u++)
-                    atomicAdd(gcol + u, x * dh[u]);
-            }
-            for (int j = 0; j < CF_NN_TAIL; j++) {
-                float x;
-                memcpy(&x, rec + CF_NN_MAP + 4 * j, sizeof(float));
-                if (x == 0.0f) continue;
-                float* gcol =
-                    gr + CF_NN_W_ENC + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN
-                    + CF_BWDW_U * lane;
-                #pragma unroll
-                for (int u = 0; u < CF_BWDW_U; u++)
-                    atomicAdd(gcol + u, x * dh[u]);
-            }
-        }
-
-        // ---- Dense-grad cross-warp reduction ----
-        __syncthreads();
-#if CF_GRU_SMEM
-        #pragma unroll
-        for (int q = 0; q < (CF_NN_GRU * CF_NN_HIDDEN) / CF_BWDW_BD; q++) {
-            int p = tid + q * CF_BWDW_BD;
-            int k = p / CF_NN_HIDDEN, j = p % CF_NN_HIDDEN;
-            float g = 0.0f;
-            #pragma unroll
-            for (int m = 0; m < CF_BWDW_WARPS; m++)
-                g = fmaf(s.dz[m][k], s.henc[m][j], g);
-            raccA[q] += g;
-        }
-#else
-        for (int p = tid; p < CF_NN_GRU * CF_NN_HIDDEN; p += CF_BWDW_BD) {
-            int k = p / CF_NN_HIDDEN, j = p % CF_NN_HIDDEN;
-            float g = 0.0f;
-            #pragma unroll
-            for (int m = 0; m < CF_BWDW_WARPS; m++)
-                g = fmaf(s.dz[m][k], s.henc[m][j], g);
-            atomicAdd(&gr[CF_NN_W_GRU + p], g);
-        }
-#endif
-        #pragma unroll
-        for (int q = 0; q < CF_BWDW_NWA; q++) {
-            int p = tid + q * CF_BWDW_BD;
-            if (p < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN) {
-                int a = p / CF_NN_HIDDEN, j = p % CF_NN_HIDDEN;
-                float g = 0.0f;
-                #pragma unroll
-                for (int m = 0; m < CF_BWDW_WARPS; m++)
-                    g = fmaf(s.dlog[m][a], s.hout[m][j], g);
-                raccWa[q] += g;
-            }
-        }
-        if (tid < CF_NN_HIDDEN) {
-            float g = 0.0f;
-            #pragma unroll
-            for (int m = 0; m < CF_BWDW_WARPS; m++)
-                g = fmaf(s.dlog[m][CRAFTAX_NUM_ACTIONS], s.hout[m][tid], g);
-            raccWv += g;
-        }
-        if (tid < CRAFTAX_NUM_ACTIONS) {
-            float g = 0.0f;
-            #pragma unroll
-            for (int m = 0; m < CF_BWDW_WARPS; m++) g += s.dlog[m][tid];
-            raccBa += g;
-        }
-        if (tid == 0) {
-            #pragma unroll
-            for (int m = 0; m < CF_BWDW_WARPS; m++)
-                raccBv += s.dlog[m][CRAFTAX_NUM_ACTIONS];
-        }
-        __syncthreads();  // staging reused next timestep
-    }
-
-    // ---- Flush register accumulators ----
-#if CF_GRU_SMEM
-    #pragma unroll
-    for (int q = 0; q < (CF_NN_GRU * CF_NN_HIDDEN) / CF_BWDW_BD; q++)
-        atomicAdd(&gr[CF_NN_W_GRU + tid + q * CF_BWDW_BD], raccA[q]);
-#endif
-    #pragma unroll
-    for (int q = 0; q < CF_BWDW_NWA; q++) {
-        int p = tid + q * CF_BWDW_BD;
-        if (p < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN)
-            atomicAdd(&gr[CF_NN_W_A + p], raccWa[q]);
-    }
-    if (tid < CF_NN_HIDDEN) atomicAdd(&gr[CF_NN_W_V + tid], raccWv);
-    if (tid < CRAFTAX_NUM_ACTIONS) atomicAdd(&gr[CF_NN_B_A + tid], raccBa);
-    if (tid == 0) atomicAdd(&gr[CF_NN_B_V], raccBv);
-    if (active) {
-        #pragma unroll
-        for (int u = 0; u < CF_BWDW_U; u++)
-            atomicAdd(&gr[CF_NN_B_ENC + CF_BWDW_U * lane + u], bencacc[u]);
-    }
-    if (active && loss_acc && lane == 0) {
-        atomicAdd(&loss_acc[0], pg_sum);
-        atomicAdd(&loss_acc[1], v_sum);
-        atomicAdd(&loss_acc[2], ent_sum);
-    }
-}
-#endif  // CF_BWDW_ENABLE
-
-// Reduce per-block gradient copies, Adam-update the flat params, and
-// zero the copies for the next iteration. One thread per parameter.
+// Adam-update the flat params from the (single-copy) gradient arena,
+// zeroing it for the next iteration. One thread per parameter. lr and
+// the 1-based step come from device memory (a float and a uint64
+// counter) so the whole trainer iteration lives in one CUDA graph
+// with host-side lr annealing as a single 4-byte H2D write.
 __global__ void k_adam(
-    float* __restrict__ params, float* __restrict__ grads, int grad_copies,
+    float* __restrict__ params, float* __restrict__ grads,
     float* __restrict__ m, float* __restrict__ v,
-    int step, float lr, float beta1, float beta2, float eps
+    const uint64_t* __restrict__ step_ctr, const float* __restrict__ lr_ptr,
+    float beta1, float beta2, float eps
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= CF_NN_PARAM_COUNT) return;
-    float gsum = 0.0f;
-    for (int c = 0; c < grad_copies; c++) {
-        gsum += grads[(size_t)c * CF_NN_PARAM_COUNT + i];
-        grads[(size_t)c * CF_NN_PARAM_COUNT + i] = 0.0f;
-    }
-    float mi = beta1 * m[i] + (1.0f - beta1) * gsum;
-    float vi = beta2 * v[i] + (1.0f - beta2) * gsum * gsum;
+    float lr = *lr_ptr;
+    int step = (int)(*step_ctr) + 1;
+    float g = grads[i];
+    grads[i] = 0.0f;
+    float mi = beta1 * m[i] + (1.0f - beta1) * g;
+    float vi = beta2 * v[i] + (1.0f - beta2) * g * g;
     m[i] = mi; v[i] = vi;
     float mhat = mi / (1.0f - powf(beta1, (float)step));
     float vhat = vi / (1.0f - powf(beta2, (float)step));
@@ -11823,25 +10955,101 @@ static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
 }
 
 // ------------------------------------------------------------
-// run / runhash / runverify: NN-fused env+policy rollouts.
+// run / runhash / runverify / train / gradcheck: batched
+// env+policy rollouts and the on-device PPO trainer (ported from
+// main_classic.cu; same GEMM layout tricks and graph discipline).
+//
+// cuBLAS conveniences. All activation buffers are col-major. A
+// row-major weight W [m][k] is consumed as col-major W^T [k][m], so
+// the forward is OP_T and dh/dW use OP_N/OP_T on the SAME memory --
+// no transposed weight copies anywhere.
 // ------------------------------------------------------------
+#define CUBLAS_CHECK(x) do { \
+    cublasStatus_t s_ = (x); \
+    if (s_ != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS error %d at %s:%d\n", (int)s_, __FILE__, \
+                __LINE__); \
+        exit(1); \
+    } } while (0)
+
+static cublasHandle_t g_blas = NULL;
+static float g_one = 1.0f, g_zero = 0.0f;
+
+static void cu_ensure_blas(void) {
+    if (!g_blas) {
+        CUBLAS_CHECK(cublasCreate(&g_blas));
+        CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_TF32_TENSOR_OP_MATH));
+    }
+}
+
+// y[m][cols] = W[m][k] @ x[k][cols]   (forward, W row-major raw)
+static void cu_gemm_fwd(int m, int cols, int k, const float* W,
+                        const float* x, float* y, cudaStream_t s) {
+    CUBLAS_CHECK(cublasSetStream(g_blas, s));
+    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, m, cols, k,
+                             &g_one, W, k, x, k, &g_zero, y, m));
+}
+
+// dh[HIDDEN][cols] = W^T @ dpre[m3][cols]  (same raw W memory, OP_N)
+static void cu_gemm_dh(int m3, int cols, const float* W, const float* dpre,
+                       float* dh, cudaStream_t s) {
+    CUBLAS_CHECK(cublasSetStream(g_blas, s));
+    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, CF_NN_HIDDEN,
+                             cols, m3, &g_one, W, CF_NN_HIDDEN, dpre, m3,
+                             &g_zero, dh, CF_NN_HIDDEN));
+}
+
+// dW[j-major][+] += x[HIDDEN][cols] @ dpre[rows][cols]^T, beta=1.
+// C(j,i) lands at j + i*HIDDEN, i.e. raw [rows][HIDDEN] row-major,
+// matching the forward weight layout exactly.
+static void cu_gemm_dw(int rows, int cols, const float* x, const float* dpre,
+                       float* dW, cudaStream_t s) {
+    CUBLAS_CHECK(cublasSetStream(g_blas, s));
+    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_T, CF_NN_HIDDEN,
+                             rows, cols, &g_one, x, CF_NN_HIDDEN, dpre, rows,
+                             &g_one, dW, CF_NN_HIDDEN));
+}
+
+// dWv[j] += sum_s x[HIDDEN][cols](j,s) * dv[s]     (gemv, beta=1)
+static void cu_gemv_dwv(const float* x, const float* dv, float* dWv,
+                        int cols, cudaStream_t s) {
+    CUBLAS_CHECK(cublasSetStream(g_blas, s));
+    CUBLAS_CHECK(cublasSgemv(g_blas, CUBLAS_OP_N, CF_NN_HIDDEN, cols,
+                             &g_one, x, CF_NN_HIDDEN, dv, 1, &g_one, dWv, 1));
+}
+
 typedef struct {
     float* params;
     CfWeights w;
-    float* h_state;
+    float* h_state;   // [LAYERS][HIDDEN][n] live recurrent state
+    float* h_enc;     // [HIDDEN][n] col-major forward chain
+    float* hout[2];   // [HIDDEN][n]
+    float* h3;        // [HIDDEN][n]
+    float* pre;       // [GRU][n]
+    float* logits;    // [NUM_ACTIONS][n]
     int32_t* d_act;
     float* d_logprob;
     float* d_value;
+    uint64_t* step_ctr;  // device counter: Philox sampler offset
+    cudaStream_t stream;
 } CuPolicy;
 
 static void cu_policy_init(CuPolicy* p, int num_envs) {
-    CU_CHECK(cudaMalloc(&p->params, (size_t)CF_NN_PARAM_COUNT * sizeof(float)));
+    if (num_envs % 32 != 0) {
+        fprintf(stderr,
+                "policy modes need --envs to be a multiple of 32 "
+                "(warp encoder)\n");
+        exit(1);
+    }
+    cu_ensure_blas();
+    CU_CHECK(cudaMalloc(&p->params,
+                        (size_t)CF_NN_PARAM_COUNT * sizeof(float)));
     float be = 1.0f / sqrtf((float)CF_NN_OBS);
     float bh = 1.0f / sqrtf((float)CF_NN_HIDDEN);
     const struct { int off, count; float bound; } segs[7] = {
         {CF_NN_W_ENC, CF_NN_OBS * CF_NN_HIDDEN, be},
         {CF_NN_B_ENC, CF_NN_HIDDEN, be},
-        {CF_NN_W_GRU, CF_NN_GRU * CF_NN_HIDDEN, bh},
+        {CF_NN_W_GRU, CF_NN_W_GRU_ELEMS, bh},
         {CF_NN_W_A, CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN, bh},
         {CF_NN_B_A, CRAFTAX_NUM_ACTIONS, bh},
         {CF_NN_W_V, CF_NN_HIDDEN, bh},
@@ -11860,80 +11068,113 @@ static void cu_policy_init(CuPolicy* p, int num_envs) {
     p->w.W_v = p->params + CF_NN_W_V;
     p->w.b_v = p->params + CF_NN_B_V;
 
+    size_t hn = (size_t)CF_NN_HIDDEN * num_envs;
     CU_CHECK(cudaMalloc(&p->h_state,
-                        (size_t)CF_NN_HIDDEN * num_envs * sizeof(float)));
+                        (size_t)CF_NN_LAYERS * hn * sizeof(float)));
     CU_CHECK(cudaMemset(p->h_state, 0,
-                        (size_t)CF_NN_HIDDEN * num_envs * sizeof(float)));
+                        (size_t)CF_NN_LAYERS * hn * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->h_enc, hn * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->hout[0], hn * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->hout[1], hn * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->h3, hn * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->pre,
+                        (size_t)CF_NN_GRU * num_envs * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->logits,
+                        (size_t)CRAFTAX_NUM_ACTIONS * num_envs * sizeof(float)));
     CU_CHECK(cudaMalloc(&p->d_act, (size_t)num_envs * sizeof(int32_t)));
     CU_CHECK(cudaMalloc(&p->d_logprob, (size_t)num_envs * sizeof(float)));
     CU_CHECK(cudaMalloc(&p->d_value, (size_t)num_envs * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->step_ctr, sizeof(uint64_t)));
+    CU_CHECK(cudaMemset(p->step_ctr, 0, sizeof(uint64_t)));
+    CU_CHECK(cudaStreamCreateWithFlags(&p->stream, cudaStreamNonBlocking));
 }
 
 static void cu_policy_free(CuPolicy* p) {
+    cudaStreamDestroy(p->stream);
     cudaFree(p->params); cudaFree(p->h_state);
+    cudaFree(p->h_enc); cudaFree(p->hout[0]); cudaFree(p->hout[1]);
+    cudaFree(p->h3); cudaFree(p->pre); cudaFree(p->logits);
     cudaFree(p->d_act); cudaFree(p->d_logprob); cudaFree(p->d_value);
+    cudaFree(p->step_ctr);
 }
 
-// One policy+env step; no observation tensor is ever written on this path
-// (k_step_run skips the scalar tail, k_encode never runs).
+// One env+policy step, batched split path, all on p->stream (graph
+// capturable: the sampler offset and every seed input are device
+// state). No observation tensor is ever written. Optional recording
+// pointers (training): compact obs record, per-layer post-zero state
+// inputs (slab base for this t), and the reward/done row.
 static void cu_rollout_step(
-    CuVec* v, CuPolicy* p, int fused, uint64_t seed, uint64_t step
+    CuVec* v, CuPolicy* p, uint64_t seed,
+    uint8_t* r_obs_row,   // [n][CF_TRAIN_OBS] or NULL
+    float* r_state_t,     // [LAYERS][HIDDEN*n] slab base for this t, or NULL
+    int32_t* act_dst, float* lp_dst, float* val_dst,
+    float* r_reward_row, uint8_t* r_done_row  // or NULL
 ) {
     int n = v->num_envs;
-    CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int)));
-    CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int)));
-    if (fused) {
-        // Occupancy experiment knobs, bit-identical either way (the
-        // thread->env map is the flat global index). SMEM_PAD reserves
-        // unused dynamic smem to force FEWER blocks/SM; STEP_BLOCK resizes
-        // blocks. Measured @65k fused on idle 3090: 64thr/4blk 29.0M (best),
-        // 96thr (288 thr/SM) 25.3M, 128thr 28.3M, pad->192thr 22.2M,
-        // pad->128thr 19.2M. Defaults are the optimum.
-#ifndef CRAFTAX_STEP_SMEM_PAD
-#define CRAFTAX_STEP_SMEM_PAD 0
-#endif
-#ifndef CRAFTAX_STEP_BLOCK
-#define CRAFTAX_STEP_BLOCK 64
-#endif
-        k_step_policy<<<(n + CRAFTAX_STEP_BLOCK - 1) / CRAFTAX_STEP_BLOCK,
-                        CRAFTAX_STEP_BLOCK, CRAFTAX_STEP_SMEM_PAD>>>(
-            v->d_envs, p->w, p->h_state, n, v->d_resets,
-            p->d_act, p->d_logprob, p->d_value, seed, step);
-    } else if (fused == 2) {
-        // Split path with the warp-cooperative policy kernel (bit-identical
-        // outputs to k_policy; hidden % 128 builds only).
-#if CF_NN_HIDDEN == 128
-        k_policy_warp<<<(n + CF_POL_WARPS - 1) / CF_POL_WARPS,
-                        32 * CF_POL_WARPS>>>(
-            p->w, p->h_state, v->d_terminals, v->d_actions,
-            p->d_act, p->d_logprob, p->d_value, n, seed, step);
-        k_step_run<<<(n + 63) / 64, 64>>>(v->d_envs, n, v->d_resets);
-#else
-        fprintf(stderr, "--fused 2 (warp policy) requires -DCRAFTAX_HIDDEN "
-                "to be 128 (this build: %d)\n", CF_NN_HIDDEN);
-        exit(1);
-#endif
-    } else {
-        k_policy<<<(n + 63) / 64, 64>>>(
-            p->w, p->h_state, v->d_terminals, v->d_actions,
-            p->d_act, p->d_logprob, p->d_value, n, seed, step);
-        k_step_run<<<(n + 63) / 64, 64>>>(v->d_envs, n, v->d_resets);
+    cudaStream_t st = p->stream;
+    size_t hn = (size_t)CF_NN_HIDDEN * n;
+    int grid = (n + 255) / 256;
+    CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int), st));
+    CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int), st));
+    k_encode_env_warp<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
+        p->w.W_enc, p->w.b_enc, p->h_enc, n);
+    if (r_obs_row) k_record_obs<<<grid, 256, 0, st>>>(r_obs_row, n);
+    const float* x = p->h_enc;
+    for (int l = 0; l < CF_NN_LAYERS; l++) {
+        cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
+                    p->w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                    x, p->pre, st);
+        float* xn = (l < CF_NN_LAYERS - 1) ? p->hout[l] : p->h3;
+        float* store = r_state_t ? r_state_t + (size_t)l * hn : NULL;
+        k_mingru_epi_fwd<<<(int)((hn + 255) / 256), 256, 0, st>>>(
+            p->pre, x, p->h_state + (size_t)l * hn, xn, store,
+            v->d_terminals, n);
+        x = xn;
     }
+    cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p->w.W_a, p->h3,
+                p->logits, st);
+    k_value_sample<<<grid, 256, 0, st>>>(
+        p->h3, p->logits, p->w.b_a, p->w.W_v, p->w.b_v,
+        v->d_actions, act_dst, lp_dst, val_dst, n, seed, p->step_ctr);
+    k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, n, v->d_resets);
+    if (r_reward_row)
+        k_record_rd<<<grid, 256, 0, st>>>(v->d_rewards, v->d_terminals,
+                                          r_reward_row, r_done_row, n);
     {
         int tail_blocks = (n * 32 + 255) / 256;
         if (tail_blocks > 512) tail_blocks = 512;
-        k_spawn_tail<<<tail_blocks, 256>>>();
+        k_spawn_tail<<<tail_blocks, 256, 0, st>>>();
     }
     if (v->lazy) {
-        k_reset_list_warp<<<n, 32>>>(v->d_envs, v->d_resets);
+        k_reset_list_warp<<<n, 32, 0, st>>>(v->d_envs, v->d_resets);
     } else {
-        k_reset_list<<<(n + 63) / 64, 64>>>(v->d_envs, v->d_resets);
+        k_reset_list<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, v->d_resets);
     }
+    k_bump_ctr<<<1, 1, 0, st>>>(p->step_ctr);
     CU_CHECK(cudaGetLastError());
 }
 
+static void cu_rollout_step_plain(CuVec* v, CuPolicy* p, uint64_t seed) {
+    cu_rollout_step(v, p, seed, NULL, NULL, p->d_act, p->d_logprob,
+                    p->d_value, NULL, NULL);
+}
+
+// Warm cuBLAS workspaces for every forward GEMM shape WITHOUT
+// touching env or policy state (workspace allocation is illegal
+// inside graph capture): dummy GEMMs into the scratch buffers.
+static void cu_warm_blas_fwd(CuPolicy* p, int n) {
+    cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN, p->w.W_gru, p->h_enc, p->pre,
+                p->stream);
+    cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p->w.W_a, p->h_enc,
+                p->logits, p->stream);
+    CU_CHECK(cudaStreamSynchronize(p->stream));
+}
+
+// graph==1 captures one step into a CUDA graph and replays it; the
+// step's RNG offsets advance through the device counter, so replays
+// are bitwise identical to eager launches.
 static int cu_run_rollout_bench(
-    int num_envs, int iters, uint64_t seed, int fused
+    int num_envs, int iters, uint64_t seed, int graph
 ) {
     double t_init0 = cf_now_s();
     CuVec v;
@@ -11942,35 +11183,69 @@ static int cu_run_rollout_bench(
     cu_policy_init(&p, num_envs);
     double t_init = cf_now_s() - t_init0;
 
-    uint64_t step = 0;
+    cudaGraph_t g = NULL;
+    cudaGraphExec_t gexec = NULL;
     int warmup = iters / 20 > 10 ? 10 : (iters / 20 > 0 ? iters / 20 : 1);
-    for (int k = 0; k < warmup; k++) cu_rollout_step(&v, &p, fused, seed, step++);
-    CU_CHECK(cudaDeviceSynchronize());
-
+    for (int k = 0; k < warmup; k++) cu_rollout_step_plain(&v, &p, seed);
+    CU_CHECK(cudaStreamSynchronize(p.stream));
+    if (graph) {
+        CU_CHECK(cudaStreamBeginCapture(p.stream,
+                                        cudaStreamCaptureModeGlobal));
+        cu_rollout_step_plain(&v, &p, seed);
+        CU_CHECK(cudaStreamEndCapture(p.stream, &g));
+        cudaError_t ierr = cudaGraphInstantiate(&gexec, g, NULL, NULL, 0);
+        if (ierr != cudaSuccess) {
+            fprintf(stderr, "graph instantiate failed: %s -- eager\n",
+                    cudaGetErrorString(ierr));
+            cudaGetLastError();
+            gexec = NULL;
+        }
+    }
     double t0 = cf_now_s();
-    for (int k = 0; k < iters; k++) cu_rollout_step(&v, &p, fused, seed, step++);
-    CU_CHECK(cudaDeviceSynchronize());
+    for (int k = 0; k < iters; k++) {
+        if (gexec) {
+            CU_CHECK(cudaGraphLaunch(gexec, p.stream));
+        } else {
+            cu_rollout_step_plain(&v, &p, seed);
+        }
+    }
+    CU_CHECK(cudaStreamSynchronize(p.stream));
     double dt = cf_now_s() - t0;
     double sps = (double)num_envs * (double)iters / dt;
-    printf("envs=%d iters=%d fused=%d\n", num_envs, iters, fused);
+    printf("envs=%d iters=%d graph=%d\n", num_envs, iters,
+           gexec ? 1 : 0);
     printf("init %.3fs  run %.3fs  SPS=%12.0f  (%.2f us/step/env)\n",
            t_init, dt, sps, dt / (double)iters / (double)num_envs * 1e6);
     cu_print_logs(&v, false);
+    if (gexec) cudaGraphExecDestroy(gexec);
+    if (g) cudaGraphDestroy(g);
     cu_policy_free(&p);
     cu_vec_free(&v);
     return 0;
 }
 
-// Deterministic rollout hash: FNV over (actions, logprobs, values, rewards,
-// terminals) each step. Same seed => identical hash across runs; split
-// (fused=0) and fused (fused=1) must produce the same hash.
+// Deterministic rollout hash: FNV over (actions, logprobs, values,
+// rewards, terminals) each step. Same seed => identical hash across
+// runs; eager (graph=0) and graph-replayed (graph=1) steps must
+// produce the same hash.
 static int cu_run_rollout_hash(
-    int num_envs, int num_steps, uint64_t seed, int fused
+    int num_envs, int num_steps, uint64_t seed, int graph
 ) {
     CuVec v;
     cu_vec_init(&v, num_envs, seed);
     CuPolicy p;
     cu_policy_init(&p, num_envs);
+
+    cudaGraph_t g = NULL;
+    cudaGraphExec_t gexec = NULL;
+    if (graph) {
+        cu_warm_blas_fwd(&p, num_envs);
+        CU_CHECK(cudaStreamBeginCapture(p.stream,
+                                        cudaStreamCaptureModeGlobal));
+        cu_rollout_step_plain(&v, &p, seed);
+        CU_CHECK(cudaStreamEndCapture(p.stream, &g));
+        CU_CHECK(cudaGraphInstantiate(&gexec, g, NULL, NULL, 0));
+    }
 
     int32_t* h_act = (int32_t*)malloc((size_t)num_envs * 4);
     float* h_lp = (float*)malloc((size_t)num_envs * 4);
@@ -11978,7 +11253,12 @@ static int cu_run_rollout_hash(
     uint64_t h = 0xcbf29ce484222325ULL;
     double total_reward = 0.0;
     for (int step = 0; step < num_steps; step++) {
-        cu_rollout_step(&v, &p, fused, seed, (uint64_t)step);
+        if (gexec) {
+            CU_CHECK(cudaGraphLaunch(gexec, p.stream));
+        } else {
+            cu_rollout_step_plain(&v, &p, seed);
+        }
+        CU_CHECK(cudaStreamSynchronize(p.stream));
         CU_CHECK(cudaMemcpy(h_act, p.d_act, (size_t)num_envs * 4,
                             cudaMemcpyDeviceToHost));
         CU_CHECK(cudaMemcpy(h_lp, p.d_logprob, (size_t)num_envs * 4,
@@ -11994,113 +11274,216 @@ static int cu_run_rollout_hash(
         for (int i = 0; i < num_envs; i++)
             total_reward += (double)v.h_rewards[i];
     }
-    printf("rollout_hash 0x%016llx (envs=%d steps=%d seed=%llu fused=%d)\n",
+    printf("rollout_hash 0x%016llx (envs=%d steps=%d seed=%llu graph=%d)\n",
            (unsigned long long)h, num_envs, num_steps,
-           (unsigned long long)seed, fused);
+           (unsigned long long)seed, graph);
     printf("total_reward=%.3f\n", total_reward);
     cu_print_logs(&v, false);
     free(h_act); free(h_lp); free(h_val);
+    if (gexec) cudaGraphExecDestroy(gexec);
+    if (g) cudaGraphDestroy(g);
     cu_policy_free(&p);
     cu_vec_free(&v);
     return 0;
 }
 
-// Bitwise check of the gathered forward against a dense reference forward
-// computed from the materialized observation tensor, along a live rollout
-// driven by the gathered path's actions.
-static int cu_run_rollout_verify(int num_envs, int num_steps, uint64_t seed) {
+// Quiet rollout hash over fresh env+policy state (runverify's
+// eager-vs-graph gate; CuVec owns device symbols, so the two runs
+// are sequential, each from an identical fresh init).
+static uint64_t cu_hash_rollout(
+    int num_envs, int num_steps, uint64_t seed, int graph
+) {
     CuVec v;
     cu_vec_init(&v, num_envs, seed);
     CuPolicy p;
     cu_policy_init(&p, num_envs);
-
-    float* h_state_ref;
-    int32_t* d_act_ref;
-    float* d_lp_ref;
-    float* d_val_ref;
-    CU_CHECK(cudaMalloc(&h_state_ref,
-                        (size_t)CF_NN_HIDDEN * num_envs * sizeof(float)));
-    CU_CHECK(cudaMemset(h_state_ref, 0,
-                        (size_t)CF_NN_HIDDEN * num_envs * sizeof(float)));
-    CU_CHECK(cudaMalloc(&d_act_ref, (size_t)num_envs * 4));
-    CU_CHECK(cudaMalloc(&d_lp_ref, (size_t)num_envs * 4));
-    CU_CHECK(cudaMalloc(&d_val_ref, (size_t)num_envs * 4));
-
-    size_t hs = (size_t)CF_NN_HIDDEN * num_envs;
-    int32_t* a1 = (int32_t*)malloc((size_t)num_envs * 4);
-    int32_t* a2 = (int32_t*)malloc((size_t)num_envs * 4);
-    float* f1 = (float*)malloc(hs * 4);
-    float* f2 = (float*)malloc(hs * 4);
-    float* l1 = (float*)malloc((size_t)num_envs * 4);
-    float* l2 = (float*)malloc((size_t)num_envs * 4);
-    float* v1 = (float*)malloc((size_t)num_envs * 4);
-    float* v2 = (float*)malloc((size_t)num_envs * 4);
-
-    int n = num_envs;
-    long bad = 0;
-    for (int step = 0; step < num_steps; step++) {
-        // Materialize the full obs for the dense reference.
-        dim3 enc_block(32, CRAFTAX_ENC_WARPS_PER_BLOCK);
-        int enc_grid = (n + CRAFTAX_ENC_WARPS_PER_BLOCK - 1)
-            / CRAFTAX_ENC_WARPS_PER_BLOCK;
-        k_encode<<<enc_grid, enc_block>>>(v.d_envs, n);
-        k_encode_tail<<<(n + 63) / 64, 64>>>(v.d_envs, n);
-        k_policy<<<(n + 63) / 64, 64>>>(
-            p.w, p.h_state, v.d_terminals, v.d_actions,
-            p.d_act, p.d_logprob, p.d_value, n, seed, (uint64_t)step);
-        k_policy_ref<<<(n + 255) / 256, 256>>>(
-            p.w, h_state_ref, v.d_terminals, v.d_obs,
-            d_act_ref, d_lp_ref, d_val_ref, n, seed, (uint64_t)step);
-        CU_CHECK(cudaGetLastError());
-        CU_CHECK(cudaMemcpy(a1, p.d_act, (size_t)n * 4, cudaMemcpyDeviceToHost));
-        CU_CHECK(cudaMemcpy(a2, d_act_ref, (size_t)n * 4, cudaMemcpyDeviceToHost));
-        CU_CHECK(cudaMemcpy(l1, p.d_logprob, (size_t)n * 4, cudaMemcpyDeviceToHost));
-        CU_CHECK(cudaMemcpy(l2, d_lp_ref, (size_t)n * 4, cudaMemcpyDeviceToHost));
-        CU_CHECK(cudaMemcpy(v1, p.d_value, (size_t)n * 4, cudaMemcpyDeviceToHost));
-        CU_CHECK(cudaMemcpy(v2, d_val_ref, (size_t)n * 4, cudaMemcpyDeviceToHost));
-        CU_CHECK(cudaMemcpy(f1, p.h_state, hs * 4, cudaMemcpyDeviceToHost));
-        CU_CHECK(cudaMemcpy(f2, h_state_ref, hs * 4, cudaMemcpyDeviceToHost));
-        if (memcmp(a1, a2, (size_t)n * 4) != 0
-            || memcmp(l1, l2, (size_t)n * 4) != 0
-            || memcmp(v1, v2, (size_t)n * 4) != 0
-            || memcmp(f1, f2, hs * 4) != 0) {
-            bad++;
-        }
-        // Advance the env with the gathered path's actions.
-        CU_CHECK(cudaMemsetAsync(v.d_reset_count, 0, sizeof(int)));
-        CU_CHECK(cudaMemsetAsync(v.d_spawn_count, 0, sizeof(int)));
-        k_step_run<<<(n + 63) / 64, 64>>>(v.d_envs, n, v.d_resets);
-        {
-            int tail_blocks = (n * 32 + 255) / 256;
-            if (tail_blocks > 512) tail_blocks = 512;
-            k_spawn_tail<<<tail_blocks, 256>>>();
-        }
-        if (v.lazy) {
-            k_reset_list_warp<<<n, 32>>>(v.d_envs, v.d_resets);
-        } else {
-            k_reset_list<<<(n + 63) / 64, 64>>>(v.d_envs, v.d_resets);
-        }
-        CU_CHECK(cudaGetLastError());
+    cudaGraph_t g = NULL;
+    cudaGraphExec_t gexec = NULL;
+    if (graph) {
+        cu_warm_blas_fwd(&p, num_envs);
+        CU_CHECK(cudaStreamBeginCapture(p.stream,
+                                        cudaStreamCaptureModeGlobal));
+        cu_rollout_step_plain(&v, &p, seed);
+        CU_CHECK(cudaStreamEndCapture(p.stream, &g));
+        CU_CHECK(cudaGraphInstantiate(&gexec, g, NULL, NULL, 0));
     }
-    printf("gathered vs dense forward: %s "
-           "(%ld/%d mismatching steps, %lld env-steps compared)\n",
-           bad == 0 ? "EXACT" : "MISMATCH", bad, num_steps,
-           (long long)num_envs * num_steps);
-    printf("envs=%d steps=%d seed=%llu  =>  %s\n", num_envs, num_steps,
-           (unsigned long long)seed, bad == 0 ? "PASS" : "FAIL");
-    free(a1); free(a2); free(f1); free(f2);
-    free(l1); free(l2); free(v1); free(v2);
-    cudaFree(h_state_ref); cudaFree(d_act_ref);
-    cudaFree(d_lp_ref); cudaFree(d_val_ref);
+    int32_t* h_act = (int32_t*)malloc((size_t)num_envs * 4);
+    float* h_lp = (float*)malloc((size_t)num_envs * 4);
+    float* h_val = (float*)malloc((size_t)num_envs * 4);
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int step = 0; step < num_steps; step++) {
+        if (gexec) {
+            CU_CHECK(cudaGraphLaunch(gexec, p.stream));
+        } else {
+            cu_rollout_step_plain(&v, &p, seed);
+        }
+        CU_CHECK(cudaStreamSynchronize(p.stream));
+        CU_CHECK(cudaMemcpy(h_act, p.d_act, (size_t)num_envs * 4,
+                            cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(h_lp, p.d_logprob, (size_t)num_envs * 4,
+                            cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(h_val, p.d_value, (size_t)num_envs * 4,
+                            cudaMemcpyDeviceToHost));
+        cu_copy_back(&v, false);
+        h = cf_fnv1a(h, h_act, (size_t)num_envs * 4);
+        h = cf_fnv1a(h, h_lp, (size_t)num_envs * 4);
+        h = cf_fnv1a(h, h_val, (size_t)num_envs * 4);
+        h = cf_fnv1a(h, v.h_rewards, (size_t)num_envs * sizeof(float));
+        h = cf_fnv1a(h, v.h_terminals, (size_t)num_envs * sizeof(float));
+    }
+    free(h_act); free(h_lp); free(h_val);
+    if (gexec) cudaGraphExecDestroy(gexec);
+    if (g) cudaGraphDestroy(g);
     cu_policy_free(&p);
     cu_vec_free(&v);
-    return bad == 0 ? 0 : 1;
+    return h;
+}
+
+// Batched TF32 policy vs the scalar fp32 L=3 reference along a real
+// trajectory. The env always advances with the BATCHED path's
+// action; the reference only mirrors the forward from the
+// materialized obs, so tf32 sampling flips can never poison the
+// comparison. Gates on max |delta| along the whole trajectory;
+// action flips are reported as information. Then eager vs
+// graph-replayed rollouts must be bitwise identical.
+static int cu_run_rollout_verify(int num_envs, int num_steps,
+                                 uint64_t seed) {
+    int fail = 0;
+    cu_ensure_blas();
+    if (getenv("CRAFTAX_VERIFY_FP32"))
+        CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_DEFAULT_MATH));
+    {
+        CuVec v;
+        cu_vec_init(&v, num_envs, seed);
+        CuPolicy p;
+        cu_policy_init(&p, num_envs);
+        int n = num_envs;
+        cudaStream_t st = p.stream;
+        size_t hn = (size_t)CF_NN_HIDDEN * n;
+
+        float* ref_state;   // [L][H][n], the reference's own layout
+        float* ref_h3;      // [H][n] col-major (same layout as p.h3)
+        int32_t* act2; float* lp2; float* val2;
+        CU_CHECK(cudaMalloc(&ref_state,
+                            (size_t)CF_NN_LAYERS * hn * sizeof(float)));
+        CU_CHECK(cudaMemset(ref_state, 0,
+                            (size_t)CF_NN_LAYERS * hn * sizeof(float)));
+        CU_CHECK(cudaMalloc(&ref_h3, hn * sizeof(float)));
+        CU_CHECK(cudaMalloc(&act2, (size_t)n * 4));
+        CU_CHECK(cudaMalloc(&lp2, (size_t)n * 4));
+        CU_CHECK(cudaMalloc(&val2, (size_t)n * 4));
+
+        int grid = (n + 255) / 256;
+        float* b_h3 = (float*)malloc(hn * 4);
+        float* r_h = (float*)malloc(hn * 4);
+        float* b_val = (float*)malloc((size_t)n * 4);
+        float* v2 = (float*)malloc((size_t)n * 4);
+        int32_t* a1 = (int32_t*)malloc((size_t)n * 4);
+        int32_t* a2h = (int32_t*)malloc((size_t)n * 4);
+        double max_dh = 0.0, max_dv = 0.0;
+        long flips = 0;
+        for (int step = 0; step < num_steps; step++) {
+            // Materialize the full obs for the dense reference.
+            dim3 enc_block(32, CRAFTAX_ENC_WARPS_PER_BLOCK);
+            int enc_grid = (n + CRAFTAX_ENC_WARPS_PER_BLOCK - 1)
+                / CRAFTAX_ENC_WARPS_PER_BLOCK;
+            k_encode<<<enc_grid, enc_block, 0, st>>>(v.d_envs, n);
+            k_encode_tail<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs, n);
+            CU_CHECK(cudaMemsetAsync(v.d_reset_count, 0, sizeof(int), st));
+            CU_CHECK(cudaMemsetAsync(v.d_spawn_count, 0, sizeof(int), st));
+            // Batched forward (same launches as cu_rollout_step).
+            k_encode_env_warp<<<(int)(((size_t)n * 32 + 255) / 256), 256,
+                                0, st>>>(p.w.W_enc, p.w.b_enc, p.h_enc, n);
+            const float* x = p.h_enc;
+            for (int l = 0; l < CF_NN_LAYERS; l++) {
+                cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
+                            p.w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                            x, p.pre, st);
+                float* xn = (l < CF_NN_LAYERS - 1) ? p.hout[l] : p.h3;
+                k_mingru_epi_fwd<<<(int)((hn + 255) / 256), 256, 0, st>>>(
+                    p.pre, x, p.h_state + (size_t)l * hn, xn, NULL,
+                    v.d_terminals, n);
+                x = xn;
+            }
+            cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p.w.W_a, p.h3,
+                        p.logits, st);
+            k_value_sample<<<grid, 256, 0, st>>>(
+                p.h3, p.logits, p.w.b_a, p.w.W_v, p.w.b_v,
+                v.d_actions, p.d_act, p.d_logprob, p.d_value, n, seed,
+                p.step_ctr);
+            k_policy_ref_l3<<<grid, 256, 0, st>>>(
+                p.w, ref_state, v.d_terminals, v.d_obs, act2, lp2, val2,
+                ref_h3, n, seed, p.step_ctr);
+            // Advance the env with the batched path's actions.
+            k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs, n,
+                                                     v.d_resets);
+            {
+                int tail_blocks = (n * 32 + 255) / 256;
+                if (tail_blocks > 512) tail_blocks = 512;
+                k_spawn_tail<<<tail_blocks, 256, 0, st>>>();
+            }
+            if (v.lazy) {
+                k_reset_list_warp<<<n, 32, 0, st>>>(v.d_envs, v.d_resets);
+            } else {
+                k_reset_list<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs,
+                                                           v.d_resets);
+            }
+            k_bump_ctr<<<1, 1, 0, st>>>(p.step_ctr);
+            CU_CHECK(cudaGetLastError());
+            CU_CHECK(cudaStreamSynchronize(st));
+
+            CU_CHECK(cudaMemcpy(b_h3, p.h3, hn * 4, cudaMemcpyDeviceToHost));
+            CU_CHECK(cudaMemcpy(r_h, ref_h3, hn * 4,
+                                cudaMemcpyDeviceToHost));
+            CU_CHECK(cudaMemcpy(b_val, p.d_value, (size_t)n * 4,
+                                cudaMemcpyDeviceToHost));
+            CU_CHECK(cudaMemcpy(v2, val2, (size_t)n * 4,
+                                cudaMemcpyDeviceToHost));
+            CU_CHECK(cudaMemcpy(a1, p.d_act, (size_t)n * 4,
+                                cudaMemcpyDeviceToHost));
+            CU_CHECK(cudaMemcpy(a2h, act2, (size_t)n * 4,
+                                cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < hn; i++) {
+                double d = fabs((double)b_h3[i] - (double)r_h[i]);
+                if (d > max_dh) max_dh = d;
+            }
+            for (int e = 0; e < n; e++) {
+                double d = fabs((double)b_val[e] - (double)v2[e]);
+                if (d > max_dv) max_dv = d;
+                if (a1[e] != a2h[e]) flips++;
+            }
+        }
+        printf("batched vs scalar ref: max |d_h3| %.4g  max |d_v| %.4g  "
+               "action flips %ld/%lld  %s\n",
+               max_dh, max_dv, flips, (long long)num_steps * n,
+               (max_dh < 5e-2 && max_dv < 5e-2) ? "PASS" : "FAIL");
+        if (max_dh >= 5e-2 || max_dv >= 5e-2) fail = 1;
+        free(b_h3); free(r_h); free(b_val); free(v2); free(a1); free(a2h);
+        cudaFree(ref_state); cudaFree(ref_h3);
+        cudaFree(act2); cudaFree(lp2); cudaFree(val2);
+        cu_policy_free(&p);
+        cu_vec_free(&v);
+    }
+
+    {
+        uint64_t ha = cu_hash_rollout(num_envs, num_steps, seed, 0);
+        uint64_t hb = cu_hash_rollout(num_envs, num_steps, seed, 1);
+        printf("rollout hash (eager): %016llx\n", (unsigned long long)ha);
+        printf("rollout hash (graph): %016llx  (%s)\n",
+               (unsigned long long)hb, ha == hb ? "MATCH" : "MISMATCH");
+        if (ha != hb) fail = 1;
+    }
+
+    printf("envs=%d steps=%d  =>  %s\n", num_envs, num_steps,
+           fail ? "FAIL" : "PASS");
+    return fail;
 }
 
 // ------------------------------------------------------------
 // train / gradcheck: on-device PPO (rollout -> bootstrap -> GAE ->
-// backward -> Adam), everything resident on device; the loop syncs
-// only to log. Ported from the classic trainer (main_classic.cu).
+// GEMM backward -> Adam). The whole iteration body is captured into
+// one CUDA graph and replayed; lr/entropy annealing are single
+// 4-byte H2D writes into device floats the kernels read.
 // ------------------------------------------------------------
 typedef struct {
     float lr, gamma, lam, clip, ent, vf;
@@ -12122,35 +11505,54 @@ static CuPPOConfig cu_ppo_defaults(void) {
     return cfg;
 }
 
+// The GEMM backward's tight minibatch buffers cost ~20 KB per sample
+// column (x[4] + preb[3] + stb[3] + dh/dlogits/dvalue); the
+// auto-minibatcher sizes minibatches so they stay under ~8 GB.
+#define CF_MB_BYTES_PER_COL 20100
+
 typedef struct {
     CuVec* v;
     CuPolicy* p;
     CuPPOConfig cfg;
     int n, T;
     uint64_t seed;
-    uint64_t step_count;
     uint8_t* r_obs;     // [T][n][CF_TRAIN_OBS]
-    float* r_state;     // [T][n][CF_NN_HIDDEN] per-step state inputs
+    float* r_state;     // [T][LAYERS][n][HIDDEN] post-zero state inputs
     int32_t* r_act;     // [T][n]
     float* r_logprob;
     float* r_value;
     float* r_reward;
     uint8_t* r_done;
-    float* grads;
-    int grad_copies;
+    float* grads;       // [CF_NN_PARAM_COUNT], zeroed by k_adam
     float* adam_m;
     float* adam_v;
-    float* v_boot;
-    float* adv;
-    float* ret;
-    float* loss_acc;    // [3] pg, v, ent sums (fp32, logging)
+    float* d_lr;        // device float (host writes annealed value)
+    float* d_ent;       // device float (host writes annealed value)
+    uint64_t* adam_ctr;
+    float* v_boot;      // [n]
+    float* boot_state;  // [LAYERS][HIDDEN][n] scratch for the bootstrap
+    float* adv;         // [T][n]
+    float* ret;         // [T][n]
+    double* loss_acc;   // [3] pg, v, ent raw sums (logging / FD loss)
     double* stats;      // [2] adv sum, sumsq
-    int adam_step;
-    int mb_envs;        // envs per minibatch
-    int warp_bwd;       // 1: k_ppo_backward_warp (default), 0: thread kernel
-    long total_updates; // adam steps over the whole run (lr anneal)
-    // Phase timers (CRAFTAX_CU_TRAIN_PROF=1: sync per phase)
-    int prof;
+    // tight minibatch buffers (cols = T * mb)
+    float* x[4];        // [HIDDEN][cols]: enc out, layer outs
+    float* preb[3];     // [GRU][cols] (sweeps write dpre in place)
+    float* logitsb;     // [NUM_ACTIONS][cols]
+    float* dlogits;     // [NUM_ACTIONS][cols]
+    float* dvalue;      // [cols]
+    float* dh3b;        // [HIDDEN][cols]
+    float* dhG;         // [HIDDEN][cols]
+    float* dhX;         // [HIDDEN][cols]
+    float* stb[3];      // [HIDDEN][cols] post-zero input states from replay
+    float* live_st[3];  // [HIDDEN][mb] replay carry across t
+    int mb;             // envs per minibatch
+    long total_updates; // adam steps over the whole run (annealing)
+    long updates_done;
+    int warmed;
+    cudaGraph_t tgraph;
+    cudaGraphExec_t texec;
+    int prof;           // CRAFTAX_CU_TRAIN_PROF=1: eager + per-phase sync
     double t_rollout, t_gae, t_backward, t_adam;
 } CuTrain;
 
@@ -12160,177 +11562,259 @@ static void cu_train_init(
     memset(tr, 0, sizeof(*tr));
     tr->v = v; tr->p = p; tr->cfg = cfg;
     tr->n = v->num_envs; tr->T = T; tr->seed = seed;
-    if (tr->n % 32 != 0) {
-        fprintf(stderr, "train: --envs must be a multiple of 32\n");
-        exit(1);
-    }
     if (cfg.minibatches < 1 || tr->n % cfg.minibatches != 0) {
         fprintf(stderr, "--minibatches must divide num_envs (%d %% %d != 0)\n",
                 tr->n, cfg.minibatches);
         exit(1);
     }
-    tr->mb_envs = tr->n / cfg.minibatches;
-    if (cfg.bptt_split < 1 || T % cfg.bptt_split != 0
-        || tr->mb_envs % 32 != 0) {
+    tr->mb = tr->n / cfg.minibatches;
+    if (cfg.bptt_split < 1 || T % cfg.bptt_split != 0 || tr->mb % 32 != 0) {
         fprintf(stderr, "--bptt-split must divide horizon (%d %% %d != 0), "
                 "and envs/minibatch must be a multiple of 32\n",
                 T, cfg.bptt_split);
         exit(1);
     }
     size_t nt = (size_t)tr->n * T;
+    size_t cols = (size_t)T * tr->mb;
     CU_CHECK(cudaMalloc(&tr->r_obs, nt * CF_TRAIN_OBS));
-    CU_CHECK(cudaMalloc(&tr->r_state, nt * CF_NN_HIDDEN * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->r_state,
+                        nt * CF_NN_LAYERS * CF_NN_HIDDEN * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->r_act, nt * sizeof(int32_t)));
     CU_CHECK(cudaMalloc(&tr->r_logprob, nt * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->r_value, nt * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->r_reward, nt * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->r_done, nt));
     CU_CHECK(cudaMemset(tr->r_done, 0, nt));
-    // Backward path: warp-cooperative by default; CRAFTAX_CU_BWD=thread
-    // selects the thread-per-env reference kernel. grad_copies scales
-    // with the actual backward grid of the selected kernel.
-    const char* bwd = getenv("CRAFTAX_CU_BWD");
-#if CF_BWDW_ENABLE
-    tr->warp_bwd = !(bwd != NULL && !strcmp(bwd, "thread"));
-#else
-    (void)bwd;
-    tr->warp_bwd = 0;  // warp kernel not compiled at this hidden size
-#endif
-    size_t bw_units = (size_t)tr->mb_envs * cfg.bptt_split;
-    int grid = tr->warp_bwd
-#if CF_BWDW_ENABLE
-        ? (int)((bw_units + CF_BWDW_WARPS - 1) / CF_BWDW_WARPS)
-#else
-        ? 0
-#endif
-        : (int)((bw_units + CF_BWD_BLOCK - 1) / CF_BWD_BLOCK);
-    tr->grad_copies = grid < 512 ? grid : 512;
     CU_CHECK(cudaMalloc(&tr->grads,
-                        (size_t)tr->grad_copies * CF_NN_PARAM_COUNT * sizeof(float)));
+                        (size_t)CF_NN_PARAM_COUNT * sizeof(float)));
     CU_CHECK(cudaMemset(tr->grads, 0,
-                        (size_t)tr->grad_copies * CF_NN_PARAM_COUNT * sizeof(float)));
+                        (size_t)CF_NN_PARAM_COUNT * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->adam_m, CF_NN_PARAM_COUNT * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->adam_v, CF_NN_PARAM_COUNT * sizeof(float)));
     CU_CHECK(cudaMemset(tr->adam_m, 0, CF_NN_PARAM_COUNT * sizeof(float)));
     CU_CHECK(cudaMemset(tr->adam_v, 0, CF_NN_PARAM_COUNT * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->d_lr, sizeof(float)));
+    CU_CHECK(cudaMemcpy(tr->d_lr, &cfg.lr, 4, cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMalloc(&tr->d_ent, sizeof(float)));
+    CU_CHECK(cudaMemcpy(tr->d_ent, &cfg.ent, 4, cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMalloc(&tr->adam_ctr, sizeof(uint64_t)));
+    CU_CHECK(cudaMemset(tr->adam_ctr, 0, sizeof(uint64_t)));
     CU_CHECK(cudaMalloc(&tr->v_boot, tr->n * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->boot_state,
+                        (size_t)CF_NN_LAYERS * CF_NN_HIDDEN * tr->n
+                            * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->adv, nt * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->ret, nt * sizeof(float)));
-    CU_CHECK(cudaMalloc(&tr->loss_acc, 3 * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->loss_acc, 3 * sizeof(double)));
     CU_CHECK(cudaMalloc(&tr->stats, 2 * sizeof(double)));
+    for (int i = 0; i < 4; i++)
+        CU_CHECK(cudaMalloc(&tr->x[i],
+                            (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+    for (int l = 0; l < 3; l++) {
+        CU_CHECK(cudaMalloc(&tr->preb[l],
+                            (size_t)CF_NN_GRU * cols * sizeof(float)));
+        CU_CHECK(cudaMalloc(&tr->stb[l],
+                            (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+        CU_CHECK(cudaMalloc(&tr->live_st[l],
+                            (size_t)CF_NN_HIDDEN * tr->mb * sizeof(float)));
+    }
+    CU_CHECK(cudaMalloc(&tr->logitsb,
+                        (size_t)CRAFTAX_NUM_ACTIONS * cols * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->dlogits,
+                        (size_t)CRAFTAX_NUM_ACTIONS * cols * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->dvalue, cols * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->dh3b,
+                        (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->dhG,
+                        (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->dhX,
+                        (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
     const char* prof = getenv("CRAFTAX_CU_TRAIN_PROF");
     tr->prof = prof != NULL && atoi(prof) != 0;
 }
 
 static void cu_train_free(CuTrain* tr) {
+    if (tr->texec) cudaGraphExecDestroy(tr->texec);
+    if (tr->tgraph) cudaGraphDestroy(tr->tgraph);
     cudaFree(tr->r_obs); cudaFree(tr->r_state); cudaFree(tr->r_act);
     cudaFree(tr->r_logprob); cudaFree(tr->r_value); cudaFree(tr->r_reward);
     cudaFree(tr->r_done);
     cudaFree(tr->grads); cudaFree(tr->adam_m); cudaFree(tr->adam_v);
-    cudaFree(tr->v_boot); cudaFree(tr->adv); cudaFree(tr->ret);
+    cudaFree(tr->d_lr); cudaFree(tr->d_ent); cudaFree(tr->adam_ctr);
+    cudaFree(tr->v_boot); cudaFree(tr->boot_state);
+    cudaFree(tr->adv); cudaFree(tr->ret);
     cudaFree(tr->loss_acc); cudaFree(tr->stats);
+    for (int i = 0; i < 4; i++) cudaFree(tr->x[i]);
+    for (int l = 0; l < 3; l++) {
+        cudaFree(tr->preb[l]); cudaFree(tr->stb[l]); cudaFree(tr->live_st[l]);
+    }
+    cudaFree(tr->logitsb); cudaFree(tr->dlogits); cudaFree(tr->dvalue);
+    cudaFree(tr->dh3b); cudaFree(tr->dhG); cudaFree(tr->dhX);
 }
+
+static int cu_seg_len(const CuTrain* tr) { return tr->T / tr->cfg.bptt_split; }
 
 static double cu_prof_mark(CuTrain* tr) {
     if (!tr->prof) return 0.0;
-    CU_CHECK(cudaDeviceSynchronize());
+    CU_CHECK(cudaStreamSynchronize(tr->p->stream));
     return cf_now_s();
 }
 
-// Rollout + advantage pipeline (no param update).
+// Rollout + bootstrap value + GAE + advantage stats (no param update).
 static void cu_train_collect(CuTrain* tr) {
     CuVec* v = tr->v;
     CuPolicy* p = tr->p;
+    cudaStream_t st = p->stream;
     int n = tr->n;
+    size_t hn = (size_t)CF_NN_HIDDEN * n;
     double t0 = cu_prof_mark(tr);
     for (int t = 0; t < tr->T; t++) {
         size_t o = (size_t)t * n;
-        CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int)));
-        CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int)));
-        k_step_policy_train<<<(n + 63) / 64, 64>>>(
-            v->d_envs, p->w, p->h_state, n, v->d_resets,
-            tr->r_obs + o * CF_TRAIN_OBS,
-            tr->r_state + o * CF_NN_HIDDEN,
-            tr->r_act + o, tr->r_logprob + o, tr->r_value + o,
-            tr->r_reward + o, tr->r_done + o,
-            tr->seed, tr->step_count);
-        {
-            int tail_blocks = (n * 32 + 255) / 256;
-            if (tail_blocks > 512) tail_blocks = 512;
-            k_spawn_tail<<<tail_blocks, 256>>>();
-        }
-        if (v->lazy) {
-            k_reset_list_warp<<<n, 32>>>(v->d_envs, v->d_resets);
-        } else {
-            k_reset_list<<<(n + 63) / 64, 64>>>(v->d_envs, v->d_resets);
-        }
-        CU_CHECK(cudaGetLastError());
-        tr->step_count++;
+        cu_rollout_step(v, p, tr->seed,
+                        tr->r_obs + o * CF_TRAIN_OBS,
+                        tr->r_state + (size_t)t * CF_NN_LAYERS * hn,
+                        tr->r_act + o, tr->r_logprob + o, tr->r_value + o,
+                        tr->r_reward + o, tr->r_done + o);
     }
     double t1 = cu_prof_mark(tr);
-    k_nn_bootstrap<<<(n + 63) / 64, 64>>>(
-        v->d_envs, p->w, p->h_state, tr->v_boot, n);
-    k_gae<<<(n + 255) / 256, 256>>>(
+    // Bootstrap V(s_T) on a copy of the live state (post-rollout).
+    CU_CHECK(cudaMemcpyAsync(tr->boot_state, p->h_state,
+                             (size_t)CF_NN_LAYERS * hn * sizeof(float),
+                             cudaMemcpyDeviceToDevice, st));
+    k_encode_env_warp<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
+        p->w.W_enc, p->w.b_enc, p->h_enc, n);
+    const float* x = p->h_enc;
+    for (int l = 0; l < CF_NN_LAYERS; l++) {
+        cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
+                    p->w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                    x, p->pre, st);
+        float* xn = (l < CF_NN_LAYERS - 1) ? p->hout[l] : p->h3;
+        k_mingru_epi_fwd<<<(int)((hn + 255) / 256), 256, 0, st>>>(
+            p->pre, x, tr->boot_state + (size_t)l * hn, xn, NULL,
+            v->d_terminals, n);
+        x = xn;
+    }
+    int grid = (n + 255) / 256;
+    k_value_dot<<<grid, 256, 0, st>>>(p->h3, p->w.W_v, p->w.b_v,
+                                      tr->v_boot, n);
+    k_gae<<<grid, 256, 0, st>>>(
         tr->r_value, tr->r_reward, tr->r_done, tr->v_boot, tr->adv, tr->ret,
         n, tr->T, tr->cfg.gamma, tr->cfg.lam);
-    CU_CHECK(cudaMemsetAsync(tr->stats, 0, 2 * sizeof(double)));
-    k_adv_stats<<<256, 256>>>(tr->adv, (size_t)n * tr->T, tr->stats);
+    CU_CHECK(cudaMemsetAsync(tr->stats, 0, 2 * sizeof(double), st));
+    k_adv_stats<<<256, 256, 0, st>>>(tr->adv, (size_t)n * tr->T, tr->stats);
     CU_CHECK(cudaGetLastError());
     double t2 = cu_prof_mark(tr);
     tr->t_rollout += t1 - t0;
     tr->t_gae += t2 - t1;
 }
 
-// Backward over a contiguous env range [env_start, env_start+env_count).
+// Gradients over one contiguous env range, accumulated into the
+// (k_adam-zeroed) grads arena. Forward recompute at current theta:
+// live recurrence within BPTT segments (stored state reloaded at
+// segment starts), the same function the sweep's dcarry chain
+// differentiates.
 static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
-    // --ent-anneal: linear ent -> ent_final over the run (same schedule
-    // convention as --lr-anneal: fraction of completed adam updates).
-    float ent = tr->cfg.ent;
-    if (tr->cfg.ent_anneal && tr->total_updates > 0) {
-        float frac = (float)tr->adam_step / (float)tr->total_updates;
-        ent = tr->cfg.ent + (tr->cfg.ent_final - tr->cfg.ent) * frac;
+    CuPolicy* p = tr->p;
+    cudaStream_t st = p->stream;
+    const int T = tr->T, n = tr->n;
+    const int cols = T * env_count;
+    int bgrid = (cols + 255) / 256;
+    int hgrid = (int)(((size_t)CF_NN_HIDDEN * cols + 255) / 256);
+    int seg = cu_seg_len(tr);
+
+    k_encode_obs<<<hgrid, 256, 0, st>>>(
+        tr->r_obs, p->w.W_enc, p->w.b_enc, tr->x[0], 0, cols, env_count, n,
+        env_start);
+    int egrid = (int)(((size_t)CF_NN_HIDDEN * env_count + 255) / 256);
+    for (int t = 0; t < T; t++) {
+        size_t co = (size_t)t * env_count;
+        bool segstart = (t % seg) == 0;
+        const uint8_t* prev = segstart ? NULL
+            : tr->r_done + (size_t)(t - 1) * n + env_start;
+        for (int l = 0; l < CF_NN_LAYERS; l++) {
+            cu_gemm_fwd(CF_NN_GRU, env_count, CF_NN_HIDDEN,
+                        p->w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                        tr->x[l] + co * CF_NN_HIDDEN,
+                        tr->preb[l] + co * CF_NN_GRU, st);
+            k_mingru_epi_replay<<<egrid, 256, 0, st>>>(
+                tr->preb[l] + co * CF_NN_GRU, tr->x[l] + co * CF_NN_HIDDEN,
+                segstart ? tr->r_state
+                        + ((size_t)t * CF_NN_LAYERS + l)
+                            * (size_t)CF_NN_HIDDEN * n
+                        + (size_t)env_start * CF_NN_HIDDEN
+                    : NULL,
+                tr->live_st[l], prev, tr->stb[l] + co * CF_NN_HIDDEN,
+                tr->x[l + 1] + co * CF_NN_HIDDEN, env_count);
+        }
     }
-    size_t units = (size_t)env_count * tr->cfg.bptt_split;
-    if (tr->warp_bwd) {
-#if CF_BWDW_ENABLE
-        int grid = (int)((units + CF_BWDW_WARPS - 1) / CF_BWDW_WARPS);
-        k_ppo_backward_warp<<<grid, CF_BWDW_BD>>>(
-            tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
-            tr->r_state, tr->adv, tr->ret, tr->grads, tr->grad_copies,
-            tr->loss_acc, tr->stats, tr->n, tr->T, env_start, env_count,
-            tr->cfg.bptt_split, tr->cfg.clip, tr->cfg.vf, ent);
-#endif
-    } else {
-        int grid = (int)((units + CF_BWD_BLOCK - 1) / CF_BWD_BLOCK);
-        k_ppo_backward<<<grid, CF_BWD_BLOCK>>>(
-            tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
-            tr->r_state, tr->adv, tr->ret, tr->grads, tr->grad_copies,
-            tr->loss_acc, tr->stats, tr->n, tr->T, env_start, env_count,
-            tr->cfg.bptt_split, tr->cfg.clip, tr->cfg.vf, ent);
-    }
+    cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, cols, CF_NN_HIDDEN, p->w.W_a, tr->x[3],
+                tr->logitsb, st);
+
+    k_head_bwd<<<bgrid, 256, 0, st>>>(
+        tr->logitsb, tr->x[3], p->w.b_a, p->w.W_v, p->w.b_v,
+        tr->r_act + env_start, tr->r_logprob + env_start,
+        tr->adv + env_start, tr->ret + env_start,
+        tr->stats, tr->dlogits, tr->dvalue, tr->loss_acc, T, env_count, n,
+        tr->cfg.clip, tr->cfg.vf, tr->d_ent);
+
+    // dh chain: heads -> layer 2 -> 1 -> 0
+    const float* Wl2 = p->w.W_gru + 2 * (size_t)CF_NN_GRU * CF_NN_HIDDEN;
+    const float* Wl1 = p->w.W_gru + (size_t)CF_NN_GRU * CF_NN_HIDDEN;
+    const float* Wl0 = p->w.W_gru;
+    cu_gemm_dh(CRAFTAX_NUM_ACTIONS, cols, p->w.W_a, tr->dlogits, tr->dh3b,
+               st);
+    k_add_dv_wv<<<hgrid, 256, 0, st>>>(tr->dh3b, tr->dvalue, p->w.W_v, cols);
+    int sgrid = (int)(((size_t)CF_NN_HIDDEN * env_count + 255) / 256);
+    const uint8_t* rdone = tr->r_done + env_start;
+    k_mingru_sweep_bwd<<<sgrid, 256, 0, st>>>(
+        tr->preb[2], tr->x[2], tr->dh3b, NULL, tr->stb[2],
+        rdone, tr->preb[2], tr->dhX, T, env_count, n, seg);
+    cu_gemm_dh(CF_NN_GRU, cols, Wl2, tr->preb[2], tr->dhG, st);
+    k_mingru_sweep_bwd<<<sgrid, 256, 0, st>>>(
+        tr->preb[1], tr->x[1], tr->dhG, tr->dhX, tr->stb[1],
+        rdone, tr->preb[1], tr->dhX, T, env_count, n, seg);
+    cu_gemm_dh(CF_NN_GRU, cols, Wl1, tr->preb[1], tr->dhG, st);
+    k_mingru_sweep_bwd<<<sgrid, 256, 0, st>>>(
+        tr->preb[0], tr->x[0], tr->dhG, tr->dhX, tr->stb[0],
+        rdone, tr->preb[0], tr->dhX, T, env_count, n, seg);
+    cu_gemm_dh(CF_NN_GRU, cols, Wl0, tr->preb[0], tr->dhG, st);
+    k_enc_bwd<<<hgrid, 256, 0, st>>>(
+        tr->r_obs, tr->dhG, tr->dhX, tr->grads + CF_NN_W_ENC,
+        tr->grads + CF_NN_B_ENC, T, env_count, n, env_start);
+
+    // weight grads: flat GEMMs over samples (beta=1 accumulate)
+    for (int l = 0; l < CF_NN_LAYERS; l++)
+        cu_gemm_dw(CF_NN_GRU, cols, tr->x[l], tr->preb[l],
+                   tr->grads + CF_NN_W_GRU
+                       + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN, st);
+    cu_gemm_dw(CRAFTAX_NUM_ACTIONS, cols, tr->x[3], tr->dlogits,
+               tr->grads + CF_NN_W_A, st);
+    cu_gemv_dwv(tr->x[3], tr->dvalue, tr->grads + CF_NN_W_V, cols, st);
+    k_colsum<<<CRAFTAX_NUM_ACTIONS, 128, 0, st>>>(
+        tr->dlogits, tr->grads + CF_NN_B_A, CRAFTAX_NUM_ACTIONS, cols);
+    k_colsum<<<1, 128, 0, st>>>(tr->dvalue, tr->grads + CF_NN_B_V, 1, cols);
     CU_CHECK(cudaGetLastError());
 }
 
 static void cu_train_adam(CuTrain* tr) {
-    tr->adam_step++;
-    float lr = tr->cfg.lr;
-    if (tr->cfg.lr_anneal && tr->total_updates > 0)
-        lr *= 1.0f - (float)(tr->adam_step - 1) / (float)tr->total_updates;
-    k_adam<<<(CF_NN_PARAM_COUNT + 255) / 256, 256>>>(
-        tr->p->params, tr->grads, tr->grad_copies, tr->adam_m, tr->adam_v,
-        tr->adam_step, lr, 0.9f, 0.999f, 1e-8f);
+    cudaStream_t st = tr->p->stream;
+    k_adam<<<(CF_NN_PARAM_COUNT + 255) / 256, 256, 0, st>>>(
+        tr->p->params, tr->grads, tr->adam_m, tr->adam_v, tr->adam_ctr,
+        tr->d_lr, 0.9f, 0.999f, 1e-8f);
+    k_bump_ctr<<<1, 1, 0, st>>>(tr->adam_ctr);
     CU_CHECK(cudaGetLastError());
 }
 
-static void cu_train_update(CuTrain* tr) {
+static void cu_train_body(CuTrain* tr) {
     cu_train_collect(tr);
     for (int e = 0; e < tr->cfg.epochs; e++) {
         // loss_acc accumulates over the epoch's minibatches; the log
         // line after update reports the last epoch's full-batch sums.
-        CU_CHECK(cudaMemsetAsync(tr->loss_acc, 0, 3 * sizeof(float)));
+        CU_CHECK(cudaMemsetAsync(tr->loss_acc, 0, 3 * sizeof(double),
+                                 tr->p->stream));
         for (int m = 0; m < tr->cfg.minibatches; m++) {
             double t0 = cu_prof_mark(tr);
-            cu_train_backward(tr, m * tr->mb_envs, tr->mb_envs);
+            cu_train_backward(tr, m * tr->mb, tr->mb);
             double t1 = cu_prof_mark(tr);
             cu_train_adam(tr);
             double t2 = cu_prof_mark(tr);
@@ -12340,22 +11824,96 @@ static void cu_train_update(CuTrain* tr) {
     }
 }
 
-// Total PPO loss over the stored rollout at the current params
-// (recomputes the recurrent forward; used by gradcheck FD).
+// One PPO iteration. Graph mode warms up eagerly first (a collect
+// plus one bare backward, no adam -- params stay untouched; cuBLAS
+// workspace allocation is illegal inside capture), then captures the
+// whole body once and replays it. CRAFTAX_CU_TRAIN_PROF forces eager
+// (per-phase sync timing is meaningless inside a graph).
+static void cu_train_update(CuTrain* tr) {
+    cudaStream_t st = tr->p->stream;
+    if (tr->prof) {
+        cu_train_body(tr);
+        CU_CHECK(cudaStreamSynchronize(st));
+        return;
+    }
+    if (!tr->warmed) {
+        cu_train_collect(tr);
+        cu_train_backward(tr, 0, tr->mb);
+        CU_CHECK(cudaStreamSynchronize(st));
+        CU_CHECK(cudaMemset(tr->grads, 0,
+                            (size_t)CF_NN_PARAM_COUNT * sizeof(float)));
+        tr->warmed = 1;
+    }
+    if (!tr->texec) {
+        CU_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
+        cu_train_body(tr);
+        CU_CHECK(cudaStreamEndCapture(st, &tr->tgraph));
+        cudaError_t ierr =
+            cudaGraphInstantiate(&tr->texec, tr->tgraph, NULL, NULL, 0);
+        if (ierr != cudaSuccess) {
+            fprintf(stderr, "trainer graph instantiate failed: %s -- eager\n",
+                    cudaGetErrorString(ierr));
+            cudaGetLastError();
+            tr->texec = NULL;
+        }
+    }
+    if (tr->texec) {
+        CU_CHECK(cudaGraphLaunch(tr->texec, st));
+    } else {
+        cu_train_body(tr);
+    }
+    CU_CHECK(cudaStreamSynchronize(st));
+}
+
+// Total PPO loss over the stored rollout at the current params.
+// Uses the same live-recurrence-within-segments replay as the
+// backward's forward-recompute, so FD measures exactly the function
+// the backward differentiates -- stored r_state enters only as the
+// constant at BPTT segment starts. Envs are processed in mb-sized
+// chunks for buffer reuse.
 static double cu_train_loss(CuTrain* tr) {
-    double zero[3] = {0, 0, 0};
-    double* d_losses;
-    CU_CHECK(cudaMalloc(&d_losses, 3 * sizeof(double)));
-    CU_CHECK(cudaMemcpy(d_losses, zero, 24, cudaMemcpyHostToDevice));
-    k_ppo_loss<<<(tr->n + 255) / 256, 256>>>(
-        tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
-        tr->r_state, tr->adv, tr->ret, d_losses, tr->stats,
-        tr->n, tr->T, tr->cfg.clip);
-    CU_CHECK(cudaGetLastError());
+    CuPolicy* p = tr->p;
+    cudaStream_t st = p->stream;
+    const int T = tr->T, n = tr->n;
+    const int seg = cu_seg_len(tr);
+    CU_CHECK(cudaMemsetAsync(tr->loss_acc, 0, 3 * sizeof(double), st));
+    for (int e0 = 0; e0 < n; e0 += tr->mb) {
+        int cn = tr->mb < n - e0 ? tr->mb : n - e0;
+        int egrid = (int)(((size_t)CF_NN_HIDDEN * cn + 255) / 256);
+        for (int t = 0; t < T; t++) {
+            bool segstart = (t % seg) == 0;
+            const uint8_t* prev = segstart ? NULL
+                : tr->r_done + (size_t)(t - 1) * n + e0;
+            k_encode_obs<<<egrid, 256, 0, st>>>(
+                tr->r_obs, p->w.W_enc, p->w.b_enc, tr->x[0], t, cn, cn, n,
+                e0);
+            for (int l = 0; l < CF_NN_LAYERS; l++) {
+                cu_gemm_fwd(CF_NN_GRU, cn, CF_NN_HIDDEN,
+                            p->w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                            tr->x[l], tr->preb[l], st);
+                k_mingru_epi_replay<<<egrid, 256, 0, st>>>(
+                    tr->preb[l], tr->x[l],
+                    segstart ? tr->r_state
+                            + ((size_t)t * CF_NN_LAYERS + l)
+                                * (size_t)CF_NN_HIDDEN * n
+                            + (size_t)e0 * CF_NN_HIDDEN
+                        : NULL,
+                    tr->live_st[l], prev, NULL,
+                    tr->x[l + 1], cn);
+            }
+            cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, cn, CF_NN_HIDDEN, p->w.W_a,
+                        tr->x[3], tr->logitsb, st);
+            k_loss_accum<<<(cn + 255) / 256, 256, 0, st>>>(
+                tr->logitsb, tr->x[3], p->w.b_a, p->w.W_v, p->w.b_v,
+                tr->r_act + e0, tr->r_logprob + e0, tr->adv + e0,
+                tr->ret + e0, tr->stats, tr->loss_acc, t, cn, n, T,
+                tr->cfg.clip);
+        }
+    }
     double h[3];
-    CU_CHECK(cudaMemcpy(h, d_losses, 24, cudaMemcpyDeviceToHost));
-    cudaFree(d_losses);
-    double count = (double)tr->n * tr->T;
+    CU_CHECK(cudaStreamSynchronize(st));
+    CU_CHECK(cudaMemcpy(h, tr->loss_acc, 24, cudaMemcpyDeviceToHost));
+    double count = (double)n * T;
     return (h[0] + tr->cfg.vf * h[1] - tr->cfg.ent * h[2]) / count;
 }
 
@@ -12404,6 +11962,14 @@ static void cu_sum_logs(
 static int cu_run_train(
     int num_envs, int T, int iters, uint64_t seed, CuPPOConfig cfg
 ) {
+    // If the user did not size minibatches, pick the smallest power of
+    // two that keeps the ~20 KB/sample backward buffers under ~8 GB.
+    {
+        size_t max_cols = ((size_t)8 << 30) / CF_MB_BYTES_PER_COL;
+        while (cfg.minibatches < num_envs / 32 &&
+               (size_t)(num_envs / cfg.minibatches) * T > max_cols)
+            cfg.minibatches *= 2;
+    }
     CuVec v;
     cu_vec_init(&v, num_envs, seed);
     CuPolicy p;
@@ -12414,11 +11980,10 @@ static int cu_run_train(
 
     printf("train: envs=%d horizon=%d iters=%d seed=%llu lr=%g gamma=%g "
            "lam=%g clip=%g ent=%g vf=%g epochs=%d minibatches=%d "
-           "lr_anneal=%d bptt_split=%d hidden=%d",
+           "lr_anneal=%d bptt_split=%d hidden=%dx%d",
            num_envs, T, iters, (unsigned long long)seed, cfg.lr, cfg.gamma,
            cfg.lam, cfg.clip, cfg.ent, cfg.vf, cfg.epochs, cfg.minibatches,
-           cfg.lr_anneal, cfg.bptt_split, CF_NN_HIDDEN);
-    printf(" bwd=%s", tr.warp_bwd ? "warp" : "thread");
+           cfg.lr_anneal, cfg.bptt_split, CF_NN_HIDDEN, CF_NN_LAYERS);
     if (cfg.ent_anneal) printf(" ent_anneal->%g", cfg.ent_final);
     printf("\n");
 
@@ -12442,7 +12007,19 @@ static int cu_run_train(
     double t0 = cf_now_s();
     size_t steps_done = 0;
     for (int it = 1; it <= iters; it++) {
+        if (cfg.lr_anneal && tr.total_updates > 0) {
+            float lr_it = cfg.lr
+                * (1.0f - (float)tr.updates_done / (float)tr.total_updates);
+            CU_CHECK(cudaMemcpy(tr.d_lr, &lr_it, 4, cudaMemcpyHostToDevice));
+        }
+        if (cfg.ent_anneal && tr.total_updates > 0) {
+            float frac = (float)tr.updates_done / (float)tr.total_updates;
+            float ent_it = cfg.ent + (cfg.ent_final - cfg.ent) * frac;
+            CU_CHECK(cudaMemcpy(tr.d_ent, &ent_it, 4,
+                                cudaMemcpyHostToDevice));
+        }
         cu_train_update(&tr);
+        tr.updates_done += (long)cfg.epochs * cfg.minibatches;
         steps_done += (size_t)num_envs * T;
         if (!fw_taken && it >= fw_start) {
             cu_sum_logs(&v, h_envs, &fw_ep0, &fw_len0, &fw_ret0, fw_ach0);
@@ -12452,10 +12029,12 @@ static int cu_run_train(
             CU_CHECK(cudaMemsetAsync(rew_stats, 0, 16));
             k_adv_stats<<<256, 256>>>(tr.r_reward, (size_t)num_envs * T,
                                       rew_stats);
-            float h_loss[3];
+            double h_loss[3];
             double h_rew[2];
-            CU_CHECK(cudaMemcpy(h_loss, tr.loss_acc, 12, cudaMemcpyDeviceToHost));
-            CU_CHECK(cudaMemcpy(h_rew, rew_stats, 16, cudaMemcpyDeviceToHost));
+            CU_CHECK(cudaMemcpy(h_loss, tr.loss_acc, 24,
+                                cudaMemcpyDeviceToHost));
+            CU_CHECK(cudaMemcpy(h_rew, rew_stats, 16,
+                                cudaMemcpyDeviceToHost));
             cu_sum_logs(&v, h_envs, &ep1, &len1, &ret1, ach1);
             double eps_w = ep1 - ep0;
             double count = (double)num_envs * T;
@@ -12517,53 +12096,90 @@ static int cu_run_train(
 // Analytic gradients vs central finite differences of the PPO loss on
 // a small fixed rollout. The loss treats actions, old logprobs, and
 // advantages as constants, so it is a pure function of the parameters
-// and FD is exact up to fp32 forward noise.
+// and FD is exact up to fp32 forward noise. cuBLAS runs in strict
+// FP32 here (no TF32) so loss() and backward() agree op-for-op.
+// Before FD, a replay-fidelity gate: the recomputed forward (record
+// encoder + live-recurrence replay, per-step GEMM shapes matching the
+// rollout's) must reproduce the stored logprob/value BITWISE at every
+// (env, t).
 static int cu_run_gradcheck(uint64_t seed) {
+    cu_ensure_blas();
+    CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_DEFAULT_MATH));
     const int n = 64, T = 8;
     CuVec v;
     cu_vec_init(&v, n, seed);
     CuPolicy p;
     cu_policy_init(&p, n);
     CuPPOConfig cfg = cu_ppo_defaults();
+    if (const char* s = getenv("CRAFTAX_GC_SPLIT")) cfg.bptt_split = atoi(s);
     CuTrain tr;
     cu_train_init(&tr, &v, &p, T, seed, cfg);
     cu_train_collect(&tr);
+    CU_CHECK(cudaStreamSynchronize(p.stream));
 
-    // Replay fidelity: recomputed forward from the stored records must
-    // be bitwise identical to what the rollout stored.
+    // Replay fidelity: per-step recompute (loss()-shaped launches so
+    // every GEMM shape matches the rollout's) vs stored records.
     {
         int* d_mis;
         CU_CHECK(cudaMalloc(&d_mis, sizeof(int)));
         CU_CHECK(cudaMemset(d_mis, 0, sizeof(int)));
-        k_train_replay_check<<<(n + 63) / 64, 64>>>(
-            p.w, tr.r_obs, tr.r_act, tr.r_logprob, tr.r_value, tr.r_state,
-            n, T, d_mis);
+        int seg = cu_seg_len(&tr);
+        int egrid = (int)(((size_t)CF_NN_HIDDEN * n + 255) / 256);
+        for (int t = 0; t < T; t++) {
+            bool segstart = (t % seg) == 0;
+            const uint8_t* prev = segstart ? NULL
+                : tr.r_done + (size_t)(t - 1) * n;
+            k_encode_obs<<<egrid, 256, 0, p.stream>>>(
+                tr.r_obs, p.w.W_enc, p.w.b_enc, tr.x[0], t, n, n, n, 0);
+            for (int l = 0; l < CF_NN_LAYERS; l++) {
+                cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
+                            p.w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                            tr.x[l], tr.preb[l], p.stream);
+                k_mingru_epi_replay<<<egrid, 256, 0, p.stream>>>(
+                    tr.preb[l], tr.x[l],
+                    segstart ? tr.r_state
+                            + ((size_t)t * CF_NN_LAYERS + l)
+                                * (size_t)CF_NN_HIDDEN * n
+                        : NULL,
+                    tr.live_st[l], prev, NULL, tr.x[l + 1], n);
+            }
+            cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p.w.W_a,
+                        tr.x[3], tr.logitsb, p.stream);
+            k_replay_cmp<<<(n + 255) / 256, 256, 0, p.stream>>>(
+                tr.logitsb, tr.x[3], p.w.b_a, p.w.W_v, p.w.b_v,
+                tr.r_act + (size_t)t * n, tr.r_logprob + (size_t)t * n,
+                tr.r_value + (size_t)t * n, n, d_mis);
+        }
+        CU_CHECK(cudaStreamSynchronize(p.stream));
         CU_CHECK(cudaGetLastError());
         int mis = 0;
-        CU_CHECK(cudaMemcpy(&mis, d_mis, sizeof(int), cudaMemcpyDeviceToHost));
+        CU_CHECK(cudaMemcpy(&mis, d_mis, sizeof(int),
+                            cudaMemcpyDeviceToHost));
         cudaFree(d_mis);
         printf("record replay: %s (%d/%d env-steps mismatching)\n",
                mis == 0 ? "EXACT" : "MISMATCH", mis, n * T);
-        if (mis != 0) { printf("gradcheck: FAIL (replay)\n"); return 1; }
+        if (mis != 0) {
+            printf("gradcheck: FAIL (replay)\n");
+            return 1;
+        }
     }
 
-    CU_CHECK(cudaMemsetAsync(tr.loss_acc, 0, 3 * sizeof(float)));
+    CU_CHECK(cudaMemsetAsync(tr.loss_acc, 0, 3 * sizeof(double), p.stream));
     cu_train_backward(&tr, 0, n);
-    CU_CHECK(cudaDeviceSynchronize());
+    CU_CHECK(cudaStreamSynchronize(p.stream));
 
-    size_t gc = (size_t)tr.grad_copies * CF_NN_PARAM_COUNT;
-    float* g_all = (float*)malloc(gc * sizeof(float));
-    CU_CHECK(cudaMemcpy(g_all, tr.grads, gc * 4, cudaMemcpyDeviceToHost));
+    float* g_all = (float*)malloc((size_t)CF_NN_PARAM_COUNT * sizeof(float));
+    CU_CHECK(cudaMemcpy(g_all, tr.grads,
+                        (size_t)CF_NN_PARAM_COUNT * 4,
+                        cudaMemcpyDeviceToHost));
     double* g = (double*)calloc(CF_NN_PARAM_COUNT, sizeof(double));
-    for (int c = 0; c < tr.grad_copies; c++)
-        for (int i = 0; i < CF_NN_PARAM_COUNT; i++)
-            g[i] += g_all[(size_t)c * CF_NN_PARAM_COUNT + i];
+    for (int i = 0; i < CF_NN_PARAM_COUNT; i++) g[i] = g_all[i];
 
     struct Seg { const char* name; int off, count; };
     struct Seg segs[7] = {
         {"W_enc", CF_NN_W_ENC, CF_NN_OBS * CF_NN_HIDDEN},
         {"b_enc", CF_NN_B_ENC, CF_NN_HIDDEN},
-        {"W_gru", CF_NN_W_GRU, CF_NN_GRU * CF_NN_HIDDEN},
+        {"W_gru", CF_NN_W_GRU, CF_NN_W_GRU_ELEMS},
         {"W_a",   CF_NN_W_A,   CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN},
         {"b_a",   CF_NN_B_A,   CRAFTAX_NUM_ACTIONS},
         {"W_v",   CF_NN_W_V,   CF_NN_HIDDEN},
@@ -12571,6 +12187,8 @@ static int cu_run_gradcheck(uint64_t seed) {
     };
     uint64_t rng = 0x12345678ULL;
     int fail = 0;
+    float fh = 1e-3f;
+    if (getenv("CRAFTAX_FDH")) fh *= (float)atof(getenv("CRAFTAX_FDH"));
     for (int si = 0; si < 7; si++) {
         const struct Seg* s = &segs[si];
         double gnorm = 0.0;
@@ -12596,14 +12214,18 @@ static int cu_run_gradcheck(uint64_t seed) {
                 i = s->off + (int)((rng >> 33) % s->count);
             }
             float theta;
-            CU_CHECK(cudaMemcpy(&theta, p.params + i, 4, cudaMemcpyDeviceToHost));
-            float h = 1e-3f * fmaxf(fabsf(theta), 0.1f);
+            CU_CHECK(cudaMemcpy(&theta, p.params + i, 4,
+                                cudaMemcpyDeviceToHost));
+            float h = fh * fmaxf(fabsf(theta), 0.1f);
             float tp = theta + h, tm = theta - h;
-            CU_CHECK(cudaMemcpy(p.params + i, &tp, 4, cudaMemcpyHostToDevice));
+            CU_CHECK(cudaMemcpy(p.params + i, &tp, 4,
+                                cudaMemcpyHostToDevice));
             double lp = cu_train_loss(&tr);
-            CU_CHECK(cudaMemcpy(p.params + i, &tm, 4, cudaMemcpyHostToDevice));
+            CU_CHECK(cudaMemcpy(p.params + i, &tm, 4,
+                                cudaMemcpyHostToDevice));
             double lm = cu_train_loss(&tr);
-            CU_CHECK(cudaMemcpy(p.params + i, &theta, 4, cudaMemcpyHostToDevice));
+            CU_CHECK(cudaMemcpy(p.params + i, &theta, 4,
+                                cudaMemcpyHostToDevice));
             double fd = (lp - lm) / (2.0 * (double)(tp - tm) * 0.5);
             double diff = fabs(fd - g[i]);
             double scale = fabs(fd) > fabs(g[i]) ? fabs(fd) : fabs(g[i]);
@@ -12621,7 +12243,8 @@ static int cu_run_gradcheck(uint64_t seed) {
         if (gnorm == 0.0) { printf("  FAIL: all-zero gradient segment\n"); fail = 1; }
         free(idx);
     }
-    printf("gradcheck: envs=%d steps=%d  =>  %s\n", n, T, fail ? "FAIL" : "PASS");
+    printf("gradcheck: envs=%d steps=%d bptt_split=%d  =>  %s\n",
+           n, T, cfg.bptt_split, fail ? "FAIL" : "PASS");
     free(g_all); free(g);
     cu_train_free(&tr);
     cu_policy_free(&p);
@@ -12635,8 +12258,8 @@ static void cu_usage(const char* prog) {
             "       %s cmp   --dump FILE [--seed S] [--max-report K]\n"
             "       %s stats [--envs N] [--steps M] [--seed S]\n"
             "       %s bench [--envs N] [--iters M] [--seed S]\n"
-            "       %s run       [--envs N] [--iters M] [--seed S] [--fused 0|1]\n"
-            "       %s runhash   [--envs N] [--steps M] [--seed S] [--fused 0|1]\n"
+            "       %s run       [--envs N] [--iters M] [--seed S] [--graph 0|1]\n"
+            "       %s runhash   [--envs N] [--steps M] [--seed S] [--graph 0|1]\n"
             "       %s runverify [--envs N] [--steps M] [--seed S]\n"
             "       %s train     [--envs N] [--horizon T] [--iters M] [--seed S]\n"
             "                    [--lr F] [--gamma F] [--gae-lambda F] [--clip F]\n"
@@ -12663,7 +12286,8 @@ int main(int argc, char** argv) {
 
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--envs") && i + 1 < argc) envs = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--fused") && i + 1 < argc) fused = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "--graph") || !strcmp(argv[i], "--fused"))
+                 && i + 1 < argc) fused = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--horizon") && i + 1 < argc) horizon = atoi(argv[++i]);

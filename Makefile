@@ -27,21 +27,14 @@ craftax_classic_cpu.o: craftax_classic.c
 NVCCFLAGS_FULL ?= -O3 -arch=native --expt-relaxed-constexpr -fmad=false
 full: craftax_full_cuda
 craftax_full_cuda: craftax_full.cu
-	$(NVCC) $(NVCCFLAGS_FULL) craftax_full.cu -o $@
+	$(NVCC) $(NVCCFLAGS_FULL) craftax_full.cu -o $@ -lcublas
 
 # Compact byte observations (996B vs 3372B per env): same trajectories, its
 # own hash universe -- matches the C -DCRAFTAX_COMPACT_OBS build bit-exactly
 # (64x2000 seed 42 => 0x4fb32c98731b75e8, 4x20000 => 0x7d6c02f20a72e8f9).
 full-compact: craftax_full_cuda_compact
 craftax_full_cuda_compact: craftax_full.cu
-	$(NVCC) $(NVCCFLAGS_FULL) -DCRAFTAX_COMPACT_OBS craftax_full.cu -o $@
-
-# Hidden-128 policy build (default hidden size is 32). Env trajectories
-# (hash/statehash anchors) are hidden-independent; runhash/runverify/train
-# numbers live in their own universe (see README).
-full-h128: craftax_full_cuda_h128
-craftax_full_cuda_h128: craftax_full.cu
-	$(NVCC) $(NVCCFLAGS_FULL) -DCRAFTAX_HIDDEN=128 craftax_full.cu -o $@
+	$(NVCC) $(NVCCFLAGS_FULL) -DCRAFTAX_COMPACT_OBS craftax_full.cu -o $@ -lcublas
 else
 craftax_classic: craftax_classic.c
 	$(CC) $(CPUFLAGS) -DCRAFTAX_STANDALONE craftax_classic.c -o $@ -lpthread -lm
@@ -52,6 +45,6 @@ craftax_full: craftax_full.c
 
 clean:
 	rm -f craftax_classic craftax_full craftax_full_cuda craftax_classic_cpu.o \
-	      craftax_full_cuda_compact craftax_full_cuda_h128
+	      craftax_full_cuda_compact
 
-.PHONY: all classic full full-compact full-h128 clean
+.PHONY: all classic full full-compact clean
