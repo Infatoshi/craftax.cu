@@ -5,3 +5,7 @@ craftax_full_cuda_compact
 *.o
 craftax_classic_h128*
 craftax_full_cuda_h128
+craftax_classic_h256_l3
+craftax_tc_arch
+craftax_tc_arch_h*
+bench_h256_l3_env.inc.cu

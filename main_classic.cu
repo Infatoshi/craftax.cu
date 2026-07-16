@@ -1,26 +1,26 @@
-// main_classic.cu -- single launcher for craftax_classic.cu: benchmarks, validation,
-// and NN-fused rollouts. Pure C/CUDA, no Python.
+// main_classic.cu -- launcher for craftax_classic.cu: env benchmarks,
+// validation, and the fixed batched policy (Linear encoder -> MinGRU x3,
+// hidden 256 -> actor/value heads) via per-step kernels + cuBLAS TF32
+// GEMMs, optionally replayed as a CUDA graph.
 //
-// Build:  nvcc -O3 -arch=native --expt-relaxed-constexpr --use_fast_math \
-//              main.cu -o craftax
+// Build (Makefile does this):  nvcc -O3 -arch=native \
+//     --expt-relaxed-constexpr --use_fast_math main_classic.cu \
+//     craftax_classic_cpu.o -o craftax_classic -Xcompiler -fopenmp -lpthread -lcublas
 //
-// Hidden-128 policy build (default is hidden 32; h32 hashes unaffected):
-//   nvcc -O3 -arch=native --expt-relaxed-constexpr --use_fast_math \
-//        -DCRAFTAX_HIDDEN=128 main_classic.cu craftax_classic_cpu.o \
-//        -o craftax_classic_h128 -Xcompiler -fopenmp -lpthread
 // Usage:
-//   ./craftax bench  [envs] [iters] [obs_mode] [reset_mode]   env-only SPS
-//   ./craftax sweep                          env-only sweep (obs x reset modes)
-//   ./craftax hash   [envs] [steps]          env validation: worldgen exactness,
-//                                            trajectory hash, obs expansion,
-//                                            map diversity, block histogram
-//   ./craftax run    [envs] [T] [iters]      fused env+policy rollout SPS
-//   ./craftax split  [envs] [T] [iters]      same rollout via per-step kernels
-//   ./craftax runsweep [T]                   rollout sweep, fused vs per-step
-//   ./craftax verify [envs] [steps]          bitwise NN fusion + rollout checks
-//   ./craftax train  [envs] [T] [iters]      on-device PPO training (rollout +
-//                                            GAE + backward + Adam, no host sync)
-//   ./craftax gradcheck                      analytic grads vs finite differences
+//   ./craftax_classic bench  [envs] [iters] [obs_mode] [reset_mode]  env-only SPS
+//   ./craftax_classic sweep                          env-only sweep
+//   ./craftax_classic hash   [envs] [steps]          env validation: worldgen
+//                                                    exactness, trajectory hash,
+//                                                    obs expansion, map diversity
+//   ./craftax_classic run    [envs] [T] [iters]      env+policy rollout SPS (graph)
+//   ./craftax_classic split                          same rollout, eager launches
+//   ./craftax_classic runsweep [T]                   rollout sweep, graph vs eager
+//   ./craftax_classic verify [envs] [steps]          batched vs scalar reference,
+//                                                    eager vs graph hash equality
+//   ./craftax_classic train  [envs] [T] [iters]      on-device PPO (rollout +
+//                                                    GAE + GEMM backward + Adam)
+//   ./craftax_classic gradcheck                      analytic vs FD gradients
 //
 // obs_mode: 0 = float one-hot obs (1345), 1 = compact uint8 obs (148)
 // reset_mode: 0 = fused serial autoreset, 1 = split warp-cooperative reset
@@ -32,6 +32,7 @@
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <cublas_v2.h>
 
 #include "craftax_classic.cu"
 
@@ -39,11 +40,14 @@
     fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
     exit(1); } } while (0)
 
+#define CUBLAS_CHECK(x) do { cublasStatus_t st_ = (x); if (st_ != CUBLAS_STATUS_SUCCESS) { \
+    fprintf(stderr, "cuBLAS error %d at %s:%d\n", (int)st_, __FILE__, __LINE__); \
+    exit(1); } } while (0)
+
 static double now_s() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
-
 static uint64_t fnv1a(uint64_t h, const void* data, size_t len) {
     const uint8_t* p = (const uint8_t*)data;
     for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 0x100000001B3ULL; }
@@ -264,44 +268,106 @@ static void init_weight_seg(float* p, int count, float bound, uint64_t seed, int
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ============================================================
+// cuBLAS conveniences. All buffers are col-major. A row-major
+// weight W [m][k] is consumed as col-major W^T [k][m], so the
+// forward is OP_T and dh/dW use OP_N/OP_T on the SAME memory --
+// no transposed weight copies anywhere.
+// ============================================================
+static cublasHandle_t g_blas = nullptr;
+static float g_one = 1.0f, g_zero = 0.0f;
+
+static void ensure_blas() {
+    if (!g_blas) {
+        CUBLAS_CHECK(cublasCreate(&g_blas));
+        CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_TF32_TENSOR_OP_MATH));
+    }
+}
+
+// y[m][cols] = W[m][k] @ x[k][cols]   (forward, W row-major raw)
+static void gemm_fwd(int m, int cols, int k, const float* W, const float* x,
+                     float* y, cudaStream_t s) {
+    CUBLAS_CHECK(cublasSetStream(g_blas, s));
+    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, m, cols, k,
+                             &g_one, W, k, x, k, &g_zero, y, m));
+}
+
+// dh[HIDDEN][cols] = W^T @ dpre[m3][cols]  (same raw W memory, OP_N)
+static void gemm_dh(int m3, int cols, const float* W, const float* dpre,
+                    float* dh, cudaStream_t s) {
+    CUBLAS_CHECK(cublasSetStream(g_blas, s));
+    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, HIDDEN, cols, m3,
+                             &g_one, W, HIDDEN, dpre, m3, &g_zero, dh, HIDDEN));
+}
+
+// dW[j-major][+] += x[HIDDEN][cols] @ dpre[rows][cols]^T, beta=1.
+// C(j,i) lands at j + i*HIDDEN, i.e. raw [rows][HIDDEN] row-major,
+// matching the forward weight layout exactly.
+static void gemm_dw(int rows, int cols, const float* x, const float* dpre,
+                    float* dW, cudaStream_t s) {
+    CUBLAS_CHECK(cublasSetStream(g_blas, s));
+    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_T, HIDDEN, rows, cols,
+                             &g_one, x, HIDDEN, dpre, rows, &g_one, dW, HIDDEN));
+}
+
+// dWv[j] += sum_s x[HIDDEN][cols](j,s) * dv[s]     (gemv, beta=1)
+static void gemv_dwv(const float* x, const float* dv, float* dWv, int cols,
+                     cudaStream_t s) {
+    CUBLAS_CHECK(cublasSetStream(g_blas, s));
+    CUBLAS_CHECK(cublasSgemv(g_blas, CUBLAS_OP_N, HIDDEN, cols,
+                             &g_one, x, HIDDEN, dv, 1, &g_one, dWv, 1));
+}
+
+// ============================================================
+// Rollout: env + fixed 3x256 policy driven per step. Each step is
+// ~13 launches; `run` captures all T steps into one CUDA graph and
+// replays it. Slabs r_obs/r_state/... hold T steps of data.
+// ============================================================
 struct Rollout {
     EnvSoA g;
     uint8_t* arena;
     Weights w;
-    float* params;   // flat [PARAM_COUNT] arena the Weights pointers carve
-    float* h_state;
-    uint8_t* r_obs;
-    int32_t* r_act;
-    float* r_logprob;
-    float* r_value;
-    float* r_reward;
-    int8_t* r_done;
-    float* r_state = nullptr;  // optional [T][HIDDEN][n] for training
-    unsigned long long* ep_stats = nullptr;  // optional [1+22] episode stats
+    float* params;
+    float* h_state;      // [GRU_LAYERS][HIDDEN][n] live recurrent state
+    float* h_enc;        // [HIDDEN][n] col-major forward chain
+    float* hout[2];      // [HIDDEN][n]
+    float* h3;           // [HIDDEN][n]
+    float* pre;          // [GRU_OUT][n]
+    float* logits;       // [NUM_ACTIONS][n]
+    uint8_t* r_obs;      // [T][n][OBS_DIM_COMPACT]
+    int32_t* r_act;      // [T][n]
+    float* r_logprob;    // [T][n]
+    float* r_value;      // [T][n]
+    float* r_reward;     // [T][n]
+    int8_t* r_done;      // [T][n]
+    float* r_state = nullptr;  // [T][GRU_LAYERS*HIDDEN][n] post-zero state inputs
+    unsigned long long* ep_stats = nullptr;  // [1+22]
     int32_t* reset_list;
     int32_t* reset_ctrl;
+    uint64_t* step_ctr;  // device counter: sampler offset + reset seed schedule
+    cudaStream_t stream;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t gexec = nullptr;
+    bool warmed = false;
     int n, T;
     uint64_t seed;
-    uint64_t step_count = 0;
 
     Rollout(int num_envs, int horizon, uint64_t seed_) : n(num_envs), T(horizon), seed(seed_) {
         if (n % 32 != 0) {
             fprintf(stderr, "num_envs must be a multiple of 32 (warp collectives)\n");
             exit(1);
         }
+        ensure_blas();
         CUDA_CHECK(cudaMalloc(&arena, soa_bytes(n)));
         CUDA_CHECK(cudaMemset(arena, 0, soa_bytes(n)));
         g = carve_soa(arena, n);
 
-        // One flat parameter arena (training indexes it by PARAM_*
-        // offsets); per-segment init matches the old separate
-        // allocations bit-for-bit (same seed/subsequence/bounds).
-        CUDA_CHECK(cudaMalloc(&params, PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&params, (size_t)PARAM_COUNT * sizeof(float)));
         float be = 1.0f / sqrtf((float)OBS_DIM);
         float bh = 1.0f / sqrtf((float)HIDDEN);
         init_weight_seg(params + PARAM_W_ENC, OBS_DIM * HIDDEN, be, 1234, 0);
         init_weight_seg(params + PARAM_B_ENC, HIDDEN, be, 1234, 1);
-        init_weight_seg(params + PARAM_W_GRU, GRU_OUT * HIDDEN, bh, 1234, 2);
+        init_weight_seg(params + PARAM_W_GRU, W_GRU_ELEMS, bh, 1234, 2);
         init_weight_seg(params + PARAM_W_A, NUM_ACTIONS * HIDDEN, bh, 1234, 3);
         init_weight_seg(params + PARAM_B_A, NUM_ACTIONS, bh, 1234, 4);
         init_weight_seg(params + PARAM_W_V, HIDDEN, bh, 1234, 5);
@@ -314,8 +380,15 @@ struct Rollout {
         w.W_v   = params + PARAM_W_V;
         w.b_v   = params + PARAM_B_V;
 
-        CUDA_CHECK(cudaMalloc(&h_state, (size_t)HIDDEN * n * sizeof(float)));
-        CUDA_CHECK(cudaMemset(h_state, 0, (size_t)HIDDEN * n * sizeof(float)));
+        size_t hn = (size_t)HIDDEN * n;
+        CUDA_CHECK(cudaMalloc(&h_state, (size_t)GRU_LAYERS * hn * sizeof(float)));
+        CUDA_CHECK(cudaMemset(h_state, 0, (size_t)GRU_LAYERS * hn * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&h_enc, hn * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&hout[0], hn * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&hout[1], hn * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&h3, hn * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&pre, (size_t)GRU_OUT * n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&logits, (size_t)NUM_ACTIONS * n * sizeof(float)));
 
         size_t nt = (size_t)n * T;
         CUDA_CHECK(cudaMalloc(&r_obs, nt * OBS_DIM_COMPACT));
@@ -327,75 +400,115 @@ struct Rollout {
         CUDA_CHECK(cudaMemset(r_done, 0, nt));
         CUDA_CHECK(cudaMalloc(&reset_list, n * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&reset_ctrl, 2 * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&step_ctr, sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(step_ctr, 0, sizeof(uint64_t)));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     }
     ~Rollout() {
+        if (gexec) cudaGraphExecDestroy(gexec);
+        if (graph) cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
         cudaFree(arena); cudaFree(h_state); cudaFree(params);
+        cudaFree(h_enc); cudaFree(hout[0]); cudaFree(hout[1]); cudaFree(h3);
+        cudaFree(pre); cudaFree(logits);
         cudaFree(r_obs); cudaFree(r_act); cudaFree(r_logprob); cudaFree(r_value);
         cudaFree(r_reward); cudaFree(r_done);
         if (r_state) cudaFree(r_state);
-        cudaFree(reset_list); cudaFree(reset_ctrl);
+        cudaFree(reset_list); cudaFree(reset_ctrl); cudaFree(step_ctr);
+        if (ep_stats) { cudaFree(ep_stats); ep_stats = nullptr; }
     }
 
     void alloc_states() {
-        CUDA_CHECK(cudaMalloc(&r_state, (size_t)T * HIDDEN * n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&r_state,
+            (size_t)T * GRU_LAYERS * HIDDEN * n * sizeof(float)));
     }
 
     void reset() {
         int wgrid = ((size_t)n * 32 + RESET_WARP_BLOCK - 1) / RESET_WARP_BLOCK;
-        reset_all_warp_kernel<<<wgrid, RESET_WARP_BLOCK>>>(g, n, seed);
+        reset_all_warp_kernel<<<wgrid, RESET_WARP_BLOCK, 0, stream>>>(g, n, seed);
+        CUDA_CHECK(cudaMemsetAsync(h_state, 0,
+            (size_t)GRU_LAYERS * HIDDEN * n * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(step_ctr, 0, sizeof(uint64_t), stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemset(h_state, 0, (size_t)HIDDEN * n * sizeof(float)));
-        step_count = 0;
     }
 
-    void run_mega() {
-        int grid = (n + MEGA_BLOCK - 1) / MEGA_BLOCK;
-        rollout_kernel<<<grid, MEGA_BLOCK>>>(
-            g, w, h_state, r_obs, r_act, r_logprob, r_value, r_reward, r_done,
-            r_state, ep_stats, n, T, seed, step_count);
-        CUDA_CHECK(cudaGetLastError());
-        step_count += T;
-    }
-
-    void run_rollout(int kind) {  // 0 split, 1 mega
-        if (kind == 1) run_mega();
-        else run_split();
-    }
-
-    // Same rollout via per-step kernels (forward, step+mark, warp reset).
-    void run_split() {
+    // One env+policy step writing slab row t. t==0 never sees prev
+    // dones (old mega/split semantic: state zeroing restarts each
+    // rollout).
+    void step(int t, bool record) {
+        size_t o = (size_t)t * n;
         int block = 256, grid = (n + block - 1) / block;
-        int warps_per_block = RESET_WARP_BLOCK / 32;
-        int wgrid = (n + warps_per_block - 1) / warps_per_block;
-        if (wgrid > 512) wgrid = 512;
-        for (int t = 0; t < T; t++) {
-            size_t o = (size_t)t * n;
-            // r_done[t-1] row feeds recurrent-state zeroing; step 0 within
-            // this rollout uses the last row of the previous rollout, which
-            // we do not keep -- so split mode is only bitwise-comparable to
-            // mega when starting from reset (prev_dones all zero), which is
-            // how verify uses it.
-            const int8_t* prev = (t == 0) ? nullptr : r_done + (size_t)(t-1) * n;
-            fused_forward_kernel<<<grid, block>>>(
-                g, w, h_state, prev, r_obs + o * OBS_DIM_COMPACT,
-                r_act + o, r_logprob + o, r_value + o, n, seed, step_count);
-            CUDA_CHECK(cudaMemsetAsync(reset_ctrl, 0, 2 * sizeof(int32_t)));
-            step_mark_kernel<<<grid, block>>>(
-                g, r_act + o, r_reward + o, r_done + o, reset_list, reset_ctrl, n);
-            uint64_t reset_seed = seed + (step_count + 1) * 1000000ULL;
-            reset_warp_kernel<<<wgrid, RESET_WARP_BLOCK>>>(g, reset_list, reset_ctrl, n, reset_seed);
-            CUDA_CHECK(cudaGetLastError());
-            step_count++;
+        int wgrid = (int)(((size_t)n * 32 + block - 1) / block);
+        const int8_t* prev = (t == 0) ? nullptr : r_done + (size_t)(t - 1) * n;
+        CUDA_CHECK(cudaMemsetAsync(reset_ctrl, 0, 8, stream));
+        encode_env_warp_kernel<<<wgrid, block, 0, stream>>>(g, w.W_enc, w.b_enc, h_enc, n);
+        if (record)
+            record_obs_kernel<<<grid, block, 0, stream>>>(g, r_obs + o * OBS_DIM_COMPACT, n);
+        const float* x = h_enc;
+        for (int l = 0; l < GRU_LAYERS; l++) {
+            gemm_fwd(GRU_OUT, n, HIDDEN, w.W_gru + (size_t)l * (size_t)GRU_OUT * HIDDEN,
+                     x, pre, stream);
+            float* xn = (l < GRU_LAYERS - 1) ? hout[l] : h3;
+            float* store = r_state
+                ? r_state + ((size_t)t * GRU_LAYERS + l) * ((size_t)HIDDEN * n)
+                : nullptr;
+            mingru_epi_fwd_kernel<<<(int)(((size_t)HIDDEN * n + block - 1) / block), block, 0, stream>>>(
+                pre, x, h_state + (size_t)l * HIDDEN * n, xn, store, prev, n);
+            x = xn;
         }
+        gemm_fwd(NUM_ACTIONS, n, HIDDEN, w.W_a, h3, logits, stream);
+        value_sample_kernel<<<grid, block, 0, stream>>>(
+            h3, logits, w.b_a, w.W_v, w.b_v, r_act + o, r_logprob + o, r_value + o,
+            n, seed, step_ctr);
+        step_mark_kernel<<<grid, block, 0, stream>>>(
+            g, r_act + o, r_reward + o, r_done + o, reset_list, reset_ctrl, n);
+        if (ep_stats) ep_stats_kernel<<<grid, block, 0, stream>>>(g, r_done + o, ep_stats, n);
+        int warps_per_block = RESET_WARP_BLOCK / 32;
+        int rwgrid = (n + warps_per_block - 1) / warps_per_block;
+        if (rwgrid > 512) rwgrid = 512;
+        reset_warp_ctr_kernel<<<rwgrid, RESET_WARP_BLOCK, 0, stream>>>(
+            g, reset_list, reset_ctrl, n, seed, step_ctr);
+        bump_ctr_kernel<<<1, 1, 0, stream>>>(step_ctr);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Full T-step rollout. Graph mode warms up eagerly once (cuBLAS
+    // workspace allocation is illegal inside capture), then captures
+    // and replays. Eager and graph runs are bitwise identical.
+    void run(bool use_graph) {
+        if (use_graph && !warmed) {
+            for (int t = 0; t < T; t++) step(t, true);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            warmed = true;
+        }
+        if (!use_graph) {
+            for (int t = 0; t < T; t++) step(t, true);
+            return;
+        }
+        if (!gexec) {
+            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+            for (int t = 0; t < T; t++) step(t, true);
+            CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+            cudaError_t ierr = cudaGraphInstantiate(&gexec, graph, nullptr, nullptr, 0);
+            if (ierr != cudaSuccess) {
+                fprintf(stderr, "graph instantiate failed: %s -- falling back to eager\n",
+                        cudaGetErrorString(ierr));
+                cudaGetLastError();
+                gexec = nullptr;
+                for (int t = 0; t < T; t++) step(t, true);
+                return;
+            }
+        }
+        CUDA_CHECK(cudaGraphLaunch(gexec, stream));
     }
 };
 
 static const char* ROLLOUT_NAMES[2] = {"split", "run  "};
 
 static void run_bench_rollout(int num_envs, int T, int iters, int kind) {
-    // Rollout buffers are n*T*(148+13+4) bytes plus env state; skip
-    // configs that do not fit.
-    size_t need = (size_t)num_envs * T * (OBS_DIM_COMPACT + 17) + soa_bytes(num_envs);
+    size_t need = (size_t)num_envs * T * (OBS_DIM_COMPACT + 17) + soa_bytes(num_envs)
+                + (size_t)num_envs * (GRU_LAYERS * HIDDEN + 4 * HIDDEN + GRU_OUT + NUM_ACTIONS) * 4;
     size_t free_b, total_b;
     CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
     if (need + (512ull << 20) > free_b) {
@@ -405,14 +518,15 @@ static void run_bench_rollout(int num_envs, int T, int iters, int kind) {
     }
     Rollout r(num_envs, T, 42);
     r.reset();
-    for (int i = 0; i < 3; i++) r.run_rollout(kind);
+    for (int i = 0; i < 3; i++) r.run(kind == 1);
+    CUDA_CHECK(cudaStreamSynchronize(r.stream));
     CUDA_CHECK(cudaDeviceSynchronize());
     double t0 = now_s();
-    for (int i = 0; i < iters; i++) r.run_rollout(kind);
+    for (int i = 0; i < iters; i++) r.run(kind == 1);
     CUDA_CHECK(cudaDeviceSynchronize());
     double dt = now_s() - t0;
     double sps = (double)num_envs * T * iters / dt;
-    printf("NE=%8d T=%d %s: %8.1f M SPS  (%.1f us/env-step-row)\n",
+    printf("NE=%8d T=%d %s: %8.2f M SPS  (%.1f us/env-step-row)\n",
            num_envs, T, ROLLOUT_NAMES[kind], sps / 1e6, dt / (iters * (double)T) * 1e6);
 }
 
@@ -438,79 +552,111 @@ static uint64_t rollout_hash(Rollout& r) {
     return h;
 }
 
+// Batched TF32 policy vs the scalar fp32 reference, along a real
+// trajectory. The env always advances with the BATCHED path's action;
+// the reference only mirrors the forward, so tf32 sampling flips can
+// never poison the comparison. Gates on max |delta| along the whole
+// trajectory; action flips are reported as information.
 static int run_verify(int num_envs, int steps) {
     int fail = 0;
-
-    // Check 1: fused (gather) forward == dense reference forward, bitwise,
-    // along a real trajectory driven by the fused path's sampled actions.
+    ensure_blas();
+    if (getenv("CRAFTAX_VERIFY_FP32"))
+        CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_DEFAULT_MATH));
     {
         Rollout r(num_envs, 1, 42);
         r.reset();
-        float* obs_f;
-        float* h_state_ref;
-        int32_t* act_ref; float* lp_ref; float* val_ref;
-        CUDA_CHECK(cudaMalloc(&obs_f, (size_t)num_envs * OBS_DIM * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&h_state_ref, (size_t)HIDDEN * num_envs * sizeof(float)));
-        CUDA_CHECK(cudaMemset(h_state_ref, 0, (size_t)HIDDEN * num_envs * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&act_ref, num_envs * 4));
-        CUDA_CHECK(cudaMalloc(&lp_ref, num_envs * 4));
-        CUDA_CHECK(cudaMalloc(&val_ref, num_envs * 4));
+        float* ref_state;   // [L][H][n]
+        float* ref_h3;      // [H][n]
+        int32_t* act2; float* lp2; float* val2;
+        size_t hbytes = (size_t)HIDDEN * num_envs * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&ref_state, (size_t)GRU_LAYERS * hbytes));
+        CUDA_CHECK(cudaMemset(ref_state, 0, (size_t)GRU_LAYERS * hbytes));
+        CUDA_CHECK(cudaMalloc(&ref_h3, hbytes));
+        CUDA_CHECK(cudaMalloc(&act2, num_envs * 4));
+        CUDA_CHECK(cudaMalloc(&lp2, num_envs * 4));
+        CUDA_CHECK(cudaMalloc(&val2, num_envs * 4));
 
         int block = 256, grid = (num_envs + block - 1) / block;
-        long bad = 0;
-        std::vector<int32_t> a1(num_envs), a2(num_envs);
-        std::vector<float> f1((size_t)HIDDEN * num_envs), f2((size_t)HIDDEN * num_envs);
-        std::vector<float> v1(num_envs), v2(num_envs), l1(num_envs), l2(num_envs);
+        std::vector<float> b_h3((size_t)HIDDEN * num_envs), b_val(num_envs);
+        std::vector<float> r_h((size_t)HIDDEN * num_envs);
+        std::vector<int32_t> a1(num_envs), a2h(num_envs);
+        std::vector<float> v2(num_envs);
+        double max_dh = 0.0, max_dv = 0.0;
+        long flips = 0;
         for (int t = 0; t < steps; t++) {
             const int8_t* prev = (t == 0) ? nullptr : r.r_done;
-            obs_kernel<<<grid, block>>>(r.g, obs_f, nullptr, 0, num_envs);
-            fused_forward_kernel<<<grid, block>>>(
-                r.g, r.w, r.h_state, prev, r.r_obs, r.r_act, r.r_logprob, r.r_value,
-                num_envs, r.seed, r.step_count);
-            ref_forward_kernel<<<grid, block>>>(
-                r.w, obs_f, h_state_ref, prev, act_ref, lp_ref, val_ref,
-                num_envs, r.seed, r.step_count);
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaMemcpy(a1.data(), r.r_act, num_envs * 4, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(a2.data(), act_ref, num_envs * 4, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(f1.data(), r.h_state, f1.size() * 4, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(f2.data(), h_state_ref, f2.size() * 4, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(v1.data(), r.r_value, num_envs * 4, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(v2.data(), val_ref, num_envs * 4, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(l1.data(), r.r_logprob, num_envs * 4, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(l2.data(), lp_ref, num_envs * 4, cudaMemcpyDeviceToHost));
-            if (memcmp(a1.data(), a2.data(), num_envs * 4) != 0) bad++;
-            else if (memcmp(f1.data(), f2.data(), f1.size() * 4) != 0) bad++;
-            else if (memcmp(v1.data(), v2.data(), num_envs * 4) != 0) bad++;
-            else if (memcmp(l1.data(), l2.data(), num_envs * 4) != 0) bad++;
-
-            // advance env with the sampled actions
-            CUDA_CHECK(cudaMemsetAsync(r.reset_ctrl, 0, 8));
-            step_mark_kernel<<<grid, block>>>(
+            CUDA_CHECK(cudaMemsetAsync(r.reset_ctrl, 0, 8, r.stream));
+            encode_env_warp_kernel<<<(num_envs * 32 + 255) / 256, 256, 0, r.stream>>>(
+                r.g, r.w.W_enc, r.w.b_enc, r.h_enc, num_envs);
+            const float* x = r.h_enc;
+            for (int l = 0; l < GRU_LAYERS; l++) {
+                gemm_fwd(GRU_OUT, num_envs, HIDDEN,
+                         r.w.W_gru + (size_t)l * (size_t)GRU_OUT * HIDDEN, x, r.pre, r.stream);
+                float* xn = (l < GRU_LAYERS - 1) ? r.hout[l] : r.h3;
+                mingru_epi_fwd_kernel<<<((size_t)HIDDEN * num_envs + 255) / 256, 256, 0, r.stream>>>(
+                    r.pre, x, r.h_state + (size_t)l * HIDDEN * num_envs, xn, nullptr, prev, num_envs);
+                x = xn;
+            }
+            gemm_fwd(NUM_ACTIONS, num_envs, HIDDEN, r.w.W_a, r.h3, r.logits, r.stream);
+            value_sample_kernel<<<grid, block, 0, r.stream>>>(
+                r.h3, r.logits, r.w.b_a, r.w.W_v, r.w.b_v, r.r_act, r.r_logprob, r.r_value,
+                num_envs, r.seed, r.step_ctr);
+            ref_policy_l3_kernel<<<grid, block, 0, r.stream>>>(
+                r.g, r.w, ref_state, prev, act2, lp2, val2, ref_h3,
+                num_envs, r.seed, r.step_ctr);
+            step_mark_kernel<<<grid, block, 0, r.stream>>>(
                 r.g, r.r_act, r.r_reward, r.r_done, r.reset_list, r.reset_ctrl, num_envs);
-            uint64_t reset_seed = r.seed + (r.step_count + 1) * 1000000ULL;
-            int wgrid = (num_envs + 3) / 4; if (wgrid > 512) wgrid = 512;
-            reset_warp_kernel<<<wgrid, RESET_WARP_BLOCK>>>(
-                r.g, r.reset_list, r.reset_ctrl, num_envs, reset_seed);
+            int rwgrid = (num_envs + 3) / 4; if (rwgrid > 512) rwgrid = 512;
+            reset_warp_ctr_kernel<<<rwgrid, RESET_WARP_BLOCK, 0, r.stream>>>(
+                r.g, r.reset_list, r.reset_ctrl, num_envs, r.seed, r.step_ctr);
+            bump_ctr_kernel<<<1, 1, 0, r.stream>>>(r.step_ctr);
             CUDA_CHECK(cudaGetLastError());
-            r.step_count++;
+            // device-visible copies: the legacy default stream does
+            // NOT serialize with our non-blocking stream
+            CUDA_CHECK(cudaStreamSynchronize(r.stream));
+
+            CUDA_CHECK(cudaMemcpy(b_h3.data(), r.h3, hbytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(b_val.data(), r.r_value, num_envs * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(r_h.data(), ref_h3, hbytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(v2.data(), val2, num_envs * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(a1.data(), r.r_act, num_envs * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(a2h.data(), act2, num_envs * 4, cudaMemcpyDeviceToHost));
+            for (int i = 0; i < HIDDEN * num_envs; i++) {
+                double d = fabs((double)b_h3[i] - (double)r_h[i]);
+                if (d > max_dh) max_dh = d;
+            }
+            for (int e = 0; e < num_envs; e++) {
+                double d = fabs((double)b_val[e] - (double)v2[e]);
+                if (d > max_dv) max_dv = d;
+                if (a1[e] != a2h[e]) flips++;
+            }
         }
-        printf("fused vs dense forward: %s (%ld/%d mismatching steps)\n",
-               bad == 0 ? "EXACT" : "MISMATCH", bad, steps);
-        if (bad != 0) fail = 1;
-        cudaFree(obs_f); cudaFree(h_state_ref);
-        cudaFree(act_ref); cudaFree(lp_ref); cudaFree(val_ref);
+        printf("batched vs scalar ref: max |d_h3| %.4g  max |d_v| %.4g  action flips %ld/%lld  %s\n",
+               max_dh, max_dv, flips, (long long)steps * num_envs,
+               (max_dh < 5e-2 && max_dv < 5e-2) ? "PASS" : "FAIL");
+        if (max_dh >= 5e-2 || max_dv >= 5e-2) fail = 1;
+        cudaFree(ref_state); cudaFree(ref_h3);
+        cudaFree(act2); cudaFree(lp2); cudaFree(val2);
     }
 
-    // Check 2: megakernel, smem-map, and split-path rollouts, all bitwise equal.
+    // Eager and graph-replayed rollouts must be bitwise identical.
+    // The first graph-mode run also executes its T warmup steps, so
+    // build/warm the graph first, then reset both sides and compare
+    // one clean rollout per mode.
     {
         Rollout a(num_envs, steps, 42), b(num_envs, steps, 42);
+        b.reset();
+        b.run(true);
+        CUDA_CHECK(cudaStreamSynchronize(b.stream));
         a.reset(); b.reset();
-        a.run_mega(); b.run_split();
+        a.run(false);
+        CUDA_CHECK(cudaStreamSynchronize(a.stream));
+        b.run(true);
+        CUDA_CHECK(cudaStreamSynchronize(b.stream));
         CUDA_CHECK(cudaDeviceSynchronize());
         uint64_t ha = rollout_hash(a), hb = rollout_hash(b);
-        printf("run rollout hash:   %016llx\n", (unsigned long long)ha);
-        printf("split rollout hash: %016llx  (%s)\n", (unsigned long long)hb,
+        printf("rollout hash (eager): %016llx\n", (unsigned long long)ha);
+        printf("rollout hash (graph): %016llx  (%s)\n", (unsigned long long)hb,
                ha == hb ? "MATCH" : "MISMATCH");
         if (ha != hb) fail = 1;
     }
@@ -519,36 +665,52 @@ static int run_verify(int num_envs, int steps) {
     return fail;
 }
 
-
 // ============================================================
-// PPO training: rollout -> bootstrap -> GAE -> backward -> Adam,
-// everything resident on device; the loop syncs only to log.
+// PPO training: rollout -> bootstrap -> GAE -> GEMM backward ->
+// Adam, everything resident on device as one capturable graph; the
+// loop only syncs to log.
 // ============================================================
 struct PPOConfig {
     float lr = 3e-4f, gamma = 0.99f, lam = 0.95f;
     float clip = 0.2f, ent = 0.01f, vf = 0.5f;
-    int epochs = 1;       // backward+adam passes per collected batch
+    int epochs = 1;
     int minibatches = 1;  // contiguous env-range slices per epoch
-    int lr_anneal = 0;    // 1: linear lr decay over the run
-    int bptt_split = 1;   // BPTT segments per env in backward (1 = exact;
-                          // >1 truncates state gradients at segment cuts)
+    int lr_anneal = 0;
+    int bptt_split = 1;   // BPTT segments per env (1 = exact)
 };
 
 struct Trainer {
     Rollout& r;
     PPOConfig cfg;
-    float* grads;
-    int grad_copies;
+    float* grads;      // [PARAM_COUNT], accumulated per minibatch
     float* adam_m;
     float* adam_v;
-    float* v_boot;
-    float* adv;
-    float* ret;
-    float* loss_acc;   // [3] pg, v, ent sums (fp32, logging)
+    float* d_lr;       // device float (host writes annealed value)
+    uint64_t* adam_ctr;
+    float* v_boot;     // [n]
+    float* boot_state; // [3H][n] scratch for the bootstrap value
+    float* adv;        // [T][n]
+    float* ret;        // [T][n]
+    double* loss_acc;  // [3] raw sums (logging)
     double* stats;     // [2] adv sum, sumsq
-    int adam_step = 0;
-    int mb_envs;           // envs per minibatch
-    long total_updates = 0;  // adam steps over the whole run (lr anneal)
+    // tight minibatch buffers (cols = T * mb)
+    float* x[4];       // [HIDDEN][cols]: enc out, layer outs
+    float* preb[3];    // [GRU_OUT][cols] (sweeps write dpre in place)
+    float* logitsb;    // [NUM_ACTIONS][cols]
+    float* dlogits;    // [NUM_ACTIONS][cols]
+    float* dvalue;     // [cols]
+    float* dh3b;       // [HIDDEN][cols]
+    float* dhG;        // [HIDDEN][cols]
+    float* dhX;        // [HIDDEN][cols]
+    float* stb[3];     // [HIDDEN][cols] post-zero input states from replay
+    float* live_st[3]; // [HIDDEN][mb] replay carry across t
+    int mb;              // envs per minibatch
+    int chunk;           // envs per loss() chunk (= mb)
+    long total_updates = 0;
+    bool warmed = false;
+    cudaGraph_t tgraph = nullptr;
+    cudaGraphExec_t texec = nullptr;
+    static const int MB_BYTES_PER_COL = 20100;  // measured from buffer set
 
     Trainer(Rollout& r_, PPOConfig cfg_) : r(r_), cfg(cfg_) {
         r.alloc_states();
@@ -557,116 +719,285 @@ struct Trainer {
                     r.n, cfg.minibatches);
             exit(1);
         }
-        mb_envs = r.n / cfg.minibatches;
-        if (cfg.bptt_split < 1 || r.T % cfg.bptt_split != 0 ||
-            (cfg.bptt_split > 1 && mb_envs % 32 != 0)) {
+        mb = r.n / cfg.minibatches;
+        if (cfg.bptt_split < 1 || r.T % cfg.bptt_split != 0 || mb % 32 != 0) {
             fprintf(stderr, "--bptt-split must divide horizon (%d %% %d != 0), "
                     "and envs/minibatch must be a multiple of 32\n",
                     r.T, cfg.bptt_split);
             exit(1);
         }
-        // Grad copies sized for the minibatch grid, not the full batch.
-        int grid = ((size_t)mb_envs * cfg.bptt_split + 255) / 256;
-        grad_copies = grid < 512 ? grid : 512;
-        CUDA_CHECK(cudaMalloc(&grads, (size_t)grad_copies * PARAM_COUNT * sizeof(float)));
-        CUDA_CHECK(cudaMemset(grads, 0, (size_t)grad_copies * PARAM_COUNT * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&adam_m, PARAM_COUNT * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&adam_v, PARAM_COUNT * sizeof(float)));
-        CUDA_CHECK(cudaMemset(adam_m, 0, PARAM_COUNT * sizeof(float)));
-        CUDA_CHECK(cudaMemset(adam_v, 0, PARAM_COUNT * sizeof(float)));
+        size_t cols = (size_t)r.T * mb;
+        CUDA_CHECK(cudaMalloc(&grads, (size_t)PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMemset(grads, 0, (size_t)PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&adam_m, (size_t)PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&adam_v, (size_t)PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMemset(adam_m, 0, (size_t)PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMemset(adam_v, 0, (size_t)PARAM_COUNT * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_lr, sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_lr, &cfg.lr, 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&adam_ctr, sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(adam_ctr, 0, sizeof(uint64_t)));
         CUDA_CHECK(cudaMalloc(&v_boot, r.n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&boot_state, (size_t)GRU_LAYERS * HIDDEN * r.n * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&adv, (size_t)r.n * r.T * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&ret, (size_t)r.n * r.T * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&loss_acc, 3 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&loss_acc, 3 * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&stats, 2 * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&r.ep_stats, 23 * sizeof(unsigned long long)));
         CUDA_CHECK(cudaMemset(r.ep_stats, 0, 23 * sizeof(unsigned long long)));
+        for (int i = 0; i < 4; i++)
+            CUDA_CHECK(cudaMalloc(&x[i], (size_t)HIDDEN * cols * sizeof(float)));
+        for (int l = 0; l < 3; l++)
+            CUDA_CHECK(cudaMalloc(&preb[l], (size_t)GRU_OUT * cols * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&logitsb, (size_t)NUM_ACTIONS * cols * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dlogits, (size_t)NUM_ACTIONS * cols * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dvalue, cols * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dh3b, (size_t)HIDDEN * cols * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dhG, (size_t)HIDDEN * cols * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&dhX, (size_t)HIDDEN * cols * sizeof(float)));
+        for (int l = 0; l < 3; l++) {
+            CUDA_CHECK(cudaMalloc(&stb[l], (size_t)HIDDEN * cols * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&live_st[l], (size_t)HIDDEN * mb * sizeof(float)));
+        }
+        chunk = mb;
     }
     ~Trainer() {
+        if (texec) cudaGraphExecDestroy(texec);
+        if (tgraph) cudaGraphDestroy(tgraph);
         cudaFree(grads); cudaFree(adam_m); cudaFree(adam_v);
-        cudaFree(v_boot); cudaFree(adv); cudaFree(ret);
+        cudaFree(d_lr); cudaFree(adam_ctr);
+        cudaFree(v_boot); cudaFree(boot_state); cudaFree(adv); cudaFree(ret);
         cudaFree(loss_acc); cudaFree(stats);
-        cudaFree(r.ep_stats); r.ep_stats = nullptr;
+        for (int i = 0; i < 4; i++) cudaFree(x[i]);
+        for (int l = 0; l < 3; l++) {
+            cudaFree(preb[l]); cudaFree(stb[l]); cudaFree(live_st[l]);
+        }
+        cudaFree(logitsb); cudaFree(dlogits); cudaFree(dvalue);
+        cudaFree(dh3b); cudaFree(dhG); cudaFree(dhX);
+        if (r.ep_stats) { cudaFree(r.ep_stats); r.ep_stats = nullptr; }
     }
 
-    // Rollout + advantage pipeline (no param update).
+    int seg_len() const { return r.T / cfg.bptt_split; }
+
+    // Rollout + bootstrap value + GAE + advantage stats. The rollout
+    // always launches eagerly here: the trainer's own graph capture
+    // (update) subsumes it -- a nested cudaGraphLaunch inside another
+    // capture is not allowed.
     void collect() {
-        r.run_mega();
+        r.run(false);
         int block = 256, grid = (r.n + block - 1) / block;
-        bootstrap_value_kernel<<<grid, block>>>(
-            r.g, r.w, r.h_state, r.r_done + (size_t)(r.T - 1) * r.n, v_boot, r.n);
-        gae_kernel<<<grid, block>>>(
-            r.r_value, r.r_reward, r.r_done, v_boot, adv, ret,
-            r.n, r.T, cfg.gamma, cfg.lam);
-        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(double)));
-        adv_stats_kernel<<<256, 256>>>(adv, (size_t)r.n * r.T, stats);
+        size_t hn = (size_t)HIDDEN * r.n;
+        const int8_t* prev = r.r_done + (size_t)(r.T - 1) * r.n;
+        CUDA_CHECK(cudaMemcpyAsync(boot_state, r.h_state,
+                                   (size_t)GRU_LAYERS * hn * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, r.stream));
+        encode_env_warp_kernel<<<((size_t)r.n * 32 + 255) / 256, block, 0, r.stream>>>(
+            r.g, r.w.W_enc, r.w.b_enc, r.h_enc, r.n);
+        const float* xx = r.h_enc;
+        for (int l = 0; l < GRU_LAYERS; l++) {
+            gemm_fwd(GRU_OUT, r.n, HIDDEN, r.w.W_gru + (size_t)l * (size_t)GRU_OUT * HIDDEN,
+                     xx, r.pre, r.stream);
+            float* xn = (l < GRU_LAYERS - 1) ? r.hout[l] : r.h3;
+            mingru_epi_fwd_kernel<<<((size_t)hn + 255) / 256, block, 0, r.stream>>>(
+                r.pre, xx, boot_state + (size_t)l * hn, xn, nullptr, prev, r.n);
+            xx = xn;
+        }
+        value_dot_kernel<<<grid, block, 0, r.stream>>>(r.h3, r.w.W_v, r.w.b_v, v_boot, r.n);
+        gae_kernel<<<grid, block, 0, r.stream>>>(
+            r.r_value, r.r_reward, r.r_done, v_boot, adv, ret, r.n, r.T, cfg.gamma, cfg.lam);
+        CUDA_CHECK(cudaMemsetAsync(stats, 0, 2 * sizeof(double), r.stream));
+        adv_stats_kernel<<<256, 256, 0, r.stream>>>(adv, (size_t)r.n * r.T, stats);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // Backward over a contiguous env range [env_start, env_start+env_count).
+    // Gradients over one contiguous env range, accumulated into the
+    // (freshly zeroed) grads arena.
     void backward(int env_start, int env_count) {
-        int block = 256;
-        int grid = (int)(((size_t)env_count * cfg.bptt_split + block - 1) / block);
-        ppo_backward_kernel<<<grid, block>>>(
-            r.w, r.r_obs, r.r_act, r.r_logprob, r.r_done, r.r_state,
-            adv, ret, grads, grad_copies, loss_acc, stats,
-            r.n, r.T, env_start, env_count, cfg.bptt_split,
+        ensure_blas();
+        const int T = r.T, n = r.n;
+        const int cols = T * env_count;
+        int bgrid = (cols + 255) / 256;
+        int hgrid = (int)(((size_t)HIDDEN * cols + 255) / 256);
+        int seg = seg_len();
+
+        // forward recompute at current theta: live recurrence within
+        // BPTT segments (stored state reloaded at segment starts),
+        // the same function the sweep's dcarry chain differentiates
+        encode_obs_kernel<<<(int)(((size_t)HIDDEN * cols + 255) / 256), 256, 0, r.stream>>>(
+            r.r_obs, r.w.W_enc, r.w.b_enc, x[0], 0, cols, env_count, n, env_start);
+        int egrid = (int)(((size_t)HIDDEN * env_count + 255) / 256);
+        for (int t = 0; t < T; t++) {
+            size_t co = (size_t)t * env_count;
+            bool segstart = (t % seg) == 0;
+            const int8_t* prev = segstart ? nullptr
+                : r.r_done + (size_t)(t - 1) * n + env_start;
+            for (int l = 0; l < GRU_LAYERS; l++) {
+                gemm_fwd(GRU_OUT, env_count, HIDDEN,
+                         r.w.W_gru + (size_t)l * (size_t)GRU_OUT * HIDDEN,
+                         x[l] + co * HIDDEN, preb[l] + co * GRU_OUT, r.stream);
+                mingru_epi_replay_kernel<<<egrid, 256, 0, r.stream>>>(
+                    preb[l] + co * GRU_OUT, x[l] + co * HIDDEN,
+                    segstart ? r.r_state + ((size_t)t * GRU_LAYERS + l) * HIDDEN * n + env_start
+                             : nullptr,
+                    live_st[l], prev, stb[l] + co * HIDDEN,
+                    x[l + 1] + co * HIDDEN, n, env_count);
+            }
+        }
+        gemm_fwd(NUM_ACTIONS, cols, HIDDEN, r.w.W_a, x[3], logitsb, r.stream);
+
+        head_bwd_kernel<<<bgrid, 256, 0, r.stream>>>(
+            logitsb, x[3], r.w.b_a, r.w.W_v, r.w.b_v,
+            r.r_act + env_start, r.r_logprob + env_start, adv + env_start, ret + env_start,
+            stats, dlogits, dvalue, loss_acc, T, env_count, n,
             cfg.clip, cfg.vf, cfg.ent);
+
+        // dh chain: heads -> layer 3 -> 2 -> 1
+        const float* Wl2 = r.w.W_gru + 2 * (size_t)GRU_OUT * HIDDEN;
+        const float* Wl1 = r.w.W_gru + (size_t)GRU_OUT * HIDDEN;
+        const float* Wl0 = r.w.W_gru;
+        gemm_dh(NUM_ACTIONS, cols, r.w.W_a, dlogits, dh3b, r.stream);
+        add_dv_wv_kernel<<<hgrid, 256, 0, r.stream>>>(dh3b, dvalue, r.w.W_v, cols);
+        int sgrid = (int)(((size_t)HIDDEN * env_count + 255) / 256);
+        const int8_t* rdone = r.r_done + env_start;
+        mingru_sweep_bwd_kernel<<<sgrid, 256, 0, r.stream>>>(
+            preb[2], x[2], dh3b, nullptr, stb[2],
+            rdone, preb[2], dhX, T, env_count, n, seg);
+        gemm_dh(GRU_OUT, cols, Wl2, preb[2], dhG, r.stream);
+        mingru_sweep_bwd_kernel<<<sgrid, 256, 0, r.stream>>>(
+            preb[1], x[1], dhG, dhX, stb[1],
+            rdone, preb[1], dhX, T, env_count, n, seg);
+        gemm_dh(GRU_OUT, cols, Wl1, preb[1], dhG, r.stream);
+        mingru_sweep_bwd_kernel<<<sgrid, 256, 0, r.stream>>>(
+            preb[0], x[0], dhG, dhX, stb[0],
+            rdone, preb[0], dhX, T, env_count, n, seg);
+        gemm_dh(GRU_OUT, cols, Wl0, preb[0], dhG, r.stream);
+        enc_bwd_kernel<<<(int)(((size_t)HIDDEN * cols + 255) / 256), 256, 0, r.stream>>>(
+            r.r_obs, dhG, dhX, grads + PARAM_W_ENC, grads + PARAM_B_ENC,
+            T, env_count, n, env_start);
+
+        // weight grads: flat GEMMs over samples (beta=1 accumulate)
+        for (int l = 0; l < GRU_LAYERS; l++)
+            gemm_dw(GRU_OUT, cols, x[l], preb[l],
+                    grads + PARAM_W_GRU + (size_t)l * GRU_OUT * HIDDEN, r.stream);
+        gemm_dw(NUM_ACTIONS, cols, x[3], dlogits, grads + PARAM_W_A, r.stream);
+        gemv_dwv(x[3], dvalue, grads + PARAM_W_V, cols, r.stream);
+        colsum_kernel<<<NUM_ACTIONS, 128, 0, r.stream>>>(dlogits, grads + PARAM_B_A,
+                                                         NUM_ACTIONS, cols);
+        colsum_kernel<<<1, 128, 0, r.stream>>>(dvalue, grads + PARAM_B_V, 1, cols);
         CUDA_CHECK(cudaGetLastError());
     }
 
     void adam() {
-        adam_step++;
-        float lr = cfg.lr;
-        if (cfg.lr_anneal && total_updates > 0)
-            lr *= 1.0f - (float)(adam_step - 1) / (float)total_updates;
-        adam_kernel<<<(PARAM_COUNT + 255) / 256, 256>>>(
-            r.params, grads, grad_copies, adam_m, adam_v,
-            adam_step, lr, 0.9f, 0.999f, 1e-8f);
+        adam_kernel<<<(PARAM_COUNT + 255) / 256, 256, 0, r.stream>>>(
+            r.params, grads, 1, adam_m, adam_v, adam_ctr, d_lr, 0.9f, 0.999f, 1e-8f);
+        bump_ctr_kernel<<<1, 1, 0, r.stream>>>(adam_ctr);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    void update() {
+    void body() {
         collect();
         for (int e = 0; e < cfg.epochs; e++) {
-            // loss_acc accumulates over the epoch's minibatches; the log
-            // line after update() reports the last epoch's full-batch sums.
-            CUDA_CHECK(cudaMemsetAsync(loss_acc, 0, 3 * sizeof(float)));
+            CUDA_CHECK(cudaMemsetAsync(loss_acc, 0, 3 * sizeof(double), r.stream));
             for (int m = 0; m < cfg.minibatches; m++) {
-                backward(m * mb_envs, mb_envs);
+                backward(m * mb, mb);
                 adam();
             }
         }
     }
 
-    // Total PPO loss over the stored rollout at the current params
-    // (recomputes the recurrent forward; used by gradcheck FD).
+    // One PPO iteration. Graph mode warms up eagerly first (a rollout
+    // plus one bare backward, no adam -- params stay untouched), then
+    // captures the whole body once and replays it.
+    void update(bool use_graph) {
+        if (!warmed) {
+            r.run(false);
+            backward(0, mb);
+            CUDA_CHECK(cudaStreamSynchronize(r.stream));
+            warmed = true;
+        }
+        if (use_graph && !texec) {
+            CUDA_CHECK(cudaStreamBeginCapture(r.stream, cudaStreamCaptureModeGlobal));
+            body();
+            CUDA_CHECK(cudaStreamEndCapture(r.stream, &tgraph));
+            cudaError_t ierr = cudaGraphInstantiate(&texec, tgraph, nullptr, nullptr, 0);
+            if (ierr != cudaSuccess) {
+                fprintf(stderr, "trainer graph instantiate failed: %s -- eager\n",
+                        cudaGetErrorString(ierr));
+                cudaGetLastError();
+                texec = nullptr;
+            }
+        }
+        if (texec) {
+            CUDA_CHECK(cudaGraphLaunch(texec, r.stream));
+        } else {
+            body();
+        }
+        CUDA_CHECK(cudaStreamSynchronize(r.stream));
+    }
+
+    // Total PPO loss over the stored rollout at the current params.
+    // Uses the same live-recurrence-within-segments replay as the
+    // backward's forward-recompute, so FD measures exactly the
+    // function the backward differentiates -- stored r_state enters
+    // only as the constant at BPTT segment starts.
+    // Envs are processed in chunks for buffer reuse.
     double loss() {
-        double zero[3] = {0, 0, 0};
-        double* d_losses;
-        CUDA_CHECK(cudaMalloc(&d_losses, 3 * sizeof(double)));
-        CUDA_CHECK(cudaMemcpy(d_losses, zero, 24, cudaMemcpyHostToDevice));
-        int block = 256, grid = (r.n + block - 1) / block;
-        ppo_loss_kernel<<<grid, block>>>(
-            r.w, r.r_obs, r.r_act, r.r_logprob, r.r_done, r.r_state,
-            adv, ret, d_losses, stats, r.n, r.T, cfg.clip);
-        CUDA_CHECK(cudaGetLastError());
+        ensure_blas();
+        const int T = r.T, n = r.n;
+        const int seg = seg_len();
+        CUDA_CHECK(cudaMemsetAsync(loss_acc, 0, 3 * sizeof(double), r.stream));
+        for (int e0 = 0; e0 < n; e0 += chunk) {
+            int cn = chunk < n - e0 ? chunk : n - e0;
+            size_t hn = (size_t)HIDDEN * n;
+            for (int t = 0; t < T; t++) {
+                bool segstart = (t % seg) == 0;
+                const int8_t* prev = segstart ? nullptr
+                    : r.r_done + (size_t)(t - 1) * n + e0;
+                encode_obs_kernel<<<(int)(((size_t)HIDDEN * cn + 255) / 256), 256, 0, r.stream>>>(
+                    r.r_obs, r.w.W_enc, r.w.b_enc, x[0], t, cn, cn, n, e0);
+                for (int l = 0; l < GRU_LAYERS; l++) {
+                    gemm_fwd(GRU_OUT, cn, HIDDEN,
+                             r.w.W_gru + (size_t)l * (size_t)GRU_OUT * HIDDEN,
+                             x[l], preb[l], r.stream);
+                    mingru_epi_replay_kernel<<<(int)(((size_t)HIDDEN * cn + 255) / 256), 256, 0, r.stream>>>(
+                        preb[l], x[l],
+                        segstart ? r.r_state + ((size_t)t * GRU_LAYERS + l) * hn + e0
+                                 : nullptr,
+                        live_st[l], prev, nullptr, x[l + 1], n, cn);
+                }
+                gemm_fwd(NUM_ACTIONS, cn, HIDDEN, r.w.W_a, x[3], logitsb, r.stream);
+                loss_accum_kernel<<<(cn + 255) / 256, 256, 0, r.stream>>>(
+                    logitsb, x[3], r.w.b_a, r.w.W_v, r.w.b_v,
+                    r.r_act + e0, r.r_logprob + e0, adv + e0, ret + e0,
+                    stats, loss_acc, t, n, T, cfg.clip);
+            }
+        }
         double h[3];
-        CUDA_CHECK(cudaMemcpy(h, d_losses, 24, cudaMemcpyDeviceToHost));
-        cudaFree(d_losses);
-        double count = (double)r.n * r.T;
+        CUDA_CHECK(cudaStreamSynchronize(r.stream));
+        CUDA_CHECK(cudaMemcpy(h, loss_acc, 24, cudaMemcpyDeviceToHost));
+        double count = (double)n * T;
         return (h[0] + cfg.vf * h[1] - cfg.ent * h[2]) / count;
     }
 };
 
 static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
+    // The GEMM backward's minibatch buffers scale with T*mb (~17
+    // KB/sample). If the user did not size minibatches, pick the
+    // smallest power of two that keeps the buffers under ~8 GB.
+    {
+        size_t max_cols = ((size_t)8 << 30) / Trainer::MB_BYTES_PER_COL;
+        while (cfg.minibatches < num_envs / 32 &&
+               (size_t)(num_envs / cfg.minibatches) * T > max_cols)
+            cfg.minibatches *= 2;
+    }
     Rollout r(num_envs, T, 42);
     Trainer tr(r, cfg);
     tr.total_updates = (long)iters * cfg.epochs * cfg.minibatches;
     r.reset();
-    printf("train: hidden=%d envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g epochs=%d minibatches=%d lr_anneal=%d bptt_split=%d\n",
-           HIDDEN, num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam, cfg.clip, cfg.ent, cfg.vf,
-           cfg.epochs, cfg.minibatches, cfg.lr_anneal, cfg.bptt_split);
+    printf("train: hidden=%d layers=%d envs=%d horizon=%d iters=%d lr=%g gamma=%g lam=%g clip=%g ent=%g vf=%g epochs=%d minibatches=%d lr_anneal=%d bptt_split=%d\n",
+           HIDDEN, GRU_LAYERS, num_envs, T, iters, cfg.lr, cfg.gamma, cfg.lam,
+           cfg.clip, cfg.ent, cfg.vf, cfg.epochs, cfg.minibatches,
+           cfg.lr_anneal, cfg.bptt_split);
 
     static const char* ach_names[22] = {
         "collect_wood", "place_table", "eat_cow", "collect_sapling",
@@ -681,17 +1012,23 @@ static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
     double t0 = now_s();
     size_t steps_done = 0, steps_window = 0;
     unsigned long long total_eps = 0, total_ach[22] = {0};
+    int64_t updates_done = 0;
     for (int it = 1; it <= iters; it++) {
-        tr.update();
+        if (cfg.lr_anneal && tr.total_updates > 0) {
+            float lr_it = cfg.lr * (1.0f - (float)updates_done / (float)tr.total_updates);
+            CUDA_CHECK(cudaMemcpy(tr.d_lr, &lr_it, 4, cudaMemcpyHostToDevice));
+        }
+        tr.update(true);
+        updates_done += (int64_t)cfg.epochs * cfg.minibatches;
         steps_done += (size_t)num_envs * T;
         steps_window += (size_t)num_envs * T;
         if (it == 1 || it % 10 == 0 || it == iters) {
             CUDA_CHECK(cudaMemsetAsync(rew_stats, 0, 16));
             adv_stats_kernel<<<256, 256>>>(r.r_reward, (size_t)num_envs * T, rew_stats);
-            float h_loss[3];
+            double h_loss[3];
             double h_rew[2];
             unsigned long long h_eps[23];
-            CUDA_CHECK(cudaMemcpy(h_loss, tr.loss_acc, 12, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_loss, tr.loss_acc, 24, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(h_rew, rew_stats, 16, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(h_eps, r.ep_stats, 23 * 8, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemsetAsync(r.ep_stats, 0, 23 * 8));
@@ -700,7 +1037,7 @@ static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
             double count = (double)num_envs * T;
             double sps = steps_done / (now_s() - t0);
             double eplen = h_eps[0] ? (double)steps_window / h_eps[0] : 0.0;
-            double retep = (h_rew[0] / count) * eplen;  // rew/step * mean ep len
+            double retep = (h_rew[0] / count) * eplen;
             printf("iter %5d  %7.1f M SPS  pg %+.4f  vf %8.4f  ent %6.3f  rew/step %+.5f  ret/ep %+.3f  eplen %5.0f\n",
                    it, sps / 1e6, h_loss[0] / count, h_loss[1] / count,
                    h_loss[2] / count, h_rew[0] / count, retep, eplen);
@@ -718,29 +1055,67 @@ static void run_train(int num_envs, int T, int iters, PPOConfig cfg) {
 // Analytic gradients vs central finite differences of the PPO loss on
 // a small fixed rollout. The loss treats actions, old logprobs, and
 // advantages as constants, so it is a pure function of the parameters
-// and FD is exact up to fp32 forward noise.
+// and FD is exact up to fp32 forward noise. cuBLAS runs in strict
+// FP32 here (no TF32) so loss() and backward() agree op-for-op.
 static int run_gradcheck() {
+    ensure_blas();
+    CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_DEFAULT_MATH));
     const int n = 64, T = 8;
     Rollout r(n, T, 42);
     PPOConfig cfg;
+    if (const char* s = getenv("CRAFTAX_GC_SPLIT")) cfg.bptt_split = atoi(s);
     Trainer tr(r, cfg);
     r.reset();
-    tr.collect();
-    CUDA_CHECK(cudaMemsetAsync(tr.loss_acc, 0, 3 * sizeof(float)));
+    tr.collect();  // eager: rollout + bootstrap + GAE + stats
+    CUDA_CHECK(cudaStreamSynchronize(r.stream));
     tr.backward(0, n);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(r.stream));
 
-    std::vector<float> g_all((size_t)tr.grad_copies * PARAM_COUNT);
-    CUDA_CHECK(cudaMemcpy(g_all.data(), tr.grads, g_all.size() * 4, cudaMemcpyDeviceToHost));
+    if (getenv("CRAFTAX_DUMP")) {
+        auto dumpb = [](const char* name, const void* dev, size_t bytes) {
+            std::vector<uint8_t> h(bytes);
+            CUDA_CHECK(cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost));
+            char path[256]; snprintf(path, 256, "/tmp/gcdump/%s.bin", name);
+            FILE* f = fopen(path, "wb"); fwrite(h.data(), 1, bytes, f); fclose(f);
+            fprintf(stderr, "dumped %s (%zu B)\n", path, bytes);
+        };
+        size_t tn = (size_t)T * n;
+        dumpb("params", r.params, (size_t)PARAM_COUNT * 4);
+        dumpb("obs", r.r_obs, tn * OBS_DIM_COMPACT);
+        dumpb("states", r.r_state, tn * GRU_LAYERS * HIDDEN * 4);
+        dumpb("act", r.r_act, tn * 4);
+        dumpb("lp", r.r_logprob, tn * 4);
+        dumpb("done", r.r_done, tn);
+        dumpb("adv", tr.adv, tn * 4);
+        dumpb("ret", tr.ret, tn * 4);
+        dumpb("stats", tr.stats, 2 * 8);
+        for (int l = 0; l <= GRU_LAYERS; l++) {
+            char nm[32]; snprintf(nm, 32, "x%d", l);
+            dumpb(nm, tr.x[l], tn * HIDDEN * 4);
+        }
+        for (int l = 0; l < GRU_LAYERS; l++) {
+            char nm[32]; snprintf(nm, 32, "pre%d", l);
+            dumpb(nm, tr.preb[l], tn * GRU_OUT * 4);
+        }
+        dumpb("logits", tr.logitsb, tn * NUM_ACTIONS * 4);
+        dumpb("dlogits", tr.dlogits, tn * NUM_ACTIONS * 4);
+        dumpb("dvalue", tr.dvalue, tn * 4);
+        dumpb("dh3b", tr.dh3b, tn * HIDDEN * 4);
+        dumpb("dhG", tr.dhG, tn * HIDDEN * 4);
+        dumpb("dhX", tr.dhX, tn * HIDDEN * 4);
+        dumpb("grads", tr.grads, (size_t)PARAM_COUNT * 4);
+    }
+
+    std::vector<float> g_all(PARAM_COUNT);
+    CUDA_CHECK(cudaMemcpy(g_all.data(), tr.grads, PARAM_COUNT * 4, cudaMemcpyDeviceToHost));
     std::vector<double> g(PARAM_COUNT, 0.0);
-    for (int c = 0; c < tr.grad_copies; c++)
-        for (int i = 0; i < PARAM_COUNT; i++) g[i] += g_all[(size_t)c * PARAM_COUNT + i];
+    for (int i = 0; i < PARAM_COUNT; i++) g[i] = g_all[i];
 
-    struct Seg { const char* name; int off, count; };
+    struct Seg { const char* name; int off; int count; };
     Seg segs[] = {
         {"W_enc", PARAM_W_ENC, OBS_DIM * HIDDEN},
         {"b_enc", PARAM_B_ENC, HIDDEN},
-        {"W_gru", PARAM_W_GRU, GRU_OUT * HIDDEN},
+        {"W_gru", PARAM_W_GRU, W_GRU_ELEMS},
         {"W_a",   PARAM_W_A,   NUM_ACTIONS * HIDDEN},
         {"b_a",   PARAM_B_A,   NUM_ACTIONS},
         {"W_v",   PARAM_W_V,   HIDDEN},
@@ -748,12 +1123,12 @@ static int run_gradcheck() {
     };
     uint64_t rng = 0x12345678ULL;
     int fail = 0;
+    float fh = 1e-3f;
+    if (getenv("CRAFTAX_FDH")) fh *= (float)atof(getenv("CRAFTAX_FDH"));
     for (const Seg& s : segs) {
         double gnorm = 0.0;
         for (int i = 0; i < s.count; i++) gnorm += fabs(g[s.off + i]);
         double max_rel = 0.0, max_diff = 0.0;
-        // Check the 8 largest-|g| params (FD can resolve their relative
-        // error) plus 16 random ones (absolute agreement).
         std::vector<int> idx(s.count);
         for (int i = 0; i < s.count; i++) idx[i] = s.off + i;
         std::partial_sort(idx.begin(), idx.begin() + (s.count < 8 ? s.count : 8), idx.end(),
@@ -768,7 +1143,7 @@ static int run_gradcheck() {
             }
             float theta;
             CUDA_CHECK(cudaMemcpy(&theta, r.params + i, 4, cudaMemcpyDeviceToHost));
-            float h = 1e-3f * fmaxf(fabsf(theta), 0.1f);
+            float h = fh * fmaxf(fabsf(theta), 0.1f);
             float tp = theta + h, tm = theta - h;
             CUDA_CHECK(cudaMemcpy(r.params + i, &tp, 4, cudaMemcpyHostToDevice));
             double lp = tr.loss();
@@ -804,19 +1179,19 @@ static void usage(const char* prog) {
         "  bench      env-only SPS            (--envs --iters --obs-mode --reset-mode)\n"
         "  sweep      env-only sweep over env counts x obs x reset modes\n"
         "  hash       env validation suite    (--envs --steps)\n"
-        "  run        fused env+policy rollout SPS   (--envs --horizon --iters)\n"
-        "  split      same rollout via per-step kernels\n"
-        "  runsweep   rollout sweep, run vs split    (--horizon)\n"
-        "  verify     NN fusion + rollout validation (--envs --steps)\n"
+        "  run        env+policy rollout SPS, CUDA graph  (--envs --horizon --iters)\n"
+        "  split      same rollout, eager launches\n"
+        "  runsweep   rollout sweep, graph vs eager       (--horizon)\n"
+        "  verify     batched-vs-reference + eager-vs-graph validation (--envs --steps)\n"
         "  train      on-device PPO training  (--envs --horizon --iters + PPO flags)\n"
-        "  gradcheck  analytic vs finite-difference gradients\n"
+        "  gradcheck  analytic vs finite-difference gradients (fp32, no TF32)\n"
         "flags:\n"
         "  --backend cuda|cpu   (default cuda; cpu supports bench only)\n"
         "  --envs N  --iters N  --steps N  --horizon N  --obs-mode 0|1  --reset-mode 0|1\n"
         "  --lr F  --gamma F  --gae-lambda F  --clip F  --ent F  --vf F  --epochs N\n"
-        "  --minibatches M  (contiguous env-range slices per epoch, default 1)\n"
-        "  --bptt-split S   (BPTT segments per env in backward, default 1 = exact;\n"
-        "                    S>1 truncates state grads at segment cuts, more parallelism)\n"
+        "  --minibatches M  (contiguous env-range slices; default auto: sized so the\n"
+        "                    GEMM backward's ~17 KB/sample buffers stay under 8 GB)\n"
+        "  --bptt-split S   (BPTT segments per env in backward, default 1 = exact)\n"
         "  --lr-anneal      (linear lr decay over the run)\n",
         prog);
 }

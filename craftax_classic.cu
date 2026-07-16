@@ -1503,33 +1503,40 @@ extern "C" __global__ void gen_actions_kernel(int32_t* actions, int n, int step,
 }
 
 
-// Compile-time hidden size. Default 32 (canonical hashes). Build a
-// hidden-128 binary with -DCRAFTAX_HIDDEN=128 (its verify/train hashes
-// live in a different universe; h32 anchors are unaffected).
-#ifndef CRAFTAX_HIDDEN
-#define CRAFTAX_HIDDEN 32
-#endif
-#define HIDDEN CRAFTAX_HIDDEN
-#define GRU_OUT (3 * HIDDEN)
-#define MEGA_BLOCK 128
-
-// W_gru is 3*HIDDEN*HIDDEN floats: 12KB at hidden 32 (staged in shared
-// memory) but 192KB at hidden 128 -- over sm_86's 100KB smem budget, so
-// large-hidden builds read it straight from global (uniform across the
-// block, so it broadcasts through L1).
-#if (3 * HIDDEN * HIDDEN * 4) <= 49152
-#define GRU_SMEM 1
-#else
-#define GRU_SMEM 0
-#endif
-
 // ============================================================
-// Policy weights (device pointers, passed to kernels by value)
+// Policy: Linear(1345) -> MinGRU x3 (hidden 256) -> actor + value.
+//
+// Single fixed shape. Batched tensor-core execution: warp-cooperative
+// encoder (lane owns HIDDEN/32 outputs) + cuBLAS GEMMs; the recurrent
+// epilogue is a separate elementwise kernel.
+//
+// The old thread-per-env policy path (megakernel, scalar forward,
+// smem-staged backward) was removed on measurement:
+//  - hidden 256 spills the per-thread accumulator (1KB/layer), and
+//  - every env re-reads ~2.4MB of weights scalar-fashion, ~6.6TB/s of
+//    L2 at the resulting 2.7M SPS ceiling.
+// Batched GEMM reuses each weight across the whole env batch.
+// See README for the numbers. Parameter arena layout:
 // ============================================================
+#define HIDDEN 256
+#define GRU_LAYERS 3
+#define GRU_OUT (3 * HIDDEN)             // per-layer gate rows (h, g, p)
+#define W_GRU_ELEMS (GRU_LAYERS * GRU_OUT * HIDDEN)
+
+#define PARAM_W_ENC 0
+#define PARAM_B_ENC (OBS_DIM * HIDDEN)
+#define PARAM_W_GRU (PARAM_B_ENC + HIDDEN)                 // [L][3H][H] stacked
+#define PARAM_W_A   (PARAM_W_GRU + W_GRU_ELEMS)
+#define PARAM_B_A   (PARAM_W_A + NUM_ACTIONS * HIDDEN)
+#define PARAM_W_V   (PARAM_B_A + NUM_ACTIONS)
+#define PARAM_B_V   (PARAM_W_V + HIDDEN)
+#define PARAM_COUNT (PARAM_B_V + 1)
+
+// Policy weights (device pointers into the flat params arena).
 struct Weights {
     const float* __restrict__ W_enc;  // [OBS_DIM][HIDDEN] row per input feature
     const float* __restrict__ b_enc;  // [HIDDEN]
-    const float* __restrict__ W_gru;  // [GRU_OUT][HIDDEN]
+    const float* __restrict__ W_gru;  // [GRU_LAYERS][GRU_OUT][HIDDEN] slices
     const float* __restrict__ W_a;    // [NUM_ACTIONS][HIDDEN]
     const float* __restrict__ b_a;    // [NUM_ACTIONS]
     const float* __restrict__ W_v;    // [HIDDEN]
@@ -1544,162 +1551,6 @@ extern "C" __global__ void init_weights_kernel(
     curandStatePhilox4_32_10_t st;
     curand_init(seed, subseq, i, &st);
     w[i] = (2.0f * curand_uniform(&st) - 1.0f) * bound;
-}
-
-// Small weights staged in shared memory once per block. W_gru degrades
-// to a global pointer when it does not fit (GRU_SMEM 0); s.W_gru[i]
-// spelling works either way.
-struct NNShared {
-#if GRU_SMEM
-    float W_gru[GRU_OUT * HIDDEN];
-#else
-    const float* W_gru;
-#endif
-    float W_a[NUM_ACTIONS * HIDDEN];
-    float b_a[NUM_ACTIONS];
-    float W_v[HIDDEN];
-    float b_enc[HIDDEN];
-    float b_v;
-};
-
-__device__ void load_nn_shared(NNShared& s, const Weights& w) {
-#if GRU_SMEM
-    for (int i = threadIdx.x; i < GRU_OUT * HIDDEN; i += blockDim.x) s.W_gru[i] = w.W_gru[i];
-#else
-    if (threadIdx.x == 0) s.W_gru = w.W_gru;
-#endif
-    for (int i = threadIdx.x; i < NUM_ACTIONS * HIDDEN; i += blockDim.x) s.W_a[i] = w.W_a[i];
-    for (int i = threadIdx.x; i < NUM_ACTIONS; i += blockDim.x) s.b_a[i] = w.b_a[i];
-    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) s.W_v[i] = w.W_v[i];
-    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) s.b_enc[i] = w.b_enc[i];
-    if (threadIdx.x == 0) s.b_v = w.b_v[0];
-    __syncthreads();
-}
-
-// ============================================================
-// Fused encoder: Linear(1345 float obs -> 32) computed directly
-// from the gathered view + env state, in the SAME feature order
-// as the dense loop, skipping only exact-zero terms.
-// ============================================================
-__device__ void fused_encoder(
-    const EnvSoA& g, int e, VIEW_PARAMS,
-    const Weights& w, const NNShared& s, float* h  // h[HIDDEN]
-) {
-    const int n = g.n;
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) h[i] = s.b_enc[i];
-
-#if VIEW_PACKED_LAYOUT
-    #pragma unroll
-    for (int r = 0; r < OBS_MAP_ROWS; r++) {
-        for (int c = 0; c < OBS_MAP_COLS; c++) {
-            int cell = r * OBS_MAP_COLS + c;
-            int f = cell * (NUM_BLOCK_TYPES + 4) + vp_blk(v, r, c);
-            const float* col = w.W_enc + (size_t)f * HIDDEN;
-            #pragma unroll
-            for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, col[i], h[i]);
-            int m = vp_mob(v, r, c);
-            int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
-            for (int k = 0; k < 4; k++) {
-                if (m & (1 << k)) {
-                    const float* mc = w.W_enc + (size_t)(fm + k) * HIDDEN;
-                    #pragma unroll
-                    for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, mc[i], h[i]);
-                }
-            }
-        }
-    }
-#else
-    for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
-        int f = cell * (NUM_BLOCK_TYPES + 4) + view_blk[cell];
-        const float* col = w.W_enc + (size_t)f * HIDDEN;
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, col[i], h[i]);
-        uint8_t m = view_mob[cell];
-        int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
-        for (int k = 0; k < 4; k++) {
-            if (m & (1 << k)) {
-                const float* mc = w.W_enc + (size_t)(fm + k) * HIDDEN;
-                #pragma unroll
-                for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, mc[i], h[i]);
-            }
-        }
-    }
-#endif
-
-    int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
-    for (int j = 0; j < NUM_INVENTORY; j++, f++) {
-        float x = (float)g.inv[j*n+e] / 10.0f;
-        const float* col = w.W_enc + (size_t)f * HIDDEN;
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
-    }
-    float intr[4] = {
-        (float)g.health[e] / 10.0f, (float)g.food[e] / 10.0f,
-        (float)g.drink[e] / 10.0f, (float)g.energy[e] / 10.0f
-    };
-    for (int j = 0; j < 4; j++, f++) {
-        const float* col = w.W_enc + (size_t)f * HIDDEN;
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(intr[j], col[i], h[i]);
-    }
-    for (int d = 1; d <= 4; d++, f++) {
-        float x = (g.player_dir[e] == d) ? 1.0f : 0.0f;
-        const float* col = w.W_enc + (size_t)f * HIDDEN;
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
-    }
-    {
-        const float* col = w.W_enc + (size_t)f * HIDDEN; f++;
-        float x = g.light_level[e];
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
-    }
-    {
-        const float* col = w.W_enc + (size_t)f * HIDDEN;
-        float x = g.is_sleeping[e] ? 1.0f : 0.0f;
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
-    }
-}
-
-__device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
-__device__ __forceinline__ float mingru_g(float x) { return x >= 0.0f ? x + 0.5f : sigmoidf_(x); }
-
-// MinGRU cell + decoder heads. state in/out; logits[NUM_ACTIONS], value.
-__device__ void nn_head(
-    const float* h_enc, float* state, const NNShared& s,
-    float* logits, float& value
-) {
-    // Single loop over units (no hidden/gate/proj staging arrays: at
-    // hidden 128 they are pure register/local pressure). Per-unit math
-    // and summation order are unchanged, so results stay bit-identical.
-    float hout[HIDDEN];
-    #pragma unroll
-    for (int k = 0; k < HIDDEN; k++) {
-        float zh = 0.0f, zg = 0.0f, zp = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < HIDDEN; j++) {
-            zh = fmaf(s.W_gru[(k) * HIDDEN + j], h_enc[j], zh);
-            zg = fmaf(s.W_gru[(HIDDEN + k) * HIDDEN + j], h_enc[j], zg);
-            zp = fmaf(s.W_gru[(2*HIDDEN + k) * HIDDEN + j], h_enc[j], zp);
-        }
-        // torch.lerp(start, end, weight) = start + weight*(end-start)
-        float out = state[k] + sigmoidf_(zg) * (mingru_g(zh) - state[k]);
-        float p = sigmoidf_(zp);
-        hout[k] = p * out + (1.0f - p) * h_enc[k];
-        state[k] = out;
-    }
-    for (int a = 0; a < NUM_ACTIONS; a++) {
-        float z = s.b_a[a];
-        #pragma unroll
-        for (int j = 0; j < HIDDEN; j++) z = fmaf(s.W_a[a * HIDDEN + j], hout[j], z);
-        logits[a] = z;
-    }
-    float v = s.b_v;
-    #pragma unroll
-    for (int j = 0; j < HIDDEN; j++) v = fmaf(s.W_v[j], hout[j], v);
-    value = v;
 }
 
 // Categorical sample from logits with one uniform; returns action,
@@ -1751,286 +1602,777 @@ __device__ void write_compact_obs(
     float light = g.light_level[e];
     memcpy(obs + idx, &light, sizeof(float));
 }
-
 // ============================================================
-// Rollout megakernel: T steps, one thread per env, no grid sync.
-// step0 is the global step count at entry (sampler stream offset
-// and reset-seed schedule stay aligned with the split path).
+// Device math helpers
 // ============================================================
-#ifndef ROLLOUT_MIN_BLOCKS
-#if HIDDEN > 64
-// Large hidden: per-thread state/h_enc alone exceed the 128-reg budget
-// that 4 resident blocks would force; let ptxas use the full register
-// file instead of spilling everything.
-#define ROLLOUT_MIN_BLOCKS 1
-#else
-#define ROLLOUT_MIN_BLOCKS 4
-#endif
-#endif
-extern "C" __global__ void __launch_bounds__(MEGA_BLOCK, ROLLOUT_MIN_BLOCKS) rollout_kernel(
-    EnvSoA g, Weights w, float* __restrict__ h_state,
-    uint8_t* __restrict__ r_obs, int32_t* __restrict__ r_act,
-    float* __restrict__ r_logprob, float* __restrict__ r_value,
-    float* __restrict__ r_reward, int8_t* __restrict__ r_done,
-    float* __restrict__ r_state,  // optional [T][HIDDEN][n]: recurrent state input per step (for BPTT)
-    unsigned long long* __restrict__ ep_stats,  // optional [1+22]: episodes, ach counts
-    int num_envs, int T, uint64_t seed, uint64_t step0
-) {
-    __shared__ NNShared snn;
-    __shared__ float angles[MEGA_BLOCK / 32][WG_ANGLE_COUNT];
-    load_nn_shared(snn, w);
-
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_envs) return;
-    const int warp_in_block = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-
-    curandStatePhilox4_32_10_t sampler;
-    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, e, step0, &sampler);
-
-    float state[HIDDEN];
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) state[i] = h_state[(size_t)i * num_envs + e];
-    bool was_done = false;
-
-    for (int t = 0; t < T; t++) {
-        VIEW_DECL_GATHER(g, e);
-        write_compact_obs(g, e, VIEW_ARGS,
-                          r_obs + ((size_t)t * num_envs + e) * OBS_DIM_COMPACT);
-
-        if (was_done) {
-            #pragma unroll
-            for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
-        }
-        if (r_state) {
-            #pragma unroll
-            for (int i = 0; i < HIDDEN; i++)
-                r_state[((size_t)t * HIDDEN + i) * num_envs + e] = state[i];
-        }
-        float h_enc[HIDDEN], logits[NUM_ACTIONS], value, logprob;
-        fused_encoder(g, e, VIEW_ARGS, w, snn, h_enc);
-        nn_head(h_enc, state, snn, logits, value);
-        int action = sample_action(logits, curand_uniform(&sampler), &logprob);
-
-        size_t o = (size_t)t * num_envs + e;
-        r_act[o] = action; r_logprob[o] = logprob; r_value[o] = value;
-
-        bool done = step_env(g, e, action, r_reward + (size_t)t * num_envs);
-        r_done[o] = done ? 1 : 0;
-        was_done = done;
-
-        if (ep_stats && done) {  // episode stats, read before reset wipes ach
-            atomicAdd(&ep_stats[0], 1ULL);
-            uint32_t a = g.ach[e];
-            while (a) { int b = __ffs(a) - 1; a &= a - 1; atomicAdd(&ep_stats[1 + b], 1ULL); }
-        }
-
-        // Warp-cooperative reset of done lanes; stalls stay in this warp.
-        unsigned mask = __ballot_sync(0xFFFFFFFFu, done);
-        uint64_t reset_seed = seed + (step0 + t + 1) * 1000000ULL;
-        while (mask) {
-            int l = __ffs(mask) - 1;
-            mask &= mask - 1;
-            int de = e - lane + l;
-            generate_world_warp(g, de, reset_seed, de + num_envs, angles[warp_in_block]);
-        }
-        __syncwarp();
-    }
-
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) h_state[(size_t)i * num_envs + e] = state[i];
+__device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ float mingru_g(float x) { return x >= 0.0f ? x + 0.5f : sigmoidf_(x); }
+__device__ __forceinline__ float dg_mingru(float x) {  // d/dx of mingru_g
+    if (x >= 0.0f) return 1.0f;
+    float s = sigmoidf_(x);
+    return s * (1.0f - s);
 }
 
 // ============================================================
-// Split-path forward kernel: identical math, one step per launch.
-// Reads dones from the previous step to zero recurrent state.
+// Warp-cooperative encoder: one warp per env, lane owns ENC_W =
+// HIDDEN/32 hidden units. All 32 lanes redundantly gather the same
+// env's view (uniform loads broadcast through L1) and walk the
+// features in fused-encoder order; each lane FMAs its W_enc row
+// slice (warp covers each 1-KB column line-exactly). Output is
+// column-major [HIDDEN][cols]: h_enc[k + col*HIDDEN], fed straight
+// to cuBLAS. Same math as the old dense encoder, different width.
 // ============================================================
-extern "C" __global__ void fused_forward_kernel(
-    EnvSoA g, Weights w, float* __restrict__ h_state,
-    const int8_t* __restrict__ prev_dones,
-    uint8_t* __restrict__ r_obs, int32_t* __restrict__ r_act,
-    float* __restrict__ r_logprob, float* __restrict__ r_value,
-    int num_envs, uint64_t seed, uint64_t step_count
+#define ENC_W (HIDDEN / 32)
+static_assert(HIDDEN == 256 && (HIDDEN % 32) == 0, "fixed policy is hidden 256");
+
+#define ENC_ACC(hv, W_enc, f_, x_, lane_) do { \
+    const float* col_ = (W_enc) + ((size_t)(f_) * HIDDEN) + (lane_) * ENC_W; \
+    _Pragma("unroll") \
+    for (int i_ = 0; i_ < ENC_W; i_++) hv[i_] = fmaf((x_), col_[i_], hv[i_]); \
+} while (0)
+
+#define ENC_INIT(hv, b_enc, lane_) do { \
+    const float* be_ = (b_enc) + (lane_) * ENC_W; \
+    _Pragma("unroll") \
+    for (int i_ = 0; i_ < ENC_W; i_++) hv[i_] = be_[i_]; \
+} while (0)
+
+#define ENC_STORE(h_enc_, col_, hv, lane_) do { \
+    float4* dst_ = reinterpret_cast<float4*>( \
+        (h_enc_) + (size_t)(col_) * HIDDEN + (lane_) * ENC_W); \
+    dst_[0] = make_float4(hv[0], hv[1], hv[2], hv[3]); \
+    dst_[1] = make_float4(hv[4], hv[5], hv[6], hv[7]); \
+} while (0)
+
+// Live-env encoder (rollout forward, bootstrap). One warp per env.
+extern "C" __global__ void encode_env_warp_kernel(
+    EnvSoA g, const float* __restrict__ W_enc, const float* __restrict__ b_enc,
+    float* __restrict__ h_enc, int num_envs
 ) {
-    __shared__ NNShared snn;
-    load_nn_shared(snn, w);
+    const int lane = threadIdx.x & 31;
+    int e = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (e >= num_envs) return;
+    VIEW_DECL_GATHER(g, e);
+    const int n = g.n;
+
+    float hv[ENC_W];
+    ENC_INIT(hv, b_enc, lane);
+#if VIEW_PACKED_LAYOUT
+    for (int r = 0; r < OBS_MAP_ROWS; r++) {
+        for (int c = 0; c < OBS_MAP_COLS; c++) {
+            int cell = r * OBS_MAP_COLS + c;
+            ENC_ACC(hv, W_enc, cell * (NUM_BLOCK_TYPES + 4) + vp_blk(view, r, c), 1.0f, lane);
+            int m = vp_mob(view, r, c);
+            int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+            for (int k = 0; k < 4; k++)
+                if (m & (1 << k)) ENC_ACC(hv, W_enc, fm + k, 1.0f, lane);
+        }
+    }
+#else
+    for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
+        ENC_ACC(hv, W_enc, cell * (NUM_BLOCK_TYPES + 4) + view_blk[cell], 1.0f, lane);
+        uint8_t m = view_mob[cell];
+        int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+        for (int k = 0; k < 4; k++)
+            if (m & (1 << k)) ENC_ACC(hv, W_enc, fm + k, 1.0f, lane);
+    }
+#endif
+
+    int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
+    for (int j = 0; j < NUM_INVENTORY; j++, f++)
+        ENC_ACC(hv, W_enc, f, (float)g.inv[j*n+e] / 10.0f, lane);
+    float intr[4] = {
+        (float)g.health[e] / 10.0f, (float)g.food[e] / 10.0f,
+        (float)g.drink[e] / 10.0f, (float)g.energy[e] / 10.0f
+    };
+    for (int j = 0; j < 4; j++, f++) ENC_ACC(hv, W_enc, f, intr[j], lane);
+    for (int d = 1; d <= 4; d++, f++)
+        ENC_ACC(hv, W_enc, f, (g.player_dir[e] == d) ? 1.0f : 0.0f, lane);
+    ENC_ACC(hv, W_enc, f, g.light_level[e], lane); f++;
+    ENC_ACC(hv, W_enc, f, g.is_sleeping[e] ? 1.0f : 0.0f, lane);
+
+    ENC_STORE(h_enc, e, hv, lane);
+}
+
+// Encoder from stored compact obs records (backward recompute, loss).
+// One thread per (hidden unit k, sample w); sample w maps to
+// (t = t0 + w / mb, env offset env_start + w % mb). Output column w
+// (tight [HIDDEN][count]).
+// NOTE: this was a warp-cooperative kernel (warp per sample, ENC_ACC
+// float4 walk, ENC_STORE). Under nvcc 13.2 for sm_120 (-O3
+// --use_fast_math) that form miscompiled in a compilation-context-
+// dependent way: tail record reads returned values not present in the
+// record (garbage x for inventory/intrinsics/dir/light features) and
+// the last warp's float4 store was intermittently dropped. A bytewise
+// identical renamed clone in the same TU compiled fine. The live-env
+// encoder above (encode_env_warp_kernel) never showed the defect and
+// is hash-verified, so it is left alone. This thread-per-unit form
+// matches a float64 spec to float32 rounding on every column
+// (max|d| 1.63e-07 over all 512 gradcheck columns); do NOT "optimize"
+// it back to the warp-cooperative gather without re-running the
+// spec harness against /tmp/gcdump.
+extern "C" __global__ void encode_obs_kernel(
+    const uint8_t* __restrict__ r_obs,
+    const float* __restrict__ W_enc, const float* __restrict__ b_enc,
+    float* __restrict__ h_enc,
+    int t0, int count, int mb, int n, int env_start
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= HIDDEN * count) return;
+    int k = idx & (HIDDEN - 1);
+    int w = idx / HIDDEN;
+    int t = t0 + w / mb;
+    int el = w - (w / mb) * mb;
+    const uint8_t* obs = r_obs + ((size_t)t * n + env_start + el) * OBS_DIM_COMPACT;
+    const float* Wk = W_enc + k;
+
+    float hv = b_enc[k];
+    for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
+        hv = fmaf(1.0f, Wk[(size_t)(cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obs[cell]) * HIDDEN], hv);
+        uint8_t m = obs[OBS_MAP_CELLS + cell];
+        int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+        for (int j = 0; j < 4; j++)
+            if (m & (1 << j)) hv = fmaf(1.0f, Wk[(size_t)(fm + j) * HIDDEN], hv);
+    }
+    int oi = 2 * OBS_MAP_CELLS;
+    int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
+    for (int j = 0; j < NUM_INVENTORY + 4; j++, f++)
+        hv = fmaf((float)(int8_t)obs[oi++] / 10.0f, Wk[(size_t)f * HIDDEN], hv);
+    int8_t dir = (int8_t)obs[oi++];
+    for (int d = 1; d <= 4; d++, f++)
+        hv = fmaf((dir == d) ? 1.0f : 0.0f, Wk[(size_t)f * HIDDEN], hv);
+    uint8_t sleeping = obs[oi++];
+    float light;
+    memcpy(&light, obs + oi, sizeof(float));
+    hv = fmaf(light, Wk[(size_t)f * HIDDEN], hv); f++;
+    hv = fmaf(sleeping ? 1.0f : 0.0f, Wk[(size_t)f * HIDDEN], hv);
+
+    h_enc[(size_t)w * HIDDEN + k] = hv;
+}
+
+// ============================================================
+// MinGRU layer epilogue (elementwise, one thread per (unit, col)).
+// pre/x/state/h_out are col-major; HIDDEN is a power of two so the
+// (k, col) decode is a mask+shift. Semantics match the old scalar
+// nn_head exactly: state zeroed on prev_done (post-zero input is
+// what gets stored for BPTT), out = st + sg*(g(zh)-st),
+// h_out = p*out + (1-p)*x.
+// ============================================================
+extern "C" __global__ void mingru_epi_fwd_kernel(
+    const float* __restrict__ pre,     // [GRU_OUT][cols] col-major
+    const float* __restrict__ x,       // [HIDDEN][cols]
+    float* __restrict__ state,         // [HIDDEN][cols] live, in/out
+    float* __restrict__ h_out,         // [HIDDEN][cols]
+    float* __restrict__ r_state_store, // [HIDDEN][cols] post-zero inputs, or null
+    const int8_t* __restrict__ prev_dones,  // [cols] or null
+    int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= HIDDEN * cols) return;
+    int k = idx & (HIDDEN - 1);
+    int col = idx / HIDDEN;
+    size_t o = (size_t)col * HIDDEN + k;
+
+    float st = state[o];
+    if (prev_dones && prev_dones[col]) st = 0.0f;
+    if (r_state_store) r_state_store[o] = st;
+
+    size_t o3 = (size_t)col * GRU_OUT + k;
+    float zh = pre[o3];
+    float zg = pre[o3 + HIDDEN];
+    float zp = pre[o3 + 2 * HIDDEN];
+    float out = st + sigmoidf_(zg) * (mingru_g(zh) - st);
+    float p = sigmoidf_(zp);
+    float xv = x[o];
+    h_out[o] = p * out + (1.0f - p) * xv;
+    state[o] = out;
+}
+
+// Live-recurrence replay for the backward's forward-recompute and
+// loss(): launched once per (t, layer) over one step's columns. At a
+// BPTT segment start the state input is reloaded from the stored
+// slab (the truncation constant, matching the sweep's dcarry zeroing
+// at segment boundaries); inside a segment it carries live from the
+// previous step's out, zeroed on the done between the steps. The
+// stored-slab replay used previously severed the recurrence, so FD
+// probed a different function than the sweep differentiates. The
+// post-zero input state actually used is optionally recorded in
+// tight layout for the backward sweep.
+extern "C" __global__ void mingru_epi_replay_kernel(
+    const float* __restrict__ pre,       // [GRU_OUT][mb] this step
+    const float* __restrict__ x,         // [HIDDEN][mb] this step
+    const float* __restrict__ r_state_t, // stored slab at this (t, layer), k*n+el; segment start only, else null
+    float* __restrict__ live,            // [HIDDEN][mb] carry in/out
+    const int8_t* __restrict__ prev_dones, // dones between t-1 and t (+env offset); null at segment start
+    float* __restrict__ st_store,        // [HIDDEN][mb] tight st record for the sweep, or null
+    float* __restrict__ x_next,          // [HIDDEN][mb]
+    int n, int mb
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= HIDDEN * mb) return;
+    int k = idx & (HIDDEN - 1);
+    int el = idx / HIDDEN;
+    size_t o = (size_t)el * HIDDEN + k;
+
+    float st;
+    if (r_state_t) {
+        st = r_state_t[(size_t)k * n + el];
+    } else {
+        st = live[o];
+        if (prev_dones[el]) st = 0.0f;
+    }
+    if (st_store) st_store[o] = st;
+    size_t o3 = (size_t)el * GRU_OUT + k;
+    float zh = pre[o3];
+    float zg = pre[o3 + HIDDEN];
+    float zp = pre[o3 + 2 * HIDDEN];
+    float out = st + sigmoidf_(zg) * (mingru_g(zh) - st);
+    float p = sigmoidf_(zp);
+    x_next[o] = p * out + (1.0f - p) * x[o];
+    live[o] = out;
+}
+
+// ============================================================
+// Heads: value dot + categorical sample. One thread per env.
+// Sampler stream: Philox subsequence = env index, offset = *step_ctr
+// (device counter so CUDA graphs can replay with advancing offsets);
+// identical to the old split path's init(seed^A5A5.., e, step_count).
+// ============================================================
+extern "C" __global__ void value_sample_kernel(
+    const float* __restrict__ h_out,   // [HIDDEN][cols] col-major
+    const float* __restrict__ logits,  // [NUM_ACTIONS][cols] col-major
+    const float* __restrict__ b_a,
+    const float* __restrict__ W_v, const float* __restrict__ b_v,
+    int32_t* __restrict__ actions, float* __restrict__ logprobs,
+    float* __restrict__ values,
+    int cols, uint64_t seed, const uint64_t* __restrict__ step_ctr
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= cols) return;
+
+    const float* h = h_out + (size_t)e * HIDDEN;
+    float v = b_v[0];
+    for (int i = 0; i < HIDDEN; i++) v = fmaf(W_v[i], h[i], v);
+    values[e] = v;
+
+    float logits_e[NUM_ACTIONS];
+    const float* lp = logits + (size_t)e * NUM_ACTIONS;
+    for (int a = 0; a < NUM_ACTIONS; a++) logits_e[a] = lp[a] + b_a[a];
+
+    curandStatePhilox4_32_10_t sampler;
+    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, e, *step_ctr, &sampler);
+    float logp;
+    int action = sample_action(logits_e, curand_uniform(&sampler), &logp);
+    actions[e] = action;
+    logprobs[e] = logp;
+}
+
+// Value only (GAE bootstrap on the post-rollout state).
+extern "C" __global__ void value_dot_kernel(
+    const float* __restrict__ h_out, const float* __restrict__ W_v,
+    const float* __restrict__ b_v, float* __restrict__ v_out, int cols
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= cols) return;
+    const float* h = h_out + (size_t)e * HIDDEN;
+    float v = b_v[0];
+    for (int i = 0; i < HIDDEN; i++) v = fmaf(W_v[i], h[i], v);
+    v_out[e] = v;
+}
+
+// Record compact obs for the training record (rollout forward only).
+extern "C" __global__ void record_obs_kernel(
+    EnvSoA g, uint8_t* __restrict__ r_obs, int num_envs
+) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_envs) return;
-
     VIEW_DECL_GATHER(g, e);
     write_compact_obs(g, e, VIEW_ARGS, r_obs + (size_t)e * OBS_DIM_COMPACT);
-
-    float state[HIDDEN];
-    if (prev_dones && prev_dones[e]) {
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
-    } else {
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) state[i] = h_state[(size_t)i * num_envs + e];
-    }
-
-    float h_enc[HIDDEN], logits[NUM_ACTIONS], value, logprob;
-    fused_encoder(g, e, VIEW_ARGS, w, snn, h_enc);
-    nn_head(h_enc, state, snn, logits, value);
-
-    curandStatePhilox4_32_10_t sampler;
-    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, e, step_count, &sampler);
-    int action = sample_action(logits, curand_uniform(&sampler), &logprob);
-
-    r_act[e] = action; r_logprob[e] = logprob; r_value[e] = value;
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) h_state[(size_t)i * num_envs + e] = state[i];
 }
 
-// Dense reference forward: same math from the materialized 1345-float
-// obs, dense feature loop (no gather). Used only by `verify`.
-extern "C" __global__ void ref_forward_kernel(
-    Weights w, const float* __restrict__ obs, float* __restrict__ h_state,
+// Episode stats at dones, read before resets wipe achievement bits.
+extern "C" __global__ void ep_stats_kernel(
+    EnvSoA g, const int8_t* __restrict__ dones,
+    unsigned long long* __restrict__ ep_stats, int num_envs
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= num_envs || !dones[e]) return;
+    atomicAdd(&ep_stats[0], 1ULL);
+    uint32_t a = g.ach[e];
+    while (a) { int b = __ffs(a) - 1; a &= a - 1; atomicAdd(&ep_stats[1 + b], 1ULL); }
+}
+
+// reset_warp with the seed schedule computed from a device step
+// counter (graph-replayable): reset_seed = seed + (*ctr + 1) * 1e6,
+// matching the old host-side schedule exactly.
+extern "C" __global__ void reset_warp_ctr_kernel(
+    EnvSoA g, const int32_t* __restrict__ reset_list,
+    int32_t* __restrict__ reset_ctrl,
+    int num_envs, uint64_t seed, const uint64_t* __restrict__ step_ctr
+) {
+    __shared__ float angles[RESET_WARP_BLOCK / 32][WG_ANGLE_COUNT];
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    uint64_t reset_seed = seed + (*step_ctr + 1) * 1000000ULL;
+
+    for (;;) {
+        int i = 0;
+        if (lane == 0) i = atomicAdd(&reset_ctrl[1], 1);
+        i = __shfl_sync(0xFFFFFFFFu, i, 0);
+        if (i >= reset_ctrl[0]) return;
+        int e = reset_list[i];
+        generate_world_warp(g, e, reset_seed, e + num_envs, angles[warp_in_block]);
+    }
+}
+
+// Single-thread counter bump (graph node): step counter / adam step.
+extern "C" __global__ void bump_ctr_kernel(uint64_t* __restrict__ ctr) {
+    *ctr += 1;
+}
+
+// ============================================================
+// Scalar L=3 reference policy (verify only): one thread per env,
+// dense feature walk, strictly fp32 (no tensor cores). h[HIDDEN]
+// lives in local memory; use small env counts.
+// ============================================================
+extern "C" __global__ void ref_policy_l3_kernel(
+    EnvSoA g, Weights w, float* __restrict__ ref_state,  // [L][H][n]
     const int8_t* __restrict__ prev_dones,
     int32_t* __restrict__ r_act, float* __restrict__ r_logprob,
-    float* __restrict__ r_value,
-    int num_envs, uint64_t seed, uint64_t step_count
+    float* __restrict__ r_value, float* __restrict__ ref_h3,  // [H][n]
+    int num_envs, uint64_t seed, const uint64_t* __restrict__ step_ctr
 ) {
-    __shared__ NNShared snn;
-    load_nn_shared(snn, w);
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= num_envs) return;
+    VIEW_DECL_GATHER(g, e);
+    const int n = g.n;
 
-    const float* x = obs + (size_t)e * OBS_DIM;
-    float h_enc[HIDDEN];
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) h_enc[i] = snn.b_enc[i];
-    for (int f = 0; f < OBS_DIM; f++) {
-        float xf = x[f];
-        if (xf == 0.0f) continue;  // exact no-op terms
-        const float* col = w.W_enc + (size_t)f * HIDDEN;
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) h_enc[i] = fmaf(xf, col[i], h_enc[i]);
+    float h[HIDDEN], h2[HIDDEN];
+    for (int i = 0; i < HIDDEN; i++) h[i] = w.b_enc[i];
+#if VIEW_PACKED_LAYOUT
+    for (int r = 0; r < OBS_MAP_ROWS; r++) {
+        for (int c = 0; c < OBS_MAP_COLS; c++) {
+            int cell = r * OBS_MAP_COLS + c;
+            const float* col = w.W_enc +
+                (size_t)(cell * (NUM_BLOCK_TYPES + 4) + vp_blk(view, r, c)) * HIDDEN;
+            for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, col[i], h[i]);
+            int m = vp_mob(view, r, c);
+            int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+            for (int k = 0; k < 4; k++) {
+                if (m & (1 << k)) {
+                    const float* mc = w.W_enc + (size_t)(fm + k) * HIDDEN;
+                    for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, mc[i], h[i]);
+                }
+            }
+        }
     }
-
-    float state[HIDDEN];
-    if (prev_dones && prev_dones[e]) {
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
-    } else {
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) state[i] = h_state[(size_t)i * num_envs + e];
-    }
-    float logits[NUM_ACTIONS], value, logprob;
-    nn_head(h_enc, state, snn, logits, value);
-
-    curandStatePhilox4_32_10_t sampler;
-    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, e, step_count, &sampler);
-    int action = sample_action(logits, curand_uniform(&sampler), &logprob);
-
-    r_act[e] = action; r_logprob[e] = logprob; r_value[e] = value;
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) h_state[(size_t)i * num_envs + e] = state[i];
-}
-
-
-// ============================================================
-// Training: PPO backward + Adam, entirely on device.
-//
-// Parameters live in ONE flat arena so gradients, Adam moments,
-// and finite-difference perturbation all index the same layout.
-// The order must match how main.cu carves Weights from the arena.
-// ============================================================
-#define PARAM_W_ENC 0
-#define PARAM_B_ENC (OBS_DIM * HIDDEN)
-#define PARAM_W_GRU (PARAM_B_ENC + HIDDEN)
-#define PARAM_W_A   (PARAM_W_GRU + GRU_OUT * HIDDEN)
-#define PARAM_B_A   (PARAM_W_A + NUM_ACTIONS * HIDDEN)
-#define PARAM_W_V   (PARAM_B_A + NUM_ACTIONS)
-#define PARAM_B_V   (PARAM_W_V + HIDDEN)
-#define PARAM_COUNT (PARAM_B_V + 1)
-
-// Encoder forward from a stored compact obs (the env has moved on by
-// training time). Feature order and fmaf order match fused_encoder /
-// expand_obs_kernel exactly, so h_enc is bit-identical to the value
-// the rollout computed.
-__device__ void encoder_from_compact(
-    const uint8_t* __restrict__ obs, const Weights& w, const NNShared& s,
-    float* h  // h[HIDDEN]
-) {
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) h[i] = s.b_enc[i];
-
+#else
     for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
-        int f = cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obs[cell];
-        const float* col = w.W_enc + (size_t)f * HIDDEN;
-        #pragma unroll
+        const float* col = w.W_enc +
+            (size_t)(cell * (NUM_BLOCK_TYPES + 4) + view_blk[cell]) * HIDDEN;
         for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, col[i], h[i]);
-        uint8_t m = obs[OBS_MAP_CELLS + cell];
+        uint8_t m = view_mob[cell];
         int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
         for (int k = 0; k < 4; k++) {
             if (m & (1 << k)) {
                 const float* mc = w.W_enc + (size_t)(fm + k) * HIDDEN;
-                #pragma unroll
                 for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(1.0f, mc[i], h[i]);
             }
         }
     }
-
-    int idx = 2 * OBS_MAP_CELLS;
+#endif
     int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
-    for (int j = 0; j < NUM_INVENTORY + 4; j++, f++) {
-        float x = (float)(int8_t)obs[idx++] / 10.0f;
+    for (int j = 0; j < NUM_INVENTORY; j++, f++) {
+        float x = (float)g.inv[j*n+e] / 10.0f;
         const float* col = w.W_enc + (size_t)f * HIDDEN;
-        #pragma unroll
         for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
     }
-    int8_t dir = (int8_t)obs[idx++];
+    float intr[4] = {
+        (float)g.health[e] / 10.0f, (float)g.food[e] / 10.0f,
+        (float)g.drink[e] / 10.0f, (float)g.energy[e] / 10.0f
+    };
+    for (int j = 0; j < 4; j++, f++) {
+        const float* col = w.W_enc + (size_t)f * HIDDEN;
+        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(intr[j], col[i], h[i]);
+    }
     for (int d = 1; d <= 4; d++, f++) {
-        float x = (dir == d) ? 1.0f : 0.0f;
+        float x = (g.player_dir[e] == d) ? 1.0f : 0.0f;
         const float* col = w.W_enc + (size_t)f * HIDDEN;
-        #pragma unroll
         for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
     }
-    uint8_t sleeping = obs[idx++];
-    float light;
-    memcpy(&light, obs + idx, sizeof(float));
     {
         const float* col = w.W_enc + (size_t)f * HIDDEN; f++;
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(light, col[i], h[i]);
+        for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(g.light_level[e], col[i], h[i]);
     }
     {
         const float* col = w.W_enc + (size_t)f * HIDDEN;
-        float x = sleeping ? 1.0f : 0.0f;
-        #pragma unroll
+        float x = g.is_sleeping[e] ? 1.0f : 0.0f;
         for (int i = 0; i < HIDDEN; i++) h[i] = fmaf(x, col[i], h[i]);
     }
-}
 
-// Value of the current (post-rollout) env state: V(s_T) for the GAE
-// bootstrap. Envs that finished on the last step get masked by
-// (1 - done) in the GAE scan, so their (reset-state) value is unused.
-extern "C" __global__ void bootstrap_value_kernel(
-    EnvSoA g, Weights w, const float* __restrict__ h_state,
-    const int8_t* __restrict__ last_dones, float* __restrict__ v_boot,
-    int num_envs
-) {
-    __shared__ NNShared snn;
-    load_nn_shared(snn, w);
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_envs) return;
-
-    VIEW_DECL_GATHER(g, e);
-    float h_enc[HIDDEN], state[HIDDEN];
-    fused_encoder(g, e, VIEW_ARGS, w, snn, h_enc);
-    if (last_dones[e]) {
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
-    } else {
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) state[i] = h_state[(size_t)i * num_envs + e];
+    for (int l = 0; l < GRU_LAYERS; l++) {
+        const float* Wl = w.W_gru + (size_t)l * GRU_OUT * HIDDEN;
+        bool dz = prev_dones && prev_dones[e];
+        for (int k = 0; k < HIDDEN; k++) {
+            float st = dz ? 0.0f : ref_state[((size_t)l * HIDDEN + k) * n + e];
+            float zh = 0.0f, zg = 0.0f, zp = 0.0f;
+            for (int j = 0; j < HIDDEN; j++) {
+                zh = fmaf(Wl[k * HIDDEN + j], h[j], zh);
+                zg = fmaf(Wl[(HIDDEN + k) * HIDDEN + j], h[j], zg);
+                zp = fmaf(Wl[(2 * HIDDEN + k) * HIDDEN + j], h[j], zp);
+            }
+            float out = st + sigmoidf_(zg) * (mingru_g(zh) - st);
+            float p = sigmoidf_(zp);
+            h2[k] = p * out + (1.0f - p) * h[k];
+            ref_state[((size_t)l * HIDDEN + k) * n + e] = out;
+        }
+        for (int i = 0; i < HIDDEN; i++) h[i] = h2[i];
     }
-    float logits[NUM_ACTIONS], value;
-    nn_head(h_enc, state, snn, logits, value);
-    v_boot[e] = value;
+    for (int i = 0; i < HIDDEN; i++) ref_h3[e * HIDDEN + i] = h[i];  // col-major [H][n]
+
+    float logits[NUM_ACTIONS];
+    for (int a = 0; a < NUM_ACTIONS; a++) {
+        float z = w.b_a[a];
+        for (int j = 0; j < HIDDEN; j++) z = fmaf(w.W_a[a * HIDDEN + j], h[j], z);
+        logits[a] = z;
+    }
+    float value = w.b_v[0];
+    for (int j = 0; j < HIDDEN; j++) value = fmaf(w.W_v[j], h[j], value);
+
+    curandStatePhilox4_32_10_t sampler;
+    curand_init(seed ^ 0xA5A5A5A5A5A5A5A5ULL, e, *step_ctr, &sampler);
+    float logp;
+    r_act[e] = sample_action(logits, curand_uniform(&sampler), &logp);
+    r_logprob[e] = logp;
+    r_value[e] = value;
+}
+// ============================================================
+// Training: PPO with a batched-GEMM backward, entirely on device.
+//
+// The rollout stores only r_obs (148 B/sample), r_state (per-layer
+// post-zero state inputs, 3 KB/sample) and the small scalars. Each
+// minibatch recomputes the forward at the current theta from r_obs
+// with live recurrence inside each BPTT segment (stored r_state used
+// only as the constant at segment starts -- the truncation point
+// where the sweep zeroes dcarry), then:
+//   - head grads per sample (head_bwd_kernel)
+//   - dh chain up the layers via cuBLAS (W^T @ dpre GEMMs)
+//   - per-layer backward sweeps, thread per (unit, env), dcarry as
+//     the only sequential part (mingru_sweep_bwd_kernel)
+//   - weight grads as flat GEMMs over samples k = T*mb:
+//       dW_l = dpre_l @ x_l^T (beta=1 accumulation)
+//   - dW_enc as a thread-per-(unit, sample) sparse scatter (enc_bwd_kernel)
+// dpre aliases pre (each sweep element is read before written).
+// ============================================================
+
+// Head gradients for one sample column. Computes softmax policy
+// loss (clipped ratio), entropy bonus and value loss grads exactly
+// as the old ppo_backward did, writing dlogits (tight
+// [NUM_ACTIONS][T*mb]) and dvalue ([T*mb]) for the GEMM chain.
+// Optional loss_acc adds raw (unnormalized) sums for logging.
+extern "C" __global__ void head_bwd_kernel(
+    const float* __restrict__ logits,   // tight [NUM_ACTIONS][T*mb]
+    const float* __restrict__ h_out,    // tight [HIDDEN][T*mb]
+    const float* __restrict__ b_a,
+    const float* __restrict__ W_v, const float* __restrict__ b_v,
+    const int32_t* __restrict__ r_act,      // slab + env_start
+    const float* __restrict__ r_logprob,    // slab + env_start
+    const float* __restrict__ adv, const float* __restrict__ ret,  // slab + env_start
+    const double* __restrict__ adv_stats,
+    float* __restrict__ dlogits,        // tight [NUM_ACTIONS][T*mb]
+    float* __restrict__ dvalue,         // [T*mb]
+    double* __restrict__ loss_acc,      // [3] pg/v/ent raw sums, or null
+    int T, int mb, int n,
+    float clip_eps, float vf_coef, float ent_coef
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int cols = T * mb;
+    if (c >= cols) return;
+    int t = c / mb;
+    size_t o = (size_t)t * n + (c - t * mb);
+
+    double inv_count = 1.0 / ((double)n * (double)T);
+    float adv_mean = (float)(adv_stats[0] * inv_count);
+    double m = adv_stats[0] * inv_count;
+    double var = adv_stats[1] * inv_count - m * m;
+    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+    float inv_batch = 1.0f / (float)cols;
+
+    const float* lp = logits + (size_t)c * NUM_ACTIONS;
+    float lg[NUM_ACTIONS], pi[NUM_ACTIONS];
+    float mx = -1e30f;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) {
+        lg[a] = lp[a] + b_a[a];
+        mx = fmaxf(mx, lg[a]);
+    }
+    float total = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) { pi[a] = expf(lg[a] - mx); total += pi[a]; }
+    float inv_total = 1.0f / total;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) pi[a] *= inv_total;
+    float lse = mx + logf(total);
+
+    int act = r_act[o];
+    float logp_new = lg[act] - lse;
+    float ratio = expf(logp_new - r_logprob[o]);
+    float A = (adv[o] - adv_mean) * adv_inv_std;
+    float u1 = ratio * A;
+    float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+    float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
+    float H = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) H -= pi[a] * (lg[a] - lse);
+
+    const float* h3 = h_out + (size_t)c * HIDDEN;
+    float v = b_v[0];
+    #pragma unroll 4
+    for (int j = 0; j < HIDDEN; j++) v = fmaf(W_v[j], h3[j], v);
+    float dv = inv_batch * vf_coef * (v - ret[o]);
+    dvalue[c] = dv;
+
+    float* dq = dlogits + (size_t)c * NUM_ACTIONS;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) {
+        float d = dlogp * ((a == act ? 1.0f : 0.0f) - pi[a]);
+        d += ent_coef * pi[a] * ((lg[a] - lse) + H);
+        dq[a] = d * inv_batch;
+    }
+
+    if (loss_acc) {
+        __shared__ double s_pg, s_v, s_e;
+        if (threadIdx.x == 0) { s_pg = 0.0; s_v = 0.0; s_e = 0.0; }
+        __syncthreads();
+        atomicAdd(&s_pg, -fminf(u1, u2));
+        float ve = 0.5f * (v - ret[o]) * (v - ret[o]);
+        atomicAdd(&s_v, ve);
+        atomicAdd(&s_e, H);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            atomicAdd(&loss_acc[0], s_pg);
+            atomicAdd(&loss_acc[1], s_v);
+            atomicAdd(&loss_acc[2], s_e);
+        }
+    }
 }
 
+// dh_out after the heads: dh3 = W_a^T @ dlogits (cuBLAS) plus the
+// value-head contribution dv * W_v, added here with one add per elt.
+extern "C" __global__ void add_dv_wv_kernel(
+    float* __restrict__ dh,            // [HIDDEN][T*mb]
+    const float* __restrict__ dv,      // [T*mb]
+    const float* __restrict__ W_v,
+    int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= HIDDEN * cols) return;
+    int k = idx & (HIDDEN - 1);
+    int col = idx / HIDDEN;
+    dh[idx] += dv[col] * W_v[k];
+}
+
+// Backward sweep for one MinGRU layer over one minibatch. Thread per
+// (unit k, env el), descending t with the scalar dcarry; everything
+// else is column-parallel. bptt-split truncation = dcarry zeroed at
+// each segment boundary. dhGEMM carries W_{l+1}^T @ dpre_{l+1} (or the
+// head-side dh for the top layer), dhExtra the highway term from the
+// layer above ({1-p} * dhout), st_used the post-zero input states the
+// live replay actually consumed (tight layout, recorded by
+// mingru_epi_replay_kernel). dpre aliases pre in place (read before
+// write per element).
+extern "C" __global__ void mingru_sweep_bwd_kernel(
+    const float* __restrict__ pre,      // tight [GRU_OUT][T*mb] (aliased out)
+    const float* __restrict__ x,        // tight [HIDDEN][T*mb] layer input
+    const float* __restrict__ dhGEMM,   // tight [HIDDEN][T*mb]
+    const float* __restrict__ dhExtra,  // tight [HIDDEN][T*mb] or null
+    const float* __restrict__ st_used,  // tight [HIDDEN][T*mb] post-zero input states from replay
+    const int8_t* __restrict__ r_done,  // slab base + env_start
+    float* __restrict__ dpre,           // tight [GRU_OUT][T*mb] (may alias pre)
+    float* __restrict__ dhExtraOut,     // tight [HIDDEN][T*mb] or null
+    int T, int mb, int n, int seg_len
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= HIDDEN * mb) return;
+    int k = idx & (HIDDEN - 1);
+    int el = idx / HIDDEN;
+
+    float dcarry = 0.0f;
+    for (int t = T - 1; t >= 0; t--) {
+        if (t == T - 1 || ((t + 1) % seg_len) == 0) dcarry = 0.0f;
+        size_t col = (size_t)t * mb + el;
+        size_t o3 = col * GRU_OUT + k;
+        size_t o = col * HIDDEN + k;
+        float zh = pre[o3];
+        float zg = pre[o3 + HIDDEN];
+        float zp = pre[o3 + 2 * HIDDEN];
+        float dhout = dhGEMM[o];
+        if (dhExtra) dhout += dhExtra[o];
+        float s_in = st_used[o];
+        float xv = x[o];
+        bool done_t = r_done[(size_t)t * n + el] != 0;
+
+        float sg = sigmoidf_(zg);
+        float gh = mingru_g(zh);
+        float p = sigmoidf_(zp);
+        float out_k = s_in + sg * (gh - s_in);
+        float dout = dhout * p + (done_t ? 0.0f : dcarry);
+        float dp_ = dhout * (out_k - xv);
+        dpre[o3 + 2 * HIDDEN] = dp_ * p * (1.0f - p);
+        if (dhExtraOut) dhExtraOut[o] = dhout * (1.0f - p);
+        dcarry = dout * (1.0f - sg);
+        float dsg = dout * (gh - s_in);
+        dpre[o3 + HIDDEN] = dsg * sg * (1.0f - sg);
+        dpre[o3] = dout * sg * dg_mingru(zh);
+    }
+}
+
+// Sparse encoder backward: one thread per (hidden unit k, sample
+// column w), scalar atomicAdds into dW_enc row entries and db_enc.
+// Was warp-cooperative with an ENC_ACC_BWD macro mirrored after the
+// old warp encoder; that pattern hit the same sm_120 nvcc 13.2
+// miscompile as encode_obs_warp_kernel (inventory-region byte reads
+// returned garbage, fd-vs-analytic showed bogus dW_enc row 1325).
+// Thread-per-unit matches the fixed encode_obs_kernel walk; do NOT
+// re-warp-cooperatize without re-running the spec harness and
+// gradcheck.
+extern "C" __global__ void enc_bwd_kernel(
+    const uint8_t* __restrict__ r_obs,
+    const float* __restrict__ dhGEMM,   // W_1^T @ dpre_1, tight [HIDDEN][T*mb]
+    const float* __restrict__ dhExtra,  // highway term from layer 1, tight, or null
+    float* __restrict__ dW_enc,         // [OBS_DIM][HIDDEN] row-major
+    float* __restrict__ db_enc,
+    int T, int mb, int n, int env_start
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= HIDDEN * T * mb) return;
+    int k = idx & (HIDDEN - 1);
+    int w = idx / HIDDEN;
+    int t = w / mb;
+    int el = w - t * mb;
+    const uint8_t* obs = r_obs + ((size_t)t * n + env_start + el) * OBS_DIM_COMPACT;
+
+    size_t o = (size_t)w * HIDDEN + k;
+    float dh = dhGEMM[o];
+    if (dhExtra) dh += dhExtra[o];
+    atomicAdd(&db_enc[k], dh);
+
+#define ENC_ACC_BWD(f_, x_) atomicAdd(&dW_enc[(size_t)(f_) * HIDDEN + k], dh * (x_))
+
+    for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
+        ENC_ACC_BWD(cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obs[cell], 1.0f);
+        uint8_t mm = obs[OBS_MAP_CELLS + cell];
+        int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
+        for (int j = 0; j < 4; j++)
+            if (mm & (1 << j)) ENC_ACC_BWD(fm + j, 1.0f);
+    }
+    int idx2 = 2 * OBS_MAP_CELLS;
+    int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
+    for (int j = 0; j < NUM_INVENTORY + 4; j++, f++)
+        ENC_ACC_BWD(f, (float)(int8_t)obs[idx2++] / 10.0f);
+    int8_t dir = (int8_t)obs[idx2++];
+    for (int d = 1; d <= 4; d++, f++) ENC_ACC_BWD(f, (dir == d) ? 1.0f : 0.0f);
+    uint8_t sleeping = obs[idx2++];
+    float light;
+    memcpy(&light, obs + idx2, sizeof(float));
+    ENC_ACC_BWD(f, light); f++;
+    ENC_ACC_BWD(f, sleeping ? 1.0f : 0.0f);
+#undef ENC_ACC_BWD
+}
+
+// Column sums of a [rows][cols] col-major matrix, accumulated into
+// out (one block per row). Used for db_a (17 cols... rows) and db_v.
+extern "C" __global__ void colsum_kernel(
+    const float* __restrict__ M, float* __restrict__ out, int rows, int cols
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    __shared__ float red[128];
+    float acc = 0.0f;
+    const float* col = M + r;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        acc += col[(size_t)c * rows];
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(&out[r], red[0]);
+}
+
+// Loss accumulation over one step of a full-batch loss evaluation.
+// logits_t/h3_t are the tight per-step buffers ([NUM_ACTIONS][n] and
+// [HIDDEN][n]); r_* are the full rollout slabs. Adds raw sums into
+// loss_acc[3] (pg, v, ent), host divides by n*T_total. Matches the
+// old ppo_loss math (same stats source, same per-term formulas).
+extern "C" __global__ void loss_accum_kernel(
+    const float* __restrict__ logits_t,  // tight [NUM_ACTIONS][n]
+    const float* __restrict__ h3_t,      // tight [HIDDEN][n]
+    const float* __restrict__ b_a,
+    const float* __restrict__ W_v, const float* __restrict__ b_v,
+    const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob,
+    const float* __restrict__ adv, const float* __restrict__ ret,
+    const double* __restrict__ adv_stats,
+    double* __restrict__ loss_acc,       // [3] pg/v/ent raw sums
+    int t, int n, int T_total,
+    float clip_eps
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n) return;
+    size_t o = (size_t)t * n + e;
+
+    double inv_count = 1.0 / ((double)n * (double)T_total);
+    float amean = (float)(adv_stats[0] * inv_count);
+    double m = adv_stats[0] * inv_count;
+    double var = adv_stats[1] * inv_count - m * m;
+    float ainv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+
+    const float* lp = logits_t + (size_t)e * NUM_ACTIONS;
+    float lg[NUM_ACTIONS], pi[NUM_ACTIONS];
+    float mx = -1e30f;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) {
+        lg[a] = lp[a] + b_a[a];
+        mx = fmaxf(mx, lg[a]);
+    }
+    float total = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) { pi[a] = expf(lg[a] - mx); total += pi[a]; }
+    float inv_total = 1.0f / total;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) pi[a] *= inv_total;
+    float lse = mx + logf(total);
+
+    float A = (adv[o] - amean) * ainv_std;
+    float ratio = expf((lg[r_act[o]] - lse) - r_logprob[o]);
+    float u1 = ratio * A;
+    float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+
+    const float* h3 = h3_t + (size_t)e * HIDDEN;
+    float v = b_v[0];
+    #pragma unroll 4
+    for (int j = 0; j < HIDDEN; j++) v = fmaf(W_v[j], h3[j], v);
+
+    float H = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < NUM_ACTIONS; a++) H -= pi[a] * (lg[a] - lse);
+
+    __shared__ double s_pg, s_v, s_e;
+    if (threadIdx.x == 0) { s_pg = 0.0; s_v = 0.0; s_e = 0.0; }
+    __syncthreads();
+    atomicAdd(&s_pg, -fminf(u1, u2));
+    float ve = 0.5f * (v - ret[o]) * (v - ret[o]);
+    atomicAdd(&s_v, ve);
+    atomicAdd(&s_e, H);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        atomicAdd(&loss_acc[0], s_pg);
+        atomicAdd(&loss_acc[1], s_v);
+        atomicAdd(&loss_acc[2], s_e);
+    }
+}
 // GAE scan, one thread per env, t = T-1 .. 0.
 extern "C" __global__ void gae_kernel(
     const float* __restrict__ values, const float* __restrict__ rewards,
@@ -2077,398 +2419,21 @@ extern "C" __global__ void adv_stats_kernel(
         atomicAdd(&stats[1], s_sq[0]);
     }
 }
-
-__device__ __forceinline__ float dg_mingru(float x) {  // d/dx of mingru_g
-    if (x >= 0.0f) return 1.0f;
-    float s = sigmoidf_(x);
-    return s * (1.0f - s);
-}
-
-// PPO loss on stored rollout data (actions/old-logprobs/adv/ret fixed),
-// recomputing the recurrent forward from the stored initial state so
-// the loss is a pure function of the parameters. Double accumulators:
-// this is the reference for finite-difference gradient checking.
-// losses[0] += policy loss, [1] += 0.5*(v-ret)^2, [2] += entropy
-// (all sums; host divides by n*T and applies coefficients).
-extern "C" __global__ void ppo_loss_kernel(
-    Weights w,
-    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
-    const float* __restrict__ r_logprob, const int8_t* __restrict__ r_done,
-    const float* __restrict__ r_state0,  // [HIDDEN][n] state input at t=0
-    const float* __restrict__ adv, const float* __restrict__ ret,
-    double* __restrict__ losses,
-    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the batch
-    int num_envs, int T, float clip_eps
-) {
-    __shared__ NNShared snn;
-    load_nn_shared(snn, w);
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= num_envs) return;
-
-    double inv_count = 1.0 / ((double)num_envs * T);
-    float adv_mean = (float)(adv_stats[0] * inv_count);
-    double var = adv_stats[1] * inv_count - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
-    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
-
-    float state[HIDDEN];
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) state[i] = r_state0[(size_t)i * num_envs + e];
-
-    double pg_sum = 0.0, v_sum = 0.0, ent_sum = 0.0;
-    for (int t = 0; t < T; t++) {
-        size_t o = (size_t)t * num_envs + e;
-        if (t > 0 && r_done[o - num_envs]) {
-            #pragma unroll
-            for (int i = 0; i < HIDDEN; i++) state[i] = 0.0f;
-        }
-        float h_enc[HIDDEN], logits[NUM_ACTIONS], value;
-        encoder_from_compact(r_obs + o * OBS_DIM_COMPACT, w, snn, h_enc);
-        nn_head(h_enc, state, snn, logits, value);
-
-        float mx = logits[0];
-        for (int a = 1; a < NUM_ACTIONS; a++) mx = fmaxf(mx, logits[a]);
-        float total = 0.0f;
-        for (int a = 0; a < NUM_ACTIONS; a++) total += expf(logits[a] - mx);
-        float lse = mx + logf(total);
-
-        float logp_new = logits[r_act[o]] - lse;
-        float ratio = expf(logp_new - r_logprob[o]);
-        float A = (adv[o] - adv_mean) * adv_inv_std;
-        float u1 = ratio * A;
-        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
-        pg_sum += -fminf(u1, u2);
-
-        float dv = value - ret[o];
-        v_sum += 0.5 * (double)dv * (double)dv;
-
-        float H = 0.0f;
-        for (int a = 0; a < NUM_ACTIONS; a++) {
-            float lp = logits[a] - lse;
-            H -= expf(lp) * lp;
-        }
-        ent_sum += H;
-    }
-    atomicAdd(&losses[0], pg_sum);
-    atomicAdd(&losses[1], v_sum);
-    atomicAdd(&losses[2], ent_sum);
-}
-
-// PPO backward: one thread per env walks its trajectory t = T-1 .. 0,
-// recomputing the forward at each step from the stored compact obs and
-// stored per-step recurrent state (bit-identical to the rollout), then
-// backpropagating through heads, MinGRU (BPTT across the horizon, cut
-// at done boundaries), and the encoder. Encoder backward is a
-// scatter-add into the ~70 active feature columns per sample; the
-// dense 1345-float obs never exists.
-//
-// Dense grads (b_enc, W_gru, heads) are shuffle-reduced across the
-// warp so only lane 0 issues one atomicAdd per element (32x fewer
-// atomics); the sparse W_enc scatter stays per-lane. Both go into a
-// per-block global copy (grads + (blockIdx.x % grad_copies) *
-// PARAM_COUNT); adam_kernel reduces the copies. Out-of-range threads
-// run the whole loop with e clamped and zeroed gradients so warps
-// stay converged at the shuffles. loss_acc[0..2] accumulates
-// pg/v/ent sums (fp32, logging only).
-//
-// Minibatching: [env_start, env_start+env_count) selects a contiguous
-// env range; the loss mean is over that range while advantage
-// normalization keeps full-batch stats. env_start=0,
-// env_count=num_envs reproduces the full-batch update.
-//
-// BPTT thread-split (bptt_split = S > 1): each env's trajectory is cut
-// into S contiguous segments of T/S steps processed by S different
-// threads (thread et covers env et % env_count, segment et / env_count;
-// each segment's entry recurrent state is already stored per step in
-// r_state). dstate entering a segment from above is taken as zero, i.e.
-// gradient flow through the MinGRU state is TRUNCATED at segment
-// boundaries (standard truncated-BPTT; exact at boundaries that
-// coincide with dones, and for the last segment). S=1 is the exact
-// full-horizon backward. Requires T % S == 0 and env_count % 32 == 0
-// (warp scatter walks 32 consecutive envs at one t).
-__device__ __forceinline__ float warp_sum(float v) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
-    return v;
-}
-
-extern "C" __global__ void ppo_backward_kernel(
-    Weights w,
-    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
-    const float* __restrict__ r_logprob, const int8_t* __restrict__ r_done,
-    const float* __restrict__ r_state,   // [T][HIDDEN][n]
-    const float* __restrict__ adv, const float* __restrict__ ret,
-    float* __restrict__ grads, int grad_copies,
-    float* __restrict__ loss_acc,        // [3] or nullptr
-    const double* __restrict__ adv_stats,  // [2] sum, sumsq over the FULL batch
-    int num_envs, int T,
-    int env_start, int env_count,  // minibatch = contiguous env range
-    int bptt_split,                // S segments per env (1 = exact)
-    float clip_eps, float vf_coef, float ent_coef
-) {
-    __shared__ NNShared snn;
-    // W_enc scatter staging: fixed 32-wide hidden tile per pass (a full
-    // [32][HIDDEN+1] stage is 132KB at hidden 128 -- over sm_86's smem
-    // budget), +1 pad: bank-conflict-free. HIDDEN > 32 builds loop the
-    // scatter over HIDDEN/32 tiles.
-    __shared__ float sdh_all[256 / 32][32][32 + 1];
-    load_nn_shared(snn, w);
-    int lane = threadIdx.x & 31;
-    int et = blockIdx.x * blockDim.x + threadIdx.x;
-    bool active = et < env_count * bptt_split;
-    // clamp: inactive lanes run zeroed (env_count % 32 == 0 keeps every
-    // warp inside one segment, so warps stay converged at the shuffles)
-    if (!active) et = env_count * bptt_split - 1;
-    int seg = et / env_count;
-    int ei = et % env_count;
-    int e = env_start + ei;
-    int seg_len = T / bptt_split;
-    int t_lo = seg * seg_len;
-    int t_hi = t_lo + seg_len;
-
-    float* gr = grads + (size_t)(blockIdx.x % grad_copies) * PARAM_COUNT;
-
-    // Advantage normalization always uses full-batch stats; the loss
-    // mean is over the minibatch (env_count * T samples).
-    double inv_count = 1.0 / ((double)num_envs * T);
-    float inv_batch = (float)(1.0 / ((double)env_count * T));
-    float adv_mean = (float)(adv_stats[0] * inv_count);
-    double var = adv_stats[1] * inv_count - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
-    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
-
-    float dstate[HIDDEN];  // dL/d(state output of step t), carried backward
-    #pragma unroll
-    for (int i = 0; i < HIDDEN; i++) dstate[i] = 0.0f;
-
-    float pg_sum = 0.0f, v_sum = 0.0f, ent_sum = 0.0f;
-
-    for (int t = t_hi - 1; t >= t_lo; t--) {
-        size_t o = (size_t)t * num_envs + e;
-        const uint8_t* obs = r_obs + o * OBS_DIM_COMPACT;
-
-        // ---- Recompute forward at step t ----
-        float h_enc[HIDDEN], s_in[HIDDEN];
-        encoder_from_compact(obs, w, snn, h_enc);
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++)
-            s_in[i] = r_state[((size_t)t * HIDDEN + i) * num_envs + e];
-
-        float hout[HIDDEN];
-        #pragma unroll
-        for (int k = 0; k < HIDDEN; k++) {
-            float ah = 0.0f, ag = 0.0f, ap = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < HIDDEN; j++) {
-                ah = fmaf(snn.W_gru[k * HIDDEN + j], h_enc[j], ah);
-                ag = fmaf(snn.W_gru[(HIDDEN + k) * HIDDEN + j], h_enc[j], ag);
-                ap = fmaf(snn.W_gru[(2 * HIDDEN + k) * HIDDEN + j], h_enc[j], ap);
-            }
-            float sg = sigmoidf_(ag);
-            float o_k = s_in[k] + sg * (mingru_g(ah) - s_in[k]);
-            float p = sigmoidf_(ap);
-            hout[k] = p * o_k + (1.0f - p) * h_enc[k];
-        }
-
-        float logits[NUM_ACTIONS], value;
-        for (int a = 0; a < NUM_ACTIONS; a++) {
-            float z = snn.b_a[a];
-            #pragma unroll
-            for (int j = 0; j < HIDDEN; j++) z = fmaf(snn.W_a[a * HIDDEN + j], hout[j], z);
-            logits[a] = z;
-        }
-        {
-            float z = snn.b_v;
-            #pragma unroll
-            for (int j = 0; j < HIDDEN; j++) z = fmaf(snn.W_v[j], hout[j], z);
-            value = z;
-        }
-
-        // ---- Loss gradients at the heads ----
-        float mx = logits[0];
-        for (int a = 1; a < NUM_ACTIONS; a++) mx = fmaxf(mx, logits[a]);
-        float total = 0.0f, pi[NUM_ACTIONS];
-        for (int a = 0; a < NUM_ACTIONS; a++) { pi[a] = expf(logits[a] - mx); total += pi[a]; }
-        float inv_total = 1.0f / total;
-        for (int a = 0; a < NUM_ACTIONS; a++) pi[a] *= inv_total;
-        float lse = mx + logf(total);
-
-        int act = r_act[o];
-        float logp_new = logits[act] - lse;
-        float ratio = expf(logp_new - r_logprob[o]);
-        float A = (adv[o] - adv_mean) * adv_inv_std;
-        float u1 = ratio * A;
-        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
-        // d(-min(u1,u2))/dlogp_new: if min picks u1, -A*ratio; else the
-        // clamp is active (u2 < u1 requires ratio outside the clip
-        // window) and the gradient is blocked.
-        float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
-
-        float H = 0.0f;
-        for (int a = 0; a < NUM_ACTIONS; a++) {
-            float lp = logits[a] - lse;
-            H -= pi[a] * lp;
-        }
-
-        float dvalue = inv_batch * vf_coef * (value - ret[o]);
-        float dlogits[NUM_ACTIONS];
-        for (int a = 0; a < NUM_ACTIONS; a++) {
-            float d = dlogp * (((a == act) ? 1.0f : 0.0f) - pi[a]);  // policy term
-            d += ent_coef * pi[a] * ((logits[a] - lse) + H);         // d(-ent_coef*H)
-            dlogits[a] = d * inv_batch;
-        }
-        if (!active) {
-            dvalue = 0.0f;
-            for (int a = 0; a < NUM_ACTIONS; a++) dlogits[a] = 0.0f;
-        }
-
-        if (active) {
-            pg_sum += -fminf(u1, u2);
-            v_sum += 0.5f * (value - ret[o]) * (value - ret[o]);
-            ent_sum += H;
-        }
-
-        // ---- Heads backward ----
-        float dhout[HIDDEN];
-        #pragma unroll
-        for (int j = 0; j < HIDDEN; j++) dhout[j] = dvalue * snn.W_v[j];
-        for (int a = 0; a < NUM_ACTIONS; a++) {
-            float da = dlogits[a];
-            #pragma unroll
-            for (int j = 0; j < HIDDEN; j++) {
-                dhout[j] = fmaf(da, snn.W_a[a * HIDDEN + j], dhout[j]);
-                float g = warp_sum(da * hout[j]);
-                if (lane == 0) atomicAdd(&gr[PARAM_W_A + a * HIDDEN + j], g);
-            }
-            float gb = warp_sum(da);
-            if (lane == 0) atomicAdd(&gr[PARAM_B_A + a], gb);
-        }
-        #pragma unroll
-        for (int j = 0; j < HIDDEN; j++) {
-            float g = warp_sum(dvalue * hout[j]);
-            if (lane == 0) atomicAdd(&gr[PARAM_W_V + j], g);
-        }
-        {
-            float g = warp_sum(dvalue);
-            if (lane == 0) atomicAdd(&gr[PARAM_B_V], g);
-        }
-
-        // ---- MinGRU backward ----
-        bool done_t = r_done[o] != 0;  // done at t: step t+1's state input was zeroed
-        float dh_enc[HIDDEN];
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) dh_enc[i] = 0.0f;
-
-        #pragma unroll
-        for (int k = 0; k < HIDDEN; k++) {
-            // Recompute this unit's pre-activations (cheaper than
-            // carrying zh/zg/zp/out across the heads backward).
-            float ah = 0.0f, ag = 0.0f, ap = 0.0f;
-            #pragma unroll
-            for (int j = 0; j < HIDDEN; j++) {
-                ah = fmaf(snn.W_gru[k * HIDDEN + j], h_enc[j], ah);
-                ag = fmaf(snn.W_gru[(HIDDEN + k) * HIDDEN + j], h_enc[j], ag);
-                ap = fmaf(snn.W_gru[(2 * HIDDEN + k) * HIDDEN + j], h_enc[j], ap);
-            }
-            float p = sigmoidf_(ap);
-            float sg = sigmoidf_(ag);
-            float gh = mingru_g(ah);
-            float out_k = s_in[k] + sg * (gh - s_in[k]);
-
-            float dout = dhout[k] * p + (done_t ? 0.0f : dstate[k]);
-            float dp = dhout[k] * (out_k - h_enc[k]);
-            float dzp_k = dp * p * (1.0f - p);
-            dh_enc[k] += dhout[k] * (1.0f - p);
-
-            dstate[k] = dout * (1.0f - sg);  // ds_prev, safe in place
-            float dsg = dout * (gh - s_in[k]);
-            float dzg_k = dsg * sg * (1.0f - sg);
-            float dzh_k = dout * sg * dg_mingru(ah);
-
-            #pragma unroll
-            for (int j = 0; j < HIDDEN; j++) {
-                dh_enc[j] = fmaf(dzh_k, snn.W_gru[k * HIDDEN + j], dh_enc[j]);
-                dh_enc[j] = fmaf(dzg_k, snn.W_gru[(HIDDEN + k) * HIDDEN + j], dh_enc[j]);
-                dh_enc[j] = fmaf(dzp_k, snn.W_gru[(2 * HIDDEN + k) * HIDDEN + j], dh_enc[j]);
-                float gh_ = warp_sum(dzh_k * h_enc[j]);
-                float gg_ = warp_sum(dzg_k * h_enc[j]);
-                float gp_ = warp_sum(dzp_k * h_enc[j]);
-                if (lane == 0) {
-                    atomicAdd(&gr[PARAM_W_GRU + k * HIDDEN + j], gh_);
-                    atomicAdd(&gr[PARAM_W_GRU + (HIDDEN + k) * HIDDEN + j], gg_);
-                    atomicAdd(&gr[PARAM_W_GRU + (2 * HIDDEN + k) * HIDDEN + j], gp_);
-                }
-            }
-        }
-
-        // ---- Encoder backward: scatter dh_enc into active columns ----
-        #pragma unroll
-        for (int i = 0; i < HIDDEN; i++) {
-            float g = warp_sum(dh_enc[i]);
-            if (lane == 0) atomicAdd(&gr[PARAM_B_ENC + i], g);
-        }
-
-        // Warp-cooperative W_enc scatter: stage each lane's dh_enc in
-        // shared memory, then walk the warp's 32 samples together.
-        // For each active feature of sample m, all 32 lanes add
-        // sdh[m][lane] to the contiguous column gr[f*HIDDEN + lane]:
-        // one coalesced line-atomic per feature instead of 32
-        // scattered ones. Feature decode is uniform across the warp
-        // (every lane reads sample m's obs, broadcast through L1).
-        {
-            float (*sdh)[32 + 1] = sdh_all[threadIdx.x >> 5];
-            int ebase = (env_start + ei) - lane;
-            for (int hc = 0; hc < HIDDEN; hc += 32) {
-            #pragma unroll
-            for (int i = 0; i < 32; i++) sdh[lane][i] = dh_enc[hc + i];
-            __syncwarp();
-            for (int m = 0; m < 32 && ebase + m < env_start + env_count; m++) {
-                const uint8_t* obm = r_obs + ((size_t)t * num_envs + ebase + m) * OBS_DIM_COMPACT;
-                float dv = sdh[m][lane];
-                float* gcol = gr + PARAM_W_ENC + hc + lane;
-                for (int cell = 0; cell < OBS_MAP_CELLS; cell++) {
-                    int f = cell * (NUM_BLOCK_TYPES + 4) + (int8_t)obm[cell];
-                    atomicAdd(gcol + f * HIDDEN, dv);
-                    uint8_t mm = obm[OBS_MAP_CELLS + cell];
-                    int fm = cell * (NUM_BLOCK_TYPES + 4) + NUM_BLOCK_TYPES;
-                    for (int k = 0; k < 4; k++)
-                        if (mm & (1 << k)) atomicAdd(gcol + (fm + k) * HIDDEN, dv);
-                }
-                int idx = 2 * OBS_MAP_CELLS;
-                int f = OBS_MAP_CELLS * (NUM_BLOCK_TYPES + 4);
-                for (int j = 0; j < NUM_INVENTORY + 4; j++, f++) {
-                    float x = (float)(int8_t)obm[idx++] / 10.0f;
-                    if (x != 0.0f) atomicAdd(gcol + f * HIDDEN, x * dv);
-                }
-                int8_t dir = (int8_t)obm[idx++];
-                if (dir >= 1 && dir <= 4) atomicAdd(gcol + (f + dir - 1) * HIDDEN, dv);
-                f += 4;
-                uint8_t sleeping = obm[idx++];
-                float light;
-                memcpy(&light, obm + idx, sizeof(float));
-                if (light != 0.0f) atomicAdd(gcol + f * HIDDEN, light * dv);
-                f++;
-                if (sleeping) atomicAdd(gcol + f * HIDDEN, dv);
-            }
-            __syncwarp();  // sdh reused next tile / next t
-            }
-        }
-    }
-
-    if (active && loss_acc) {
-        atomicAdd(&loss_acc[0], pg_sum);
-        atomicAdd(&loss_acc[1], v_sum);
-        atomicAdd(&loss_acc[2], ent_sum);
-    }
-}
-
 // Reduce per-block gradient copies, Adam-update the flat params, and
 // zero the copies for the next iteration. One thread per parameter.
+// lr and the 1-based step come from device memory (a float and a
+// uint64 counter) so the whole trainer iteration lives in one CUDA
+// graph with host-side lr annealing as a single D2D float write.
 extern "C" __global__ void adam_kernel(
     float* __restrict__ params, float* __restrict__ grads, int grad_copies,
     float* __restrict__ m, float* __restrict__ v,
-    int step, float lr, float beta1, float beta2, float eps
+    const uint64_t* __restrict__ step_ctr, const float* __restrict__ lr_ptr,
+    float beta1, float beta2, float eps
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= PARAM_COUNT) return;
+    float lr = *lr_ptr;
+    int step = (int)(*step_ctr) + 1;
     float gsum = 0.0f;
     for (int c = 0; c < grad_copies; c++) {
         gsum += grads[(size_t)c * PARAM_COUNT + i];

@@ -14,7 +14,7 @@ full: craftax_full
 
 ifneq ($(NVCC),)
 craftax_classic: main_classic.cu craftax_classic.cu craftax_classic_cpu.o
-	$(NVCC) $(NVCCFLAGS) main_classic.cu craftax_classic_cpu.o -o $@ -Xcompiler -fopenmp -lpthread
+	$(NVCC) $(NVCCFLAGS) main_classic.cu craftax_classic_cpu.o -o $@ -Xcompiler -fopenmp -lpthread -lcublas
 
 craftax_classic_cpu.o: craftax_classic.c
 	$(CC) $(CPUFLAGS) -c craftax_classic.c -o $@
