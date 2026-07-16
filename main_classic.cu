@@ -837,7 +837,8 @@ struct Trainer {
                          x[l] + co * HIDDEN, preb[l] + co * GRU_OUT, r.stream);
                 mingru_epi_replay_kernel<<<egrid, 256, 0, r.stream>>>(
                     preb[l] + co * GRU_OUT, x[l] + co * HIDDEN,
-                    segstart ? r.r_state + ((size_t)t * GRU_LAYERS + l) * HIDDEN * n + env_start
+                    segstart ? r.r_state + ((size_t)t * GRU_LAYERS + l) * HIDDEN * n
+                                 + (size_t)env_start * HIDDEN
                              : nullptr,
                     live_st[l], prev, stb[l] + co * HIDDEN,
                     x[l + 1] + co * HIDDEN, n, env_count);
@@ -961,7 +962,8 @@ struct Trainer {
                              x[l], preb[l], r.stream);
                     mingru_epi_replay_kernel<<<(int)(((size_t)HIDDEN * cn + 255) / 256), 256, 0, r.stream>>>(
                         preb[l], x[l],
-                        segstart ? r.r_state + ((size_t)t * GRU_LAYERS + l) * hn + e0
+                        segstart ? r.r_state + ((size_t)t * GRU_LAYERS + l) * hn
+                                     + (size_t)e0 * HIDDEN
                                  : nullptr,
                         live_st[l], prev, nullptr, x[l + 1], n, cn);
                 }

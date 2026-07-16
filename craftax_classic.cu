@@ -1801,7 +1801,7 @@ extern "C" __global__ void mingru_epi_fwd_kernel(
 extern "C" __global__ void mingru_epi_replay_kernel(
     const float* __restrict__ pre,       // [GRU_OUT][mb] this step
     const float* __restrict__ x,         // [HIDDEN][mb] this step
-    const float* __restrict__ r_state_t, // stored slab at this (t, layer), k*n+el; segment start only, else null
+    const float* __restrict__ r_state_t, // stored slab at this (t, layer), env-major (el*HIDDEN+k, same layout mingru_epi_fwd stores) pre-offset by env_start*HIDDEN; segment start only, else null
     float* __restrict__ live,            // [HIDDEN][mb] carry in/out
     const int8_t* __restrict__ prev_dones, // dones between t-1 and t (+env offset); null at segment start
     float* __restrict__ st_store,        // [HIDDEN][mb] tight st record for the sweep, or null
@@ -1816,7 +1816,7 @@ extern "C" __global__ void mingru_epi_replay_kernel(
 
     float st;
     if (r_state_t) {
-        st = r_state_t[(size_t)k * n + el];
+        st = r_state_t[o];
     } else {
         st = live[o];
         if (prev_dones[el]) st = 0.0f;
