@@ -110,11 +110,16 @@ fused/split, both obs builds, and repeated runs. Action sampling uses
 a dedicated Philox stream per (env, step), so the env's game RNG
 sequence is untouched -- random-action trajectory anchors still hold.
 
-"Env + policy" is a rollout megakernel: the PufferLib default craftax policy
-(Linear 1345->32 encoder, MinGRU, actor/critic heads), categorical sampling,
-and PPO rollout storage fused into one persistent kernel, one thread per env,
-no grid sync. It runs within 2% of the env-only per-step path: fusing away
-launch/sync overhead roughly pays for a hidden-32 policy.
+Classic "env + policy" is a batched per-step pipeline around one
+fixed policy: Linear(1345->256) encoder -> MinGRU x3 (hidden 256) ->
+actor/value heads. A warp-cooperative encoder gathers W_enc columns
+straight from live env state (the 1345-float obs is never
+materialized), each GRU layer is a cuBLAS GEMM plus an elementwise
+epilogue, and a fused value/sampling kernel writes the rollout. The
+whole step is replayed as a CUDA graph in `run` mode; eager (`split`)
+and graph rollouts are bitwise identical (canonical rollout hash
+9dc17c576f43f4a3), and `verify` checks the batched forward against a
+scalar fp32 reference.
 
 ## Build
 
@@ -129,8 +134,8 @@ The classic CPU backend needs AVX-512 (Zen 4/5, Ice Lake+).
 ./craftax_classic bench --envs 1048576 --iters 1000 --obs-mode 1 --reset-mode 1
 ./craftax_classic bench --backend cpu --envs 32768 --iters 5000
 ./craftax_classic sweep                    # env SPS sweep: env counts x obs x reset modes
-./craftax_classic run --envs 262144 --horizon 128    # fused env+policy rollouts
-./craftax_classic runsweep                 # rollout sweep, fused vs per-step kernels
+./craftax_classic run --envs 262144 --horizon 128    # env+policy rollouts (CUDA graph)
+./craftax_classic runsweep                 # rollout sweep, graph vs eager
 ./craftax_classic hash --envs 2048 --steps 500       # env validation suite
 ./craftax_classic verify --envs 2048 --steps 300     # NN fusion + rollout validation suite
 ./craftax_classic train --envs 262144 --horizon 128 --iters 200   # on-device PPO training
@@ -185,90 +190,64 @@ the V-Cache CCD). Progression at 32k envs: 5.6M naive -> 47.8M.
 
 ## Training
 
-`./craftax_classic train` runs PPO entirely on device: fused
-rollout, bootstrap value, GAE, advantage normalization, backward, and Adam,
-with no tensor round-trips to the host inside an iteration. The 1345-float
-observation is never materialized for training either: the backward pass
-recomputes activations from the stored 148-byte compact obs plus a stored
-per-step recurrent state (for BPTT through the MinGRU, truncated at episode
-boundaries), and the encoder gradient is a sparse scatter-add into the ~70
-active one-hot columns per sample. Gradients accumulate into per-block
-copies in L2/HBM (block-level data parallelism, the single-GPU analogue of
-an all-reduce) that the Adam kernel reduces. `./craftax_classic gradcheck` verifies
-every parameter segment against central finite differences of the actual
-PPO loss.
+`./craftax_classic train` runs PPO entirely on device: rollout,
+bootstrap value, GAE, advantage normalization, backward, and Adam,
+with no tensor round-trips to the host inside an iteration. The
+1345-float observation is never materialized for training either:
+each minibatch's backward recomputes the forward at the current
+parameters from the stored 148-byte compact obs, with live recurrence
+inside each BPTT segment -- the stored per-step recurrent state
+enters only as the constant at segment starts, which are exactly the
+points where the backward sweep truncates its carried state gradient,
+so the analytic gradient is the true gradient of the replayed loss.
+Dense math is cuBLAS GEMMs over sample columns (forward
+pre-activations, the transposed dh chain between layers, and weight
+gradients accumulated with beta=1); the recurrent sweep is one thread
+per (unit, env) walking t backward with a scalar carry; the sparse
+encoder forward and scatter-add backward are one thread per (unit,
+sample).
 
-Training runs at ~81M SPS at 262k envs on the RTX PRO 6000 (vs 306.9M
-rollout-only). Two backward-pass restructures got it there from an
-initial 15M: dense grads (GRU + heads) are shuffle-reduced across the
-warp so one lane issues one atomic per element instead of 32, and the
-sparse encoder scatter is warp-cooperative -- the warp stages its 32
-dh_enc vectors in shared memory and walks its samples together, so
-every feature update is one coalesced line-atomic instead of 32
-scattered ones. The remaining gap to rollout speed is the ~70
-irreducible encoder column atomics per sample.
+`./craftax_classic gradcheck` verifies every parameter segment
+against central finite differences of the actual PPO loss (fp32
+cuBLAS with TF32 off; loss sums accumulate in double, without which
+the FD quantization noise floor produces false mismatches at the
+default step). It passes with max rel err 0.0000 on all segments,
+including with mid-horizon segment boundaries (`CRAFTAX_GC_SPLIT=2`
+or `4` builds the check at that `--bptt-split`). Getting it green
+surfaced three real device bugs, documented in the source: nvcc 13.2
+miscompiles the warp-cooperative byte-walk encoder kernels at sm_120
+(reads of bytes that exist nowhere in the record, plus a dropped
+final store that appears and disappears with unrelated compilation
+context) -- the stored-obs encoder pair is deliberately
+thread-per-unit for that reason -- and the replay originally fed
+stored states at every step, severing the recurrence that the
+backward sweep differentiates through.
 
-Learning was validated against PufferLib's PPO on craftax_classic at
-matched hyperparameters (8192 envs, horizon 128, full-batch updates,
-lr 3e-4, 200M steps): this trainer reaches episodic return 3.7 vs 1.1
-for PuffeRL forced into the same single-update regime. With more
-optimization pressure per batch (`--epochs 16 --lr 2e-3`) it reaches
-13.1 (12.9 on the RTX 3090).
+On the RTX PRO 6000, rollout runs 22.9M SPS at 16k envs (roughly flat
+out to 1M envs; CUDA graph and eager are within noise) and training
+end-to-end saturates at 5.8M SPS from 16k envs up with default flags.
+The auto-minibatcher caps backward slices at 4096 envs to bound
+buffer memory (~20KB per sample column), so throughput above 16k envs
+is pinned by per-slice GEMM efficiency; `--minibatches` can force
+larger slices on big-memory GPUs.
 
-The trainer also supports minibatched updates (`--minibatches M`
-slices each epoch into M contiguous env ranges with one backward+Adam
-step per slice, keeping BPTT within an env intact; advantages stay
-normalized with full-batch statistics) and flag-gated linear lr decay
-(`--lr-anneal`). Minibatching is worth more per unit compute than
-extra full-batch epochs: `--epochs 3 --minibatches 8 --lr 5e-3`
-reaches episodic return 14.6 (eplen ~400, 17 of 22 achievements above
-1%, wake_up 0.83 vs 0.08 for the full-batch recipe) in 344s on the
-3090 -- better than the 16-epoch full-batch recipe at a quarter of
-its update count. PufferLib's tuned-default recipe reaches 15.8 with
-128 minibatch updates per batch, annealed lr 0.015, and a hidden-128
-policy; the remaining gap at hidden 32 is dominated by model capacity
-(deeper minibatching, lr annealing, and PufferLib's
-gamma/lambda/vf/ent coefficients were all swept and plateau at
-~14.2-14.6).
-
-The hidden size is a compile-time parameter: `-DCRAFTAX_HIDDEN=128`
-builds a hidden-128 binary (default 32; the default build's hashes
-are unchanged). Two things stop scaling naively on sm_86: W_gru is
-192KB at hidden 128, so it stays in global memory instead of shared
-(uniform reads broadcast through L1), and the backward pass's warp
-staging for the W_enc scatter is tiled 32 hidden units at a time
-(a full stage would need 132KB of smem). The fused rollout megakernel
-survives the width: 255 registers with ~0.5KB spills, 10.1M SPS at
-8192 envs on the 3090 vs 56.5M at hidden 32 -- still 2.5x faster than
-the per-step split path, so it stays fused. The hidden-128 build
-passes gradcheck and the verify-mode bitwise mega/split cross-check
-(its rollout reference hash: 544e4104328fa113).
-
-Deep minibatching used to be launch-bound: one thread walks one env's
-whole T=128 trajectory in backward, so a 64-env minibatch is 64
-threads. `--bptt-split S` cuts each trajectory into S segments
-processed by S threads (each segment restarts from the stored
-per-step recurrent state; state-gradient flow is truncated at segment
-cuts, standard truncated BPTT -- S=1, the default, is the exact
-full-horizon backward). Backward wall time per epoch at hidden 128:
-8 minibatches 8.0s -> 1.27s with S=8 (6.3x); 32 minibatches ~32s ->
-2.1s with S=16 (15x); 128 minibatches ~128s -> 4.2s with S=32 (30x).
-At hidden 32 with `--epochs 3 --minibatches 8 --bptt-split 8` the
-truncation is learning-neutral (14.5 vs 14.5 exact) and the full
-200M-step run drops from 333s to 57s.
-
-With capacity plus split-affordable minibatching, the best recipe
-found is hidden 128 with `--epochs 3 --minibatches 8 --lr 5e-3
+`--minibatches M` slices each epoch into M contiguous env ranges with
+one backward+Adam step per slice (advantages stay normalized with
+full-batch statistics); `--bptt-split S` truncates BPTT at S segment
+boundaries per trajectory (S=1, the default, is the exact
+full-horizon backward); `--lr-anneal` decays lr linearly. These
+recipes were swept extensively on the previous thread-per-env
+hidden-32/128 architecture: minibatching beat extra full-batch epochs
+per unit compute, hidden 32 plateaued at episodic return ~14.6 on
+capacity, and hidden 128 with `--epochs 3 --minibatches 8 --lr 5e-3
 --lr-anneal --gamma 0.995 --gae-lambda 0.90 --vf 2.0 --ent 0.001
---bptt-split 8`: episodic return ~15.2-15.3 with the strongest tech
-tree (make_stone_pick 57%, collect_coal 35%, collect_iron 19%,
-make_iron_pick 8%) in ~740s on the 3090 -- closing most of the gap to
-PufferLib's 15.8. Without the coefficient changes the same schedule
-reaches ~15.0-15.3 but a weaker iron tier (~2%); raising lr to 8e-3
-nudges return to ~15.6 but trades the iron tier away entirely
-(survival-heavy, eplen ~960). Hotter deep-minibatch recipes (32
-minibatches, lr 1e-2, S=16 i.e. 8-step segments) collapse to ~9.2
-with a 3x higher value loss; keep segments at 16 steps or longer.
+--bptt-split 8` reached ~15.3 vs PufferLib's tuned 15.8 -- that
+capacity result is what motivated consolidating on the hidden-256,
+3-layer policy. On the new architecture the same (h128-tuned) recipe
+reaches episodic return 12.3 at 200M steps (8192 envs, ~170s on the
+PRO 6000) and is still climbing, with a survival-heavy profile
+(eplen ~790); the deeper model wants its own lr/entropy sweep and
+longer runs, which is open work.
 
 ### Full game
 
