@@ -275,7 +275,8 @@ with a 3x higher value loss; keep segments at 16 steps or longer.
 `./craftax_full_cuda train` ports the same on-device PPO stack to the
 full game (43 actions, 67 achievements, 9 floors): fused rollout with
 training storage, bootstrap value, GAE, full-batch advantage
-normalization, `k_ppo_backward`, and Adam, all resident on device. Per
+normalization, a warp-cooperative backward, and Adam, all resident on
+device. Per
 step each env stores a 996-byte compact obs record (792 packed-map
 bytes + the 51-float scalar tail -- the `CRAFTAX_WG_COMPACT_OBS_SIZE`
 layout, written independently of the obs build flag), its MinGRU state
@@ -293,11 +294,32 @@ PPO loss (max |fd-g| ~1.6e-4) plus the replay check; the training
 kernels leave the inference `run` path untouched (all six
 random-action anchors and both rollout-hash canonicals unchanged).
 
-Training runs at 3.0M SPS at 8k envs and 5.1M SPS at 65k envs on the
-RTX 3090 (vs 13.4M / 31.2M inference rollouts; ~62% of training time
-is the backward pass, ~37% the rollout). A 200M-step run (8192 envs,
-horizon 128, 191 iters) takes ~2.5-4 minutes depending on the update
-recipe.
+The backward (`k_ppo_backward_warp`) is warp-cooperative: one warp
+per (env, BPTT segment), lane l owning hidden units [Ul, U(l+1)) with
+U = hidden/32. Encoder recompute and GRU matvecs keep the scalar
+kernel's per-unit fmaf order (encoder columns and the W_enc scatter
+become coalesced line loads/atomics, no staging tile needed since the
+warp IS one sample); dense grads (W_gru/W_a/heads) are staged per
+timestep in shared memory and block-reduced across 4 warps into
+per-thread registers that persist over the whole segment, so global
+atomics for them drop to one flush per block per segment. The old
+thread-per-env kernel (`k_ppo_backward`) is kept as a reference,
+selectable with `CRAFTAX_CU_BWD=thread`; both pass gradcheck. The warp
+kernel fixes the grid starvation that made backward the wall: at 8192
+envs the thread kernel launches 8192 threads (7.6% SM busy on the RTX
+PRO 6000), the warp kernel 262k (74.5% busy, 133.9ms -> 21.6ms per
+full-batch backward; at 262k envs it runs at 82.6% SM / 97.8% L2 hit).
+
+Full-game training SPS on the RTX PRO 6000 (h32, horizon 128, e1 mb1
+exact backward; thread-kernel -> warp-kernel):
+8192 envs 5.5 -> 12.0M, 32768 15.1 -> 19.2M, 65536 14.8 -> 19.1M,
+131072 18.2 -> 21.1M, 262144 18.5 -> 21.7M SPS. Training saturates at
+~21.7M SPS at 262k envs, now 60% rollout / 40% backward; the largest
+h32 training fit is 327,680 envs on 96GB (75.8GB used at 262k) and
+65,536 on the 24GB 3090. A 1.6B-step run (65536 envs, 191 iters, the
+M5 recipe with minibatches 32) takes ~157s and reaches final-window
+episodic return 10.3 (see below). On the 3090 the warp backward gives
+2.5 -> 3.3M SPS at 8k envs (measured under light co-tenancy).
 
 Learning at 200M steps (8192 envs, horizon 128, seed 42) with the
 hidden-32 policy, final-window episodic return (random actions ~1.2):
@@ -321,6 +343,15 @@ descent just emerging (0.02% / 0.12%) -- clearly beyond random
 tree at this scale and capacity. There is no PufferLib baseline at
 these hypers for the full game; the classic-tuned coefficients
 transfer except for the entropy coefficient.
+
+Scaling the same recipe to 65536 envs (191 iters = 1.6B steps, lr
+2.5e-3, ent 0.01, epochs 3, minibatches 32, bptt-split 8, ~157s wall)
+validates large-batch training: final-window (272k episodes) episodic
+return 10.3 at eplen 581, with wood pickaxe 86%, wood sword 67%,
+collect stone 68%, place furnace 65%, collect coal 9.2%, stone
+pickaxe/sword emerging (0.26%/0.23%) and first iron collected. More
+parallel envs explore more of the tree per update; raising the
+entropy coefficient at scale is the natural next sweep.
 
 `make full-h128` builds the hidden-128 full-game binary
 (`-DCRAFTAX_HIDDEN=128`, same flag as classic; the default hidden-32

@@ -10790,6 +10790,482 @@ __global__ void k_ppo_backward(
     }
 }
 
+// ============================================================
+// Warp-cooperative PPO backward (default path; k_ppo_backward above is
+// the thread-per-env reference, selectable with CRAFTAX_CU_BWD=thread).
+//
+// One WARP per (env, BPTT segment): lane l owns hidden units
+// [U*l, U*(l+1)) with U = HIDDEN/32 (h32: 1 unit/lane, h128: 4). The
+// serial per-thread H^2 walk of k_ppo_backward becomes 32-wide:
+//  - encoder recompute: uniform record decode, each lane FMAs its own
+//    W_enc column slice (coalesced 128B/512B line loads); per-unit fmaf
+//    chains are bit-identical to cf_nn_encoder_from_record.
+//  - GRU matvecs: j ascending via warp broadcast (k_policy_warp
+//    discipline), so each unit's accumulation order is exactly the
+//    scalar loop's (bit-identical pre-activations).
+//  - heads: hout staged in shared; one lane per logit row (rows 32..42
+//    on lanes 0..10, second pass); softmax max/sum and the value dot
+//    are warp butterfly reductions (max exact; sums reassociated --
+//    inside gradcheck FD tolerance, no bitwise canonical exists here).
+//  - dh_enc = W_gru^T dz: k ascending via warp broadcast of each
+//    lane's dz, weight reads coalesced along j.
+//  - W_enc scatter: no staging needed (the warp IS one sample): each
+//    lane scatters x_f * dh_enc[its units] straight to gr[f*H + unit],
+//    one coalesced line atomic per active feature (same atomic traffic
+//    as the staged 32-sample walk of k_ppo_backward).
+//  - dense grads (W_gru/W_a/W_v/b_a/b_v): per timestep each warp
+//    stages dz [3H], h_enc [H], hout [H], dlogits+dvalue [44] in
+//    shared; after __syncthreads the block reduces the outer product
+//    across its CF_BWDW_WARPS samples cooperatively. At h32 every
+//    element accumulates in a fixed per-thread REGISTER across the
+//    whole segment (one atomic flush per block at the end: ~30x less
+//    global atomic traffic than k_ppo_backward). At h128 the 3H*H
+//    W_gru gradient (48K floats) exceeds the register/smem budget, so
+//    it is a per-timestep coalesced atomicAdd sweep (still reduced
+//    CF_BWDW_WARPS-fold by the staging); the smaller segments stay in
+//    registers. b_enc accumulates per-lane in registers.
+// Inactive warps (grid tail) run clamped with zeroed dlogits/dvalue,
+// which zeroes everything they stage; blocks never straddle a segment
+// boundary (env_count % 32 == 0 >= CF_BWDW_WARPS), so the per-timestep
+// __syncthreads stays uniform.
+// ============================================================
+#ifndef CF_BWDW_WARPS
+#if CF_GRU_SMEM
+#define CF_BWDW_WARPS 4   // block smem: padded W_gru+W_a copies + staging
+#else
+#define CF_BWDW_WARPS 8   // weights read from global; staging only
+#endif
+#endif
+// The warp kernel is only compiled for hidden <= 32: at hidden 128 the
+// lane-sliced formulation drives cicc into a multi-hour optimization
+// blowup (measured: >3h at -O3 AND -O1, sm_120, CUDA 13.2). h128 keeps
+// the thread backward; a warp variant for wide hidden needs a different
+// accumulator design, not this kernel with bigger loops.
+#define CF_BWDW_ENABLE (CF_NN_HIDDEN <= 32)
+#if CF_BWDW_ENABLE
+#define CF_BWDW_U (CF_NN_HIDDEN / 32)
+#define CF_BWDW_BD (32 * CF_BWDW_WARPS)
+#define CF_BWDW_NWA \
+    ((CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN + CF_BWDW_BD - 1) / CF_BWDW_BD)
+#if CF_GRU_SMEM && ((CF_NN_GRU * CF_NN_HIDDEN) % CF_BWDW_BD) != 0
+#error "W_gru register tile needs 3H^2 % blockDim == 0"
+#endif
+
+typedef struct CfBwdShared {
+#if CF_GRU_SMEM
+    float W_gru[CF_NN_GRU * (CF_NN_HIDDEN + 1)];   // +1 pad: conflict-free
+    float W_a[CRAFTAX_NUM_ACTIONS * (CF_NN_HIDDEN + 1)];  // row streams
+#endif
+    float W_v[CF_NN_HIDDEN];
+    float b_a[CRAFTAX_NUM_ACTIONS];
+    float b_enc[CF_NN_HIDDEN];
+    float b_v;
+    // Per-timestep cross-warp staging for the dense-grad reduction.
+    float dz[CF_BWDW_WARPS][CF_NN_GRU];
+    float henc[CF_BWDW_WARPS][CF_NN_HIDDEN];
+    float hout[CF_BWDW_WARPS][CF_NN_HIDDEN];
+    float dlog[CF_BWDW_WARPS][CRAFTAX_NUM_ACTIONS + 1];  // [43] = dvalue
+} CfBwdShared;
+
+#if CF_GRU_SMEM
+#define CF_BWDW_WG(s, k, j) ((s).W_gru[(k) * (CF_NN_HIDDEN + 1) + (j)])
+#define CF_BWDW_WA(s, a, j) ((s).W_a[(a) * (CF_NN_HIDDEN + 1) + (j)])
+#else
+#define CF_BWDW_WG(s, k, j) (w.W_gru[(size_t)(k) * CF_NN_HIDDEN + (j)])
+#define CF_BWDW_WA(s, a, j) (w.W_a[(size_t)(a) * CF_NN_HIDDEN + (j)])
+#endif
+
+static __device__ __forceinline__ float cf_warp_bsum(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+static __device__ __forceinline__ float cf_warp_bmax(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+// Encoder recompute, lane-sliced: bit-identical per hidden unit to
+// cf_nn_encoder_from_record (same fmaf chain, only the unit->lane
+// mapping changes; W_enc line loads are coalesced across the warp).
+static __device__ __forceinline__ void cf_nn_encoder_from_record_lane(
+    const uint8_t* __restrict__ rec, const float* __restrict__ W_enc,
+    const float* __restrict__ b_enc_s, int lane, float* h  // h[CF_BWDW_U]
+) {
+    #pragma unroll
+    for (int u = 0; u < CF_BWDW_U; u++)
+        h[u] = b_enc_s[CF_BWDW_U * lane + u];
+    for (int f = 0; f < CF_NN_MAP; f++) {
+        float x = (float)rec[f];
+        if (x == 0.0f) continue;
+        const float* col =
+            W_enc + (size_t)f * CF_NN_HIDDEN + CF_BWDW_U * lane;
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++) h[u] = fmaf(x, col[u], h[u]);
+    }
+    for (int j = 0; j < CF_NN_TAIL; j++) {
+        float x;
+        memcpy(&x, rec + CF_NN_MAP + 4 * j, sizeof(float));
+        if (x == 0.0f) continue;
+        const float* col =
+            W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN + CF_BWDW_U * lane;
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++) h[u] = fmaf(x, col[u], h[u]);
+    }
+}
+
+__global__ void __launch_bounds__(CF_BWDW_BD) k_ppo_backward_warp(
+    CfWeights w,
+    const uint8_t* __restrict__ r_obs, const int32_t* __restrict__ r_act,
+    const float* __restrict__ r_logprob, const uint8_t* __restrict__ r_done,
+    const float* __restrict__ r_state,   // [T][n][CF_NN_HIDDEN]
+    const float* __restrict__ adv, const float* __restrict__ ret,
+    float* __restrict__ grads, int grad_copies,
+    float* __restrict__ loss_acc,        // [3] or nullptr
+    const double* __restrict__ adv_stats,  // [2] sum, sumsq (FULL batch)
+    int num_envs, int T,
+    int env_start, int env_count,  // minibatch = contiguous env range
+    int bptt_split,                // S segments per env (1 = exact)
+    float clip_eps, float vf_coef, float ent_coef
+) {
+    __shared__ CfBwdShared s;
+    const int tid = threadIdx.x;
+#if CF_GRU_SMEM
+    for (int i = tid; i < CF_NN_GRU * CF_NN_HIDDEN; i += CF_BWDW_BD)
+        s.W_gru[(i / CF_NN_HIDDEN) * (CF_NN_HIDDEN + 1) + i % CF_NN_HIDDEN] =
+            w.W_gru[i];
+    for (int i = tid; i < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN;
+         i += CF_BWDW_BD)
+        s.W_a[(i / CF_NN_HIDDEN) * (CF_NN_HIDDEN + 1) + i % CF_NN_HIDDEN] =
+            w.W_a[i];
+#endif
+    for (int i = tid; i < CF_NN_HIDDEN; i += CF_BWDW_BD) {
+        s.W_v[i] = w.W_v[i];
+        s.b_enc[i] = w.b_enc[i];
+    }
+    for (int i = tid; i < CRAFTAX_NUM_ACTIONS; i += CF_BWDW_BD)
+        s.b_a[i] = w.b_a[i];
+    if (tid == 0) s.b_v = w.b_v[0];
+    __syncthreads();
+
+    const int warp = tid >> 5, lane = tid & 31;
+    int wt = blockIdx.x * CF_BWDW_WARPS + warp;
+    bool active = wt < env_count * bptt_split;
+    if (!active) wt = env_count * bptt_split - 1;
+    int seg = wt / env_count;
+    int e = env_start + wt % env_count;
+    int seg_len = T / bptt_split;
+    int t_lo = seg * seg_len;
+    int t_hi = t_lo + seg_len;
+
+    float* gr = grads + (size_t)(blockIdx.x % grad_copies) * CF_NN_PARAM_COUNT;
+
+    double inv_count = 1.0 / ((double)num_envs * T);
+    float inv_batch = (float)(1.0 / ((double)env_count * T));
+    float adv_mean = (float)(adv_stats[0] * inv_count);
+    double var = adv_stats[1] * inv_count
+        - (adv_stats[0] * inv_count) * (adv_stats[0] * inv_count);
+    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+
+    // Segment-persistent register accumulators.
+#if CF_GRU_SMEM
+    float raccA[(CF_NN_GRU * CF_NN_HIDDEN) / CF_BWDW_BD];
+    #pragma unroll
+    for (int q = 0; q < (CF_NN_GRU * CF_NN_HIDDEN) / CF_BWDW_BD; q++)
+        raccA[q] = 0.0f;
+#endif
+    float raccWa[CF_BWDW_NWA];
+    #pragma unroll
+    for (int q = 0; q < CF_BWDW_NWA; q++) raccWa[q] = 0.0f;
+    float raccWv = 0.0f, raccBa = 0.0f, raccBv = 0.0f;
+    float bencacc[CF_BWDW_U], dstate[CF_BWDW_U];
+    #pragma unroll
+    for (int u = 0; u < CF_BWDW_U; u++) {
+        bencacc[u] = 0.0f;
+        dstate[u] = 0.0f;
+    }
+    float pg_sum = 0.0f, v_sum = 0.0f, ent_sum = 0.0f;
+
+    for (int t = t_hi - 1; t >= t_lo; t--) {
+        size_t o = (size_t)t * num_envs + e;
+        const uint8_t* rec = r_obs + o * CF_TRAIN_OBS;
+
+        // ---- Forward recompute (lane-sliced) ----
+        float henc[CF_BWDW_U], s_in[CF_BWDW_U];
+        cf_nn_encoder_from_record_lane(rec, w.W_enc, s.b_enc, lane, henc);
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++)
+            s_in[u] = r_state[o * CF_NN_HIDDEN + CF_BWDW_U * lane + u];
+
+        float ah[CF_BWDW_U], ag[CF_BWDW_U], ap[CF_BWDW_U];
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++) ah[u] = ag[u] = ap[u] = 0.0f;
+        for (int jb = 0; jb < 32; jb++) {
+            float hj[CF_BWDW_U];
+            #pragma unroll
+            for (int v_ = 0; v_ < CF_BWDW_U; v_++)
+                hj[v_] = __shfl_sync(0xffffffffu, henc[v_], jb);
+            #pragma unroll
+            for (int u = 0; u < CF_BWDW_U; u++) {
+                int k = CF_BWDW_U * lane + u;
+                #pragma unroll
+                for (int v_ = 0; v_ < CF_BWDW_U; v_++) {
+                    int j = CF_BWDW_U * jb + v_;
+                    ah[u] = fmaf(CF_BWDW_WG(s, k, j), hj[v_], ah[u]);
+                    ag[u] = fmaf(CF_BWDW_WG(s, CF_NN_HIDDEN + k, j), hj[v_],
+                                 ag[u]);
+                    ap[u] = fmaf(CF_BWDW_WG(s, 2 * CF_NN_HIDDEN + k, j),
+                                 hj[v_], ap[u]);
+                }
+            }
+        }
+
+        float sg[CF_BWDW_U], pp[CF_BWDW_U], outk[CF_BWDW_U], hout[CF_BWDW_U];
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++) {
+            sg[u] = cf_nn_sigmoid(ag[u]);
+            float gh = cf_nn_mingru_g(ah[u]);
+            outk[u] = s_in[u] + sg[u] * (gh - s_in[u]);
+            pp[u] = cf_nn_sigmoid(ap[u]);
+            hout[u] = pp[u] * outk[u] + (1.0f - pp[u]) * henc[u];
+            s.hout[warp][CF_BWDW_U * lane + u] = hout[u];
+        }
+        __syncwarp();
+
+        // ---- Heads forward: lane-per-logit-row, value by reduction ----
+        float l0, l1 = -3.402823466e38f;
+        {
+            float z = s.b_a[lane];
+            for (int j = 0; j < CF_NN_HIDDEN; j++)
+                z = fmaf(CF_BWDW_WA(s, lane, j), s.hout[warp][j], z);
+            l0 = z;
+        }
+        if (lane + 32 < CRAFTAX_NUM_ACTIONS) {
+            float z = s.b_a[lane + 32];
+            for (int j = 0; j < CF_NN_HIDDEN; j++)
+                z = fmaf(CF_BWDW_WA(s, lane + 32, j), s.hout[warp][j], z);
+            l1 = z;
+        }
+        float vpart = 0.0f;
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++)
+            vpart = fmaf(s.W_v[CF_BWDW_U * lane + u], hout[u], vpart);
+        float value = s.b_v + cf_warp_bsum(vpart);
+
+        // ---- Softmax stats + loss gradients (uniform across the warp) ----
+        float mx = cf_warp_bmax(fmaxf(l0, l1));
+        float e0 = expf(l0 - mx);
+        float e1 = lane + 32 < CRAFTAX_NUM_ACTIONS ? expf(l1 - mx) : 0.0f;
+        float total = cf_warp_bsum(e0 + e1);
+        float inv_total = 1.0f / total;
+        float lse = mx + logf(total);
+        float pi0 = e0 * inv_total, pi1 = e1 * inv_total;
+
+        int act = r_act[o];
+        float lact_v = act < 32 ? l0 : l1;
+        float logit_act = __shfl_sync(0xffffffffu, lact_v, act & 31);
+        float logp_new = logit_act - lse;
+        float ratio = expf(logp_new - r_logprob[o]);
+        float A = (adv[o] - adv_mean) * adv_inv_std;
+        float u1 = ratio * A;
+        float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+        float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
+
+        float hp = -pi0 * (l0 - lse);
+        if (lane + 32 < CRAFTAX_NUM_ACTIONS) hp -= pi1 * (l1 - lse);
+        float Hent = cf_warp_bsum(hp);
+
+        float dvalue = inv_batch * vf_coef * (value - ret[o]);
+        float dl0 = (dlogp * ((lane == act ? 1.0f : 0.0f) - pi0)
+                     + ent_coef * pi0 * ((l0 - lse) + Hent)) * inv_batch;
+        float dl1 = (dlogp * ((lane + 32 == act ? 1.0f : 0.0f) - pi1)
+                     + ent_coef * pi1 * ((l1 - lse) + Hent)) * inv_batch;
+        if (!active) {
+            dvalue = 0.0f;
+            dl0 = 0.0f;
+            dl1 = 0.0f;
+        } else {
+            pg_sum += -fminf(u1, u2);
+            v_sum += 0.5f * (value - ret[o]) * (value - ret[o]);
+            ent_sum += Hent;
+        }
+        s.dlog[warp][lane] = dl0;
+        if (lane + 32 < CRAFTAX_NUM_ACTIONS) s.dlog[warp][lane + 32] = dl1;
+        if (lane == 0) s.dlog[warp][CRAFTAX_NUM_ACTIONS] = dvalue;
+        __syncwarp();
+
+        // ---- Heads backward: dhout for this lane's units ----
+        float dhout[CF_BWDW_U];
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++)
+            dhout[u] = dvalue * s.W_v[CF_BWDW_U * lane + u];
+        for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+            float da = s.dlog[warp][a];
+            #pragma unroll
+            for (int u = 0; u < CF_BWDW_U; u++)
+                dhout[u] = fmaf(da, CF_BWDW_WA(s, a, CF_BWDW_U * lane + u),
+                                dhout[u]);
+        }
+
+        // ---- MinGRU backward (elementwise on this lane's units) ----
+        bool done_t = r_done[o] != 0;
+        float dh[CF_BWDW_U], dzh[CF_BWDW_U], dzg[CF_BWDW_U], dzp[CF_BWDW_U];
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++) {
+            float dout = dhout[u] * pp[u] + (done_t ? 0.0f : dstate[u]);
+            float dp = dhout[u] * (outk[u] - henc[u]);
+            dzp[u] = dp * pp[u] * (1.0f - pp[u]);
+            dh[u] = dhout[u] * (1.0f - pp[u]);
+            dstate[u] = dout * (1.0f - sg[u]);
+            float dsg = dout * (cf_nn_mingru_g(ah[u]) - s_in[u]);
+            dzg[u] = dsg * sg[u] * (1.0f - sg[u]);
+            dzh[u] = dout * sg[u] * cf_nn_dg_mingru(ah[u]);
+            int k = CF_BWDW_U * lane + u;
+            s.dz[warp][k] = dzh[u];
+            s.dz[warp][CF_NN_HIDDEN + k] = dzg[u];
+            s.dz[warp][2 * CF_NN_HIDDEN + k] = dzp[u];
+            s.henc[warp][k] = henc[u];
+        }
+
+        // dh_enc += W_gru^T dz, k ascending via warp broadcast.
+        for (int kb = 0; kb < 32; kb++) {
+            float bzh[CF_BWDW_U], bzg[CF_BWDW_U], bzp[CF_BWDW_U];
+            #pragma unroll
+            for (int v_ = 0; v_ < CF_BWDW_U; v_++) {
+                bzh[v_] = __shfl_sync(0xffffffffu, dzh[v_], kb);
+                bzg[v_] = __shfl_sync(0xffffffffu, dzg[v_], kb);
+                bzp[v_] = __shfl_sync(0xffffffffu, dzp[v_], kb);
+            }
+            #pragma unroll
+            for (int v_ = 0; v_ < CF_BWDW_U; v_++) {
+                int k = CF_BWDW_U * kb + v_;
+                #pragma unroll
+                for (int u = 0; u < CF_BWDW_U; u++) {
+                    int j = CF_BWDW_U * lane + u;
+                    dh[u] = fmaf(bzh[v_], CF_BWDW_WG(s, k, j), dh[u]);
+                    dh[u] = fmaf(bzg[v_],
+                                 CF_BWDW_WG(s, CF_NN_HIDDEN + k, j), dh[u]);
+                    dh[u] = fmaf(bzp[v_],
+                                 CF_BWDW_WG(s, 2 * CF_NN_HIDDEN + k, j),
+                                 dh[u]);
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++) bencacc[u] += dh[u];
+
+        // ---- W_enc scatter: lane-owned slice, coalesced line atomics ----
+        if (active) {
+            for (int f = 0; f < CF_NN_MAP; f++) {
+                float x = (float)rec[f];
+                if (x == 0.0f) continue;
+                float* gcol =
+                    gr + CF_NN_W_ENC + (size_t)f * CF_NN_HIDDEN
+                    + CF_BWDW_U * lane;
+                #pragma unroll
+                for (int u = 0; u < CF_BWDW_U; u++)
+                    atomicAdd(gcol + u, x * dh[u]);
+            }
+            for (int j = 0; j < CF_NN_TAIL; j++) {
+                float x;
+                memcpy(&x, rec + CF_NN_MAP + 4 * j, sizeof(float));
+                if (x == 0.0f) continue;
+                float* gcol =
+                    gr + CF_NN_W_ENC + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN
+                    + CF_BWDW_U * lane;
+                #pragma unroll
+                for (int u = 0; u < CF_BWDW_U; u++)
+                    atomicAdd(gcol + u, x * dh[u]);
+            }
+        }
+
+        // ---- Dense-grad cross-warp reduction ----
+        __syncthreads();
+#if CF_GRU_SMEM
+        #pragma unroll
+        for (int q = 0; q < (CF_NN_GRU * CF_NN_HIDDEN) / CF_BWDW_BD; q++) {
+            int p = tid + q * CF_BWDW_BD;
+            int k = p / CF_NN_HIDDEN, j = p % CF_NN_HIDDEN;
+            float g = 0.0f;
+            #pragma unroll
+            for (int m = 0; m < CF_BWDW_WARPS; m++)
+                g = fmaf(s.dz[m][k], s.henc[m][j], g);
+            raccA[q] += g;
+        }
+#else
+        for (int p = tid; p < CF_NN_GRU * CF_NN_HIDDEN; p += CF_BWDW_BD) {
+            int k = p / CF_NN_HIDDEN, j = p % CF_NN_HIDDEN;
+            float g = 0.0f;
+            #pragma unroll
+            for (int m = 0; m < CF_BWDW_WARPS; m++)
+                g = fmaf(s.dz[m][k], s.henc[m][j], g);
+            atomicAdd(&gr[CF_NN_W_GRU + p], g);
+        }
+#endif
+        #pragma unroll
+        for (int q = 0; q < CF_BWDW_NWA; q++) {
+            int p = tid + q * CF_BWDW_BD;
+            if (p < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN) {
+                int a = p / CF_NN_HIDDEN, j = p % CF_NN_HIDDEN;
+                float g = 0.0f;
+                #pragma unroll
+                for (int m = 0; m < CF_BWDW_WARPS; m++)
+                    g = fmaf(s.dlog[m][a], s.hout[m][j], g);
+                raccWa[q] += g;
+            }
+        }
+        if (tid < CF_NN_HIDDEN) {
+            float g = 0.0f;
+            #pragma unroll
+            for (int m = 0; m < CF_BWDW_WARPS; m++)
+                g = fmaf(s.dlog[m][CRAFTAX_NUM_ACTIONS], s.hout[m][tid], g);
+            raccWv += g;
+        }
+        if (tid < CRAFTAX_NUM_ACTIONS) {
+            float g = 0.0f;
+            #pragma unroll
+            for (int m = 0; m < CF_BWDW_WARPS; m++) g += s.dlog[m][tid];
+            raccBa += g;
+        }
+        if (tid == 0) {
+            #pragma unroll
+            for (int m = 0; m < CF_BWDW_WARPS; m++)
+                raccBv += s.dlog[m][CRAFTAX_NUM_ACTIONS];
+        }
+        __syncthreads();  // staging reused next timestep
+    }
+
+    // ---- Flush register accumulators ----
+#if CF_GRU_SMEM
+    #pragma unroll
+    for (int q = 0; q < (CF_NN_GRU * CF_NN_HIDDEN) / CF_BWDW_BD; q++)
+        atomicAdd(&gr[CF_NN_W_GRU + tid + q * CF_BWDW_BD], raccA[q]);
+#endif
+    #pragma unroll
+    for (int q = 0; q < CF_BWDW_NWA; q++) {
+        int p = tid + q * CF_BWDW_BD;
+        if (p < CRAFTAX_NUM_ACTIONS * CF_NN_HIDDEN)
+            atomicAdd(&gr[CF_NN_W_A + p], raccWa[q]);
+    }
+    if (tid < CF_NN_HIDDEN) atomicAdd(&gr[CF_NN_W_V + tid], raccWv);
+    if (tid < CRAFTAX_NUM_ACTIONS) atomicAdd(&gr[CF_NN_B_A + tid], raccBa);
+    if (tid == 0) atomicAdd(&gr[CF_NN_B_V], raccBv);
+    if (active) {
+        #pragma unroll
+        for (int u = 0; u < CF_BWDW_U; u++)
+            atomicAdd(&gr[CF_NN_B_ENC + CF_BWDW_U * lane + u], bencacc[u]);
+    }
+    if (active && loss_acc && lane == 0) {
+        atomicAdd(&loss_acc[0], pg_sum);
+        atomicAdd(&loss_acc[1], v_sum);
+        atomicAdd(&loss_acc[2], ent_sum);
+    }
+}
+#endif  // CF_BWDW_ENABLE
+
 // Reduce per-block gradient copies, Adam-update the flat params, and
 // zero the copies for the next iteration. One thread per parameter.
 __global__ void k_adam(
@@ -11671,6 +12147,7 @@ typedef struct {
     double* stats;      // [2] adv sum, sumsq
     int adam_step;
     int mb_envs;        // envs per minibatch
+    int warp_bwd;       // 1: k_ppo_backward_warp (default), 0: thread kernel
     long total_updates; // adam steps over the whole run (lr anneal)
     // Phase timers (CRAFTAX_CU_TRAIN_PROF=1: sync per phase)
     int prof;
@@ -11709,8 +12186,24 @@ static void cu_train_init(
     CU_CHECK(cudaMalloc(&tr->r_reward, nt * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->r_done, nt));
     CU_CHECK(cudaMemset(tr->r_done, 0, nt));
-    int grid = (int)(((size_t)tr->mb_envs * cfg.bptt_split + CF_BWD_BLOCK - 1)
-                     / CF_BWD_BLOCK);
+    // Backward path: warp-cooperative by default; CRAFTAX_CU_BWD=thread
+    // selects the thread-per-env reference kernel. grad_copies scales
+    // with the actual backward grid of the selected kernel.
+    const char* bwd = getenv("CRAFTAX_CU_BWD");
+#if CF_BWDW_ENABLE
+    tr->warp_bwd = !(bwd != NULL && !strcmp(bwd, "thread"));
+#else
+    (void)bwd;
+    tr->warp_bwd = 0;  // warp kernel not compiled at this hidden size
+#endif
+    size_t bw_units = (size_t)tr->mb_envs * cfg.bptt_split;
+    int grid = tr->warp_bwd
+#if CF_BWDW_ENABLE
+        ? (int)((bw_units + CF_BWDW_WARPS - 1) / CF_BWDW_WARPS)
+#else
+        ? 0
+#endif
+        : (int)((bw_units + CF_BWD_BLOCK - 1) / CF_BWD_BLOCK);
     tr->grad_copies = grid < 512 ? grid : 512;
     CU_CHECK(cudaMalloc(&tr->grads,
                         (size_t)tr->grad_copies * CF_NN_PARAM_COUNT * sizeof(float)));
@@ -11790,8 +12283,6 @@ static void cu_train_collect(CuTrain* tr) {
 
 // Backward over a contiguous env range [env_start, env_start+env_count).
 static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
-    int grid = (int)(((size_t)env_count * tr->cfg.bptt_split + CF_BWD_BLOCK - 1)
-                     / CF_BWD_BLOCK);
     // --ent-anneal: linear ent -> ent_final over the run (same schedule
     // convention as --lr-anneal: fraction of completed adam updates).
     float ent = tr->cfg.ent;
@@ -11799,11 +12290,24 @@ static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
         float frac = (float)tr->adam_step / (float)tr->total_updates;
         ent = tr->cfg.ent + (tr->cfg.ent_final - tr->cfg.ent) * frac;
     }
-    k_ppo_backward<<<grid, CF_BWD_BLOCK>>>(
-        tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
-        tr->r_state, tr->adv, tr->ret, tr->grads, tr->grad_copies,
-        tr->loss_acc, tr->stats, tr->n, tr->T, env_start, env_count,
-        tr->cfg.bptt_split, tr->cfg.clip, tr->cfg.vf, ent);
+    size_t units = (size_t)env_count * tr->cfg.bptt_split;
+    if (tr->warp_bwd) {
+#if CF_BWDW_ENABLE
+        int grid = (int)((units + CF_BWDW_WARPS - 1) / CF_BWDW_WARPS);
+        k_ppo_backward_warp<<<grid, CF_BWDW_BD>>>(
+            tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
+            tr->r_state, tr->adv, tr->ret, tr->grads, tr->grad_copies,
+            tr->loss_acc, tr->stats, tr->n, tr->T, env_start, env_count,
+            tr->cfg.bptt_split, tr->cfg.clip, tr->cfg.vf, ent);
+#endif
+    } else {
+        int grid = (int)((units + CF_BWD_BLOCK - 1) / CF_BWD_BLOCK);
+        k_ppo_backward<<<grid, CF_BWD_BLOCK>>>(
+            tr->p->w, tr->r_obs, tr->r_act, tr->r_logprob, tr->r_done,
+            tr->r_state, tr->adv, tr->ret, tr->grads, tr->grad_copies,
+            tr->loss_acc, tr->stats, tr->n, tr->T, env_start, env_count,
+            tr->cfg.bptt_split, tr->cfg.clip, tr->cfg.vf, ent);
+    }
     CU_CHECK(cudaGetLastError());
 }
 
@@ -11914,6 +12418,7 @@ static int cu_run_train(
            num_envs, T, iters, (unsigned long long)seed, cfg.lr, cfg.gamma,
            cfg.lam, cfg.clip, cfg.ent, cfg.vf, cfg.epochs, cfg.minibatches,
            cfg.lr_anneal, cfg.bptt_split, CF_NN_HIDDEN);
+    printf(" bwd=%s", tr.warp_bwd ? "warp" : "thread");
     if (cfg.ent_anneal) printf(" ent_anneal->%g", cfg.ent_final);
     printf("\n");
 
