@@ -238,11 +238,16 @@ buffer memory (~20KB per sample column), so throughput above 16k envs
 is pinned by per-slice GEMM efficiency; `--minibatches` can force
 larger slices on big-memory GPUs.
 
-`--minibatches M` slices each epoch into M contiguous env ranges with
-one backward+Adam step per slice (advantages stay normalized with
-full-batch statistics); `--bptt-split S` truncates BPTT at S segment
-boundaries per trajectory (S=1, the default, is the exact
-full-horizon backward); `--lr-anneal` decays lr linearly. These
+`--horizon T` is the rollout length per PPO iteration: each iteration
+collects envs x T steps of experience (episodes pause mid-rollout and
+the last state's value bootstraps GAE), runs the update on that batch,
+and T is also the window BPTT unrolls over. `--iters N` is the number
+of collect+update iterations, so total env steps = envs x horizon x
+iters. `--minibatches M` slices each epoch into M contiguous env
+ranges with one backward+Adam step per slice (advantages stay
+normalized with full-batch statistics); `--bptt-split S` truncates
+BPTT at S segment boundaries per trajectory (S=1, the default, is the
+exact full-horizon backward); `--lr-anneal` decays lr linearly. These
 recipes were swept extensively on the previous thread-per-env
 hidden-32/128 architecture: minibatching beat extra full-batch epochs
 per unit compute, hidden 32 plateaued at episodic return ~14.6 on
