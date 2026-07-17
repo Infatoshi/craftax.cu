@@ -11108,11 +11108,21 @@ static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
 // env+policy rollouts and the on-device PPO trainer (ported from
 // main_classic.cu; same GEMM layout tricks and graph discipline).
 //
-// cuBLAS conveniences. All activation buffers are col-major. A
-// row-major weight W [m][k] is consumed as col-major W^T [k][m], so
-// the forward is OP_T and dh/dW use OP_N/OP_T on the SAME memory --
-// no transposed weight copies anywhere.
+// Policy GEMMs are custom fixed-shape kernels (H=256, GRU=768, OBS=843,
+// A=43). cuBLAS TF32 is fine at huge N, but streaming backward issues T
+// serial mid-size GEMMs where cuBLAS dispatch dominates. Default path
+// is fp32 fma on CUDA cores (gradcheck-clean). Compile with
+// -DCF_GEMM_BF16_DEVICE=1 to round operands through bf16 (step toward
+// a real tensor-core MMA path). CF_USE_CUBLAS=1 restores cuBLAS.
+//
+// Layout: activations col-major; W row-major [m][k]. Forward is
+//   y[m][cols] = W[m][k] @ x[k][cols].
 // ------------------------------------------------------------
+#include <cuda_bf16.h>
+#ifndef CF_GEMM_BF16_DEVICE
+#define CF_GEMM_BF16_DEVICE 0
+#endif
+
 #define CUBLAS_CHECK(x) do { \
     cublasStatus_t s_ = (x); \
     if (s_ != CUBLAS_STATUS_SUCCESS) { \
@@ -11123,60 +11133,277 @@ static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
 
 static cublasHandle_t g_blas = NULL;
 static float g_one = 1.0f, g_zero = 0.0f;
+// 1 = cuBLAS TF32 (default: wins on PRO 6000 at our shapes), 0 = custom
+// smem-tiled fp32/bf16 path (CF_USE_CUBLAS=0). Custom is correct
+// (gradcheck green) but currently ~5-6x slower than TF32 tensor-core
+// cuBLAS; kept as the isolated hook for a real bf16 MMA kernel.
+static int g_use_cublas = -1;
 
 static void cu_ensure_blas(void) {
     if (!g_blas) {
         CUBLAS_CHECK(cublasCreate(&g_blas));
         CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_TF32_TENSOR_OP_MATH));
     }
+    if (g_use_cublas < 0) {
+        const char* e = getenv("CF_USE_CUBLAS");
+        // Default ON. Set CF_USE_CUBLAS=0 to force the custom kernels.
+        g_use_cublas = (e == NULL || atoi(e) != 0) ? 1 : 0;
+    }
+}
+
+// ------------------------------------------------------------
+// Custom policy GEMMs — fixed-shape, smem-tiled, no cuBLAS.
+//
+// Y[M,N] = W[M,K] @ X[K,N]
+//   W row-major fp32 [M][K]; X,Y col-major fp32 (ld K / M).
+// Tile BM x BN of C; drain K in BK steps with smem so each X panel is
+// reused across BM rows (naive thread-per-output reloaded X M times and
+// was ~30x slower than cuBLAS). Master weights stay fp32 (Adam).
+// CF_GEMM_BF16_DEVICE=1 rounds smem loads through bf16.
+// CF_USE_CUBLAS=1 restores cuBLAS TF32.
+// ------------------------------------------------------------
+
+static __device__ __forceinline__ float cf_op(float x) {
+#if CF_GEMM_BF16_DEVICE
+    return __bfloat162float(__float2bfloat16(x));
+#else
+    return x;
+#endif
+}
+
+// Block: (BN, BM/TM). Each thread owns TM output rows in one column.
+template <int BM, int BN, int BK, int TM>
+__global__ void k_cf_gemm_tiled(
+    const float* __restrict__ W, const float* __restrict__ X,
+    float* __restrict__ Y, int M, int N, int K
+) {
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BK][BN + 1];
+    const int tx = (int)threadIdx.x, ty = (int)threadIdx.y;
+    const int col0 = (int)blockIdx.x * BN;
+    const int row0 = (int)blockIdx.y * BM;
+    const int threads = (BM / TM) * BN;
+    const int tid = ty * BN + tx;
+    float acc[TM];
+#pragma unroll
+    for (int i = 0; i < TM; i++) acc[i] = 0.0f;
+    for (int kk = 0; kk < K; kk += BK) {
+        for (int t = tid; t < BM * BK; t += threads) {
+            int r = t / BK, c = t % BK;
+            int gr = row0 + r, gc = kk + c;
+            As[r][c] = (gr < M && gc < K) ? cf_op(W[(size_t)gr * K + gc]) : 0.0f;
+        }
+        for (int t = tid; t < BK * BN; t += threads) {
+            int r = t / BN, c = t % BN;
+            int gr = kk + r, gc = col0 + c;
+            Bs[r][c] = (gr < K && gc < N) ? cf_op(X[(size_t)gc * K + gr]) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < BK; k++) {
+            float b = Bs[k][tx];
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+                acc[i] = fmaf(As[ty * TM + i][k], b, acc[i]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int gr = row0 + ty * TM + i, gc = col0 + tx;
+        if (gr < M && gc < N) Y[(size_t)gc * M + gr] = acc[i];
+    }
+}
+
+// dh[H,N] = W^T @ dpre, W row-major [m3][H]
+template <int BM, int BN, int BK, int TM>
+__global__ void k_cf_gemm_dh_tiled(
+    const float* __restrict__ W, const float* __restrict__ dpre,
+    float* __restrict__ dh, int m3, int N
+) {
+    const int H = CF_NN_HIDDEN;
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BK][BN + 1];
+    const int tx = (int)threadIdx.x, ty = (int)threadIdx.y;
+    const int col0 = (int)blockIdx.x * BN;
+    const int row0 = (int)blockIdx.y * BM;
+    const int threads = (BM / TM) * BN;
+    const int tid = ty * BN + tx;
+    float acc[TM];
+#pragma unroll
+    for (int i = 0; i < TM; i++) acc[i] = 0.0f;
+    for (int kk = 0; kk < m3; kk += BK) {
+        for (int t = tid; t < BM * BK; t += threads) {
+            int r = t / BK, c = t % BK;
+            int gh = row0 + r, gr = kk + c;
+            As[r][c] = (gh < H && gr < m3) ? cf_op(W[(size_t)gr * H + gh]) : 0.0f;
+        }
+        for (int t = tid; t < BK * BN; t += threads) {
+            int r = t / BN, c = t % BN;
+            int gr = kk + r, gc = col0 + c;
+            Bs[r][c] = (gr < m3 && gc < N) ? cf_op(dpre[(size_t)gc * m3 + gr]) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < BK; k++) {
+            float b = Bs[k][tx];
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+                acc[i] = fmaf(As[ty * TM + i][k], b, acc[i]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int gh = row0 + ty * TM + i, gc = col0 + tx;
+        if (gh < H && gc < N) dh[(size_t)gc * H + gh] = acc[i];
+    }
+}
+
+// dW(h,r) += sum_n X(h,n)*dpre(r,n); tile (h across BN, r across BM)
+template <int BM, int BN, int BK, int TM>
+__global__ void k_cf_gemm_dw_tiled(
+    const float* __restrict__ X, const float* __restrict__ dpre,
+    float* __restrict__ dW, int rows, int N
+) {
+    const int H = CF_NN_HIDDEN;
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BK][BN + 1];
+    const int tx = (int)threadIdx.x, ty = (int)threadIdx.y;
+    const int h0 = (int)blockIdx.x * BN;
+    const int r0 = (int)blockIdx.y * BM;
+    const int threads = (BM / TM) * BN;
+    const int tid = ty * BN + tx;
+    float acc[TM];
+#pragma unroll
+    for (int i = 0; i < TM; i++) acc[i] = 0.0f;
+    for (int nn = 0; nn < N; nn += BK) {
+        for (int t = tid; t < BM * BK; t += threads) {
+            int r = t / BK, c = t % BK;
+            int gr = r0 + r, gn = nn + c;
+            As[r][c] = (gr < rows && gn < N) ? cf_op(dpre[(size_t)gn * rows + gr]) : 0.0f;
+        }
+        for (int t = tid; t < BK * BN; t += threads) {
+            int r = t / BN, c = t % BN;
+            int gn = nn + r, gh = h0 + c;
+            Bs[r][c] = (gn < N && gh < H) ? cf_op(X[(size_t)gn * H + gh]) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < BK; k++) {
+            float b = Bs[k][tx];
+#pragma unroll
+            for (int i = 0; i < TM; i++)
+                acc[i] = fmaf(As[ty * TM + i][k], b, acc[i]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TM; i++) {
+        int gr = r0 + ty * TM + i, gh = h0 + tx;
+        if (gr < rows && gh < H) dW[(size_t)gr * H + gh] += acc[i];
+    }
+}
+
+__global__ void k_cf_gemv_dwv(
+    const float* __restrict__ X, const float* __restrict__ dv,
+    float* __restrict__ dWv, int N
+) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= CF_NN_HIDDEN) return;
+    float acc = 0.0f;
+    for (int n = 0; n < N; n++)
+        acc = fmaf(X[(size_t)n * CF_NN_HIDDEN + h], dv[n], acc);
+    dWv[h] += acc;
+}
+
+static void cf_gemm_fwd_launch(int M, int N, int K, const float* W,
+                               const float* X, float* Y, cudaStream_t s) {
+    constexpr int BM = 64, BN = 32, BK = 16, TM = 4;
+    dim3 block(BN, BM / TM);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    k_cf_gemm_tiled<BM, BN, BK, TM><<<grid, block, 0, s>>>(W, X, Y, M, N, K);
 }
 
 // y[m][cols] = W[m][k] @ x[k][cols]   (forward, W row-major raw)
 static void cu_gemm_fwd(int m, int cols, int k, const float* W,
                         const float* x, float* y, cudaStream_t s) {
-    CUBLAS_CHECK(cublasSetStream(g_blas, s));
-    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, m, cols, k,
-                             &g_one, W, k, x, k, &g_zero, y, m));
+    cu_ensure_blas();
+    if (g_use_cublas) {
+        CUBLAS_CHECK(cublasSetStream(g_blas, s));
+        CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, m, cols, k,
+                                 &g_one, W, k, x, k, &g_zero, y, m));
+        return;
+    }
+    cf_gemm_fwd_launch(m, cols, k, W, x, y, s);
 }
 
-// h[HIDDEN][cols] = W_enc^T @ xobs[OBS][cols]  (raw row-major
-// W_enc [OBS][HIDDEN] is col-major [HIDDEN][OBS], so plain OP_N).
-// Bias is added by k_add_bias afterwards.
+// h[HIDDEN][cols] = W_enc^T @ xobs[OBS][cols]
 static void cu_gemm_enc_fwd(int cols, const float* W_enc, const float* xobs,
                             float* h, cudaStream_t s) {
-    CUBLAS_CHECK(cublasSetStream(g_blas, s));
-    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, CF_NN_HIDDEN,
-                             cols, CF_NN_OBS, &g_one, W_enc, CF_NN_HIDDEN,
-                             xobs, CF_NN_OBS, &g_zero, h, CF_NN_HIDDEN));
+    cu_ensure_blas();
+    if (g_use_cublas) {
+        CUBLAS_CHECK(cublasSetStream(g_blas, s));
+        CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, CF_NN_HIDDEN,
+                                 cols, CF_NN_OBS, &g_one, W_enc, CF_NN_HIDDEN,
+                                 xobs, CF_NN_OBS, &g_zero, h, CF_NN_HIDDEN));
+        return;
+    }
+    constexpr int BM = 64, BN = 32, BK = 16, TM = 4;
+    dim3 block(BN, BM / TM);
+    dim3 grid((cols + BN - 1) / BN, (CF_NN_HIDDEN + BM - 1) / BM);
+    k_cf_gemm_dh_tiled<BM, BN, BK, TM>
+        <<<grid, block, 0, s>>>(W_enc, xobs, h, CF_NN_OBS, cols);
 }
 
-// dh[HIDDEN][cols] = W^T @ dpre[m3][cols]  (same raw W memory, OP_N)
 static void cu_gemm_dh(int m3, int cols, const float* W, const float* dpre,
                        float* dh, cudaStream_t s) {
-    CUBLAS_CHECK(cublasSetStream(g_blas, s));
-    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, CF_NN_HIDDEN,
-                             cols, m3, &g_one, W, CF_NN_HIDDEN, dpre, m3,
-                             &g_zero, dh, CF_NN_HIDDEN));
+    cu_ensure_blas();
+    if (g_use_cublas) {
+        CUBLAS_CHECK(cublasSetStream(g_blas, s));
+        CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, CF_NN_HIDDEN,
+                                 cols, m3, &g_one, W, CF_NN_HIDDEN, dpre, m3,
+                                 &g_zero, dh, CF_NN_HIDDEN));
+        return;
+    }
+    constexpr int BM = 64, BN = 32, BK = 16, TM = 4;
+    dim3 block(BN, BM / TM);
+    dim3 grid((cols + BN - 1) / BN, (CF_NN_HIDDEN + BM - 1) / BM);
+    k_cf_gemm_dh_tiled<BM, BN, BK, TM>
+        <<<grid, block, 0, s>>>(W, dpre, dh, m3, cols);
 }
 
-// dW[j-major][+] += x[HIDDEN][cols] @ dpre[rows][cols]^T, beta=1.
-// C(j,i) lands at j + i*HIDDEN, i.e. raw [rows][HIDDEN] row-major,
-// matching the forward weight layout exactly.
 static void cu_gemm_dw(int rows, int cols, const float* x, const float* dpre,
                        float* dW, cudaStream_t s) {
-    CUBLAS_CHECK(cublasSetStream(g_blas, s));
-    CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_T, CF_NN_HIDDEN,
-                             rows, cols, &g_one, x, CF_NN_HIDDEN, dpre, rows,
-                             &g_one, dW, CF_NN_HIDDEN));
+    cu_ensure_blas();
+    if (g_use_cublas) {
+        CUBLAS_CHECK(cublasSetStream(g_blas, s));
+        CUBLAS_CHECK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_T, CF_NN_HIDDEN,
+                                 rows, cols, &g_one, x, CF_NN_HIDDEN, dpre,
+                                 rows, &g_one, dW, CF_NN_HIDDEN));
+        return;
+    }
+    constexpr int BM = 64, BN = 32, BK = 16, TM = 4;
+    dim3 block(BN, BM / TM);
+    dim3 grid((CF_NN_HIDDEN + BN - 1) / BN, (rows + BM - 1) / BM);
+    k_cf_gemm_dw_tiled<BM, BN, BK, TM>
+        <<<grid, block, 0, s>>>(x, dpre, dW, rows, cols);
 }
 
 // dWv[j] += sum_s x[HIDDEN][cols](j,s) * dv[s]     (gemv, beta=1)
 static void cu_gemv_dwv(const float* x, const float* dv, float* dWv,
                         int cols, cudaStream_t s) {
-    CUBLAS_CHECK(cublasSetStream(g_blas, s));
-    CUBLAS_CHECK(cublasSgemv(g_blas, CUBLAS_OP_N, CF_NN_HIDDEN, cols,
-                             &g_one, x, CF_NN_HIDDEN, dv, 1, &g_one, dWv, 1));
+    cu_ensure_blas();
+    if (g_use_cublas) {
+        CUBLAS_CHECK(cublasSetStream(g_blas, s));
+        CUBLAS_CHECK(cublasSgemv(g_blas, CUBLAS_OP_N, CF_NN_HIDDEN, cols,
+                                 &g_one, x, CF_NN_HIDDEN, dv, 1, &g_one, dWv,
+                                 1));
+        return;
+    }
+    k_cf_gemv_dwv<<<(CF_NN_HIDDEN + 255) / 256, 256, 0, s>>>(x, dv, dWv, cols);
 }
+
 
 typedef struct {
     float* params;
