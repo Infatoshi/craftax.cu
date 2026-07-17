@@ -9343,23 +9343,33 @@ __global__ void k_reset_list(Craftax* envs, const CraftaxResetRec* resets) {
     cf_encode_tail(env->state, env->observations);
 }
 
-// Warp-cooperative reset: one warp (= one block) per finished env, noise
-// scratch in shared memory instead of 46KB of per-thread stack. Only valid
-// in lazy-floors mode (floor 0 regenerated here, floors 1-8 on descent).
+// Warp-cooperative reset: one warp (= one block) processes finished envs
+// from the compacted reset list, noise scratch in shared memory instead of
+// 46KB of per-thread stack. Only valid in lazy-floors mode (floor 0
+// regenerated here, floors 1-8 on descent).
+//
+// Grid-strided over the worklist so the host can launch a fixed small grid
+// (graph-friendly, ~num_SMs worth of blocks) instead of `num_envs` mostly
+// empty blocks. Each env's worldgen is a pure function of its reset key, so
+// processing order is irrelevant and bit-identical to 1-block-per-reset.
+// Typical load is ~n/eplen resets/step (~30 @8192); the previous n-block
+// launch paid scheduler overhead on thousands of early-exit warps every step.
 __global__ void __launch_bounds__(32) k_reset_list_warp(
     Craftax* envs, const CraftaxResetRec* resets
 ) {
     __shared__ CraftaxWarpScratch s;
-    int idx = blockIdx.x;
-    if (idx >= g_reset_count) return;
     unsigned lane = threadIdx.x;
-    Craftax* env = &envs[resets[idx].env];
-    CraftaxThreefryKey reset_key;
-    reset_key.word[0] = resets[idx].key0;
-    reset_key.word[1] = resets[idx].key1;
-    craftax_reset_state_on_done_warp(env->state, reset_key, &s, lane);
-    if (lane == 0) {
-        cf_encode_tail(env->state, env->observations);
+    // Stride the compacted list; idle blocks exit on the first check.
+    for (int idx = (int)blockIdx.x; idx < g_reset_count; idx += (int)gridDim.x) {
+        Craftax* env = &envs[resets[idx].env];
+        CraftaxThreefryKey reset_key;
+        reset_key.word[0] = resets[idx].key0;
+        reset_key.word[1] = resets[idx].key1;
+        craftax_reset_state_on_done_warp(env->state, reset_key, &s, lane);
+        if (lane == 0) {
+            cf_encode_tail(env->state, env->observations);
+        }
+        __syncwarp();
     }
 }
 
@@ -9528,10 +9538,23 @@ static __device__ int cf_nn_sample_action(
 // of craftax_encode_compact_observation -- per-cell bytes are pure
 // functions of state, and the serial mob scatter's last-slot-wins is
 // reproduced by an overwrite-on-(cell,ch)-match mob list, so the
-// record bytes are identical to the old thread-per-env scatter). The thread-per-env form ran as 32 blocks
-// at 8192 envs (16.6% occupancy, 565us/step, grid starvation).
+// record bytes are identical to the old thread-per-env scatter). The
+// thread-per-env form ran as 32 blocks at 8192 envs (16.6% occupancy,
+// 565us/step, grid starvation).
+//
+// Mob list is built once per warp into shared memory (lane 0 only) --
+// the previous "every lane rebuilds the same list" form burned ~half of
+// k_record_obs on redundant serial walks of the 14-slot mob pool; bytes
+// are unchanged because the predicates and last-slot-wins order match.
 __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
+    // 256-thread blocks = 8 warps; each warp owns one env.
+    __shared__ int16_t sm_mob_cell[8][14];
+    __shared__ int8_t sm_mob_ch[8][14];
+    __shared__ uint8_t sm_mob_val[8][14];
+    __shared__ int sm_nm[8];
+
     const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
     int e = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (e >= num_envs) return;
     const CraftaxState* cs = &((const CraftaxState*)g_cf_state_base)[e];
@@ -9544,51 +9567,53 @@ __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
     const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
     const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
 
-    // Visible-mob list, built redundantly by every lane (uniform walk;
-    // same predicates, class/slot order and overwrite semantics as the
-    // serial compact scatter).
-    int16_t mob_cell[14];
-    int8_t mob_ch[14];
-    uint8_t mob_val[14];
-    int nm = 0;
-    for (int c = 0; c < CRAFTAX_WG_NUM_MOB_CLASSES; c++) {
-        const int nslots = c == 2 ? 2 : 3;
-        for (int i = 0; i < nslots; i++) {
-            int type_id = MOB_TYPE(c, mob_level, i, state);
-            if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-                || !MOB_MASK(c, mob_level, i, state)) {
-                continue;
-            }
-            int mob_row = MOB_POS(c, mob_level, i, 0, state);
-            int mob_col = MOB_POS(c, mob_level, i, 1, state);
-            int local_row = mob_row - top;
-            int local_col = mob_col - left;
-            if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
-                || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
-                continue;
-            }
-            bool in_bounds = mob_row >= 0 && mob_row < CRAFTAX_WG_MAP_SIZE
-                && mob_col >= 0 && mob_col < CRAFTAX_WG_MAP_SIZE;
-            if (!in_bounds
-                || state->light_map[mob_level][mob_row][mob_col] <= 12) {
-                continue;
-            }
-            int16_t cell =
-                (int16_t)(local_row * CRAFTAX_WG_OBS_COLS + local_col);
-            int8_t ch = (int8_t)(3 + c);
-            int found = -1;
-            for (int j = 0; j < nm; j++)
-                if (mob_cell[j] == cell && mob_ch[j] == ch) found = j;
-            if (found >= 0) {
-                mob_val[found] = (uint8_t)(type_id + 1);
-            } else {
-                mob_cell[nm] = cell;
-                mob_ch[nm] = ch;
-                mob_val[nm] = (uint8_t)(type_id + 1);
-                nm++;
+    // Visible-mob list: lane 0 only, then broadcast via smem. Same
+    // class/slot order and overwrite semantics as the serial scatter.
+    if (lane == 0) {
+        int nm = 0;
+        for (int c = 0; c < CRAFTAX_WG_NUM_MOB_CLASSES; c++) {
+            const int nslots = c == 2 ? 2 : 3;
+            for (int i = 0; i < nslots; i++) {
+                int type_id = MOB_TYPE(c, mob_level, i, state);
+                if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
+                    || !MOB_MASK(c, mob_level, i, state)) {
+                    continue;
+                }
+                int mob_row = MOB_POS(c, mob_level, i, 0, state);
+                int mob_col = MOB_POS(c, mob_level, i, 1, state);
+                int local_row = mob_row - top;
+                int local_col = mob_col - left;
+                if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
+                    || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
+                    continue;
+                }
+                bool in_bounds = mob_row >= 0 && mob_row < CRAFTAX_WG_MAP_SIZE
+                    && mob_col >= 0 && mob_col < CRAFTAX_WG_MAP_SIZE;
+                if (!in_bounds
+                    || state->light_map[mob_level][mob_row][mob_col] <= 12) {
+                    continue;
+                }
+                int16_t cell =
+                    (int16_t)(local_row * CRAFTAX_WG_OBS_COLS + local_col);
+                int8_t ch = (int8_t)(3 + c);
+                int found = -1;
+                for (int j = 0; j < nm; j++)
+                    if (sm_mob_cell[warp][j] == cell && sm_mob_ch[warp][j] == ch)
+                        found = j;
+                if (found >= 0) {
+                    sm_mob_val[warp][found] = (uint8_t)(type_id + 1);
+                } else {
+                    sm_mob_cell[warp][nm] = cell;
+                    sm_mob_ch[warp][nm] = ch;
+                    sm_mob_val[warp][nm] = (uint8_t)(type_id + 1);
+                    nm++;
+                }
             }
         }
+        sm_nm[warp] = nm;
     }
+    __syncwarp();
+    const int nm = sm_nm[warp];
 
     for (int cell = lane; cell < CRAFTAX_WG_OBS_ROWS * CRAFTAX_WG_OBS_COLS;
          cell += 32) {
@@ -9605,7 +9630,8 @@ __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
             b[2] = 1;
         }
         for (int m = 0; m < nm; m++)
-            if ((int)mob_cell[m] == cell) b[mob_ch[m]] = mob_val[m];
+            if ((int)sm_mob_cell[warp][m] == cell)
+                b[sm_mob_ch[warp][m]] = sm_mob_val[warp][m];
         // rec + cell*8 is 4-byte aligned (CF_TRAIN_OBS = 996 = 4*249)
         uint32_t w0, w1;
         memcpy(&w0, b, 4);
@@ -9616,12 +9642,14 @@ __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
         dst[1] = w1;
     }
 
-    // Scalar tail, computed redundantly per lane, written cooperatively;
-    // float stores give the same bytes the serial memcpy produced.
-    float tail[CF_NN_TAIL];
-    craftax_encode_scalar_observation_tail_at(state, tail, 0);
+    // Scalar tail: lane 0 computes once, warp stores cooperatively.
+    // (Previously every lane recomputed the same 51 floats.)
+    __shared__ float sm_tail[8][CF_NN_TAIL];
+    if (lane == 0)
+        craftax_encode_scalar_observation_tail_at(state, sm_tail[warp], 0);
+    __syncwarp();
     for (int j = lane; j < CF_NN_TAIL; j += 32)
-        memcpy(rec + CF_NN_MAP + 4 * j, &tail[j], sizeof(float));
+        memcpy(rec + CF_NN_MAP + 4 * j, &sm_tail[warp][j], sizeof(float));
 }
 
 // Streaming (evict-first) accessors for the recurrent state and the
@@ -10617,9 +10645,13 @@ static void cu_step_launch(CuVec* v) {
         if (tail_blocks > 512) tail_blocks = 512;
         k_spawn_tail<<<tail_blocks, 256>>>();
     }
-    // Worst-case grid; threads/blocks beyond g_reset_count exit immediately.
+    // Cap the reset grid: worldgen is ~one warp of work per finished env and
+    // typical load is tens of resets, not num_envs. Stride covers the rare
+    // all-die step. (See k_reset_list_warp.)
     if (v->lazy) {
-        k_reset_list_warp<<<v->num_envs, 32>>>(v->d_envs, v->d_resets);
+        int rgrid = v->num_envs;
+        if (rgrid > 512) rgrid = 512;
+        k_reset_list_warp<<<rgrid, 32>>>(v->d_envs, v->d_resets);
     } else {
         k_reset_list<<<(v->num_envs + 63) / 64, 64>>>(v->d_envs, v->d_resets);
     }
@@ -11176,7 +11208,17 @@ static void cu_rollout_step(
     k_value_sample<<<grid, 256, 0, st>>>(
         p->h3, p->logits, p->w.b_a, p->w.W_v, p->w.b_v,
         v->d_actions, act_dst, lp_dst, val_dst, n, seed, p->step_ctr);
-    k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, n, v->d_resets);
+    // Mid-small n: 64-wide under-fills the SMs (128 blocks @8192 on 188
+    // SMs). 32-wide doubles the block count so more SMs get a divergent
+    // gameplay warp; bit-identical (one thread still owns one env). Below
+    // ~4k the 32-wide form was measured slightly slower (launch/sched
+    // noise dominates), and above ~12k the wider block wins on the
+    // 3090-measured L1-share curve -- so only retile the mid band.
+    if (n >= 4096 && n <= 12288) {
+        k_step_run<<<(n + 31) / 32, 32, 0, st>>>(v->d_envs, n, v->d_resets);
+    } else {
+        k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, n, v->d_resets);
+    }
     if (r_reward_row)
         k_record_rd<<<grid, 256, 0, st>>>(v->d_rewards, v->d_terminals,
                                           r_reward_row, r_done_row, n);
@@ -11186,7 +11228,8 @@ static void cu_rollout_step(
         k_spawn_tail<<<tail_blocks, 256, 0, st>>>();
     }
     if (v->lazy) {
-        k_reset_list_warp<<<n, 32, 0, st>>>(v->d_envs, v->d_resets);
+        int rgrid = n > 512 ? 512 : n;
+        k_reset_list_warp<<<rgrid, 32, 0, st>>>(v->d_envs, v->d_resets);
     } else {
         k_reset_list<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, v->d_resets);
     }
@@ -11449,15 +11492,21 @@ static int cu_run_rollout_verify(int num_envs, int num_steps,
                 p.w, ref_state, v.d_terminals, v.d_obs, act2, lp2, val2,
                 ref_h3, n, seed, p.step_ctr);
             // Advance the env with the batched path's actions.
-            k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs, n,
-                                                     v.d_resets);
+            if (n >= 4096 && n <= 12288) {
+                k_step_run<<<(n + 31) / 32, 32, 0, st>>>(v.d_envs, n,
+                                                         v.d_resets);
+            } else {
+                k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs, n,
+                                                         v.d_resets);
+            }
             {
                 int tail_blocks = (n * 32 + 255) / 256;
                 if (tail_blocks > 512) tail_blocks = 512;
                 k_spawn_tail<<<tail_blocks, 256, 0, st>>>();
             }
             if (v.lazy) {
-                k_reset_list_warp<<<n, 32, 0, st>>>(v.d_envs, v.d_resets);
+                int rgrid = n > 512 ? 512 : n;
+                k_reset_list_warp<<<rgrid, 32, 0, st>>>(v.d_envs, v.d_resets);
             } else {
                 k_reset_list<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs,
                                                            v.d_resets);

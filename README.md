@@ -42,7 +42,8 @@ see git history):
 | CUDA, 262k envs, compact obs | RTX PRO 6000 Blackwell | 104.5M | - |
 | CUDA, 262k envs | RTX PRO 6000 Blackwell | 94.3M | 30.0M |
 | CUDA, 65k envs, compact obs | RTX PRO 6000 Blackwell | 89.5M | - |
-| CUDA, 65k envs | RTX PRO 6000 Blackwell | 85.6M | 30.3M |
+| CUDA, 65k envs | RTX PRO 6000 Blackwell | 85.6M | 31.5M |
+| CUDA, 8k envs | RTX PRO 6000 Blackwell | - | 17.6M |
 | CUDA, 186k envs, compact obs | RTX 3090 | 46.4M | - |
 | CUDA, 182k envs | RTX 3090 | 43.0M | - |
 | CUDA, 65k envs, compact obs | RTX 3090 | 40.4M | - |
@@ -315,24 +316,44 @@ at bptt-split 1, 2, and 4 (max |fd-g| ~1.7e-4). The training kernels
 leave the env code untouched: all random-action trajectory anchors and
 the state hash are bit-exact.
 
-Training SPS on the RTX PRO 6000 (h256x3, horizon 128, defaults
-epochs 1 / minibatches 4): 8192 envs 6.4M, 32768 8.0M, 65536 8.2M,
-131072 7.7M -- 2.6x over the scatter-encoder trainer (2.5M @8192,
-saturating at 3.1M): GEMM-ifying the backward encoder gave 1.9x,
-replacing the rollout's live warp encoder with the record+GEMM path
-gave 14.0M -> 22.8M standalone `run` SPS, and L2-chunking the rollout
-GRU chain (see above) gave 22.8M -> 30.3M. Below the 16k chunk width
-(8192 envs, and every sealed hash/gradcheck config) the launches are
-bit-identical to the unchunked chain. The split at 65536 is now 30%
-rollout / 70% backward, so the backward pass is the lever. 131,072
-envs train within the 96GB card. A 20-iteration smoke at 8192x128
-(21M steps, ~3s) reaches final-window episodic return 3.4 at eplen
-280 (random actions ~1.2) with the crafting tree already opening
-(wood pickaxe 1.3%, wood sword 1.1%, collect stone 0.3%).
-Hyperparameter sweeps and long runs for the h256x3 policy on the full
-game are open work; the hidden-32/128 results this section previously
-reported were measured on the retired architecture and live in git
-history (f4af14d and earlier).
+Training is a **split multi-kernel path** (record -> expand -> cuBLAS
+GEMMs -> MinGRU epilogues -> sample -> step -> spawn-tail -> reset),
+replayed as one CUDA graph per PPO iteration -- not a megakernel.
+(A fused env megakernel exists for random-action bench and was measured
+slower on sm_120: one occupancy config cannot serve both register-heavy
+gameplay and resident-warp encode.) Training SPS on the RTX PRO 6000
+(h256x3, horizon 128, auto minibatches under the 8 GB backward-buffer
+cap -- equals 4 at 8192):
+
+| envs | train SPS | standalone `run` SPS |
+|---:|---:|---:|
+| 1024 | 2.35M | 3.9M |
+| 2048 | 3.73M | 6.9M |
+| 4096 | 5.43M | 11.8M |
+| **8192** | **6.68M** | **17.6M** |
+| 16384 | 7.63M | 23.7M |
+| 32768 | 8.34M | 31.1M |
+| 65536 | 8.43M | 31.5M |
+
+Geomean train over {1k,2k,4k,8k} is 4.22M (was 4.03M before the
+small-N pass). Ladder: GEMM-ifying the backward encoder 1.9x, rollout
+record+GEMM 14.0M->22.8M `run`, L2-chunked GRU chain 22.8M->30.3M at
+65k, then small-N pass (shared-memory mob list + tail in `k_record_obs`
+58us->22us @8k, strided reset grid capped at 512 blocks, 32-wide
+`k_step_run` retiling in the 4k-12k band) 6.4M->6.68M train / 16.0M->
+17.6M `run` @8192. Below the 16k chunk width the GRU launches stay
+bit-identical to the unchunked chain (sealed runhash unchanged). At
+8192 the phase split is ~45% rollout / 55% backward; remaining
+rollout leaders are `k_step_run` (~109us, divergent gameplay) and
+`k_reset_list_warp` (~97us, real floor-0 worldgen). 131,072 envs train
+within the 96GB card. A 20-iteration smoke at 8192x128 (21M steps,
+~3s) reaches final-window episodic return 3.4 at eplen 280 (random
+actions ~1.2) with the crafting tree already opening (wood pickaxe
+1.3%, wood sword 1.1%, collect stone 0.3%). Hyperparameter sweeps and
+long runs for the h256x3 policy on the full game are open work; the
+hidden-32/128 results this section previously reported were measured
+on the retired architecture and live in git history (f4af14d and
+earlier).
 
 ## Citation
 
