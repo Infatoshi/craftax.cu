@@ -11129,8 +11129,12 @@ static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
 
 static cublasHandle_t g_blas = NULL;
 static float g_one = 1.0f, g_zero = 0.0f;
-// 0 = tensor-core custom (default), 1 = cuBLAS TF32
+// 1 = cuBLAS TF32 (default), 0 = multi-warp bf16 TC (CF_USE_CUBLAS=0).
+// CF_MMA_BF16_ACC=1: after each mma.sync, quantize fp32 accumulator
+// through bf16 (emulates .bf16.bf16.bf16.bf16 accumulate; wmma has no
+// clean bf16-acc store API).
 static int g_use_cublas = -1;
+static int g_mma_bf16_acc = -1;
 
 static void cu_ensure_blas(void) {
     if (!g_blas) {
@@ -11139,13 +11143,24 @@ static void cu_ensure_blas(void) {
     }
     if (g_use_cublas < 0) {
         const char* e = getenv("CF_USE_CUBLAS");
-        // Default cuBLAS TF32. CF_USE_CUBLAS=0 forces multi-warp bf16 TC.
         g_use_cublas = (e == NULL || atoi(e) != 0) ? 1 : 0;
+    }
+    if (g_mma_bf16_acc < 0) {
+        const char* e = getenv("CF_MMA_BF16_ACC");
+        g_mma_bf16_acc = (e && atoi(e) != 0) ? 1 : 0;
     }
 }
 
+template <typename Frag>
+static __device__ __forceinline__ void cf_acc_to_bf16(Frag& c) {
+#pragma unroll
+    for (int i = 0; i < Frag::num_elements; i++)
+        c.x[i] = __bfloat162float(__float2bfloat16(c.x[i]));
+}
+
 // ============================================================
-// Tensor-core policy GEMMs — multi-warp WMMA (bf16 MMA, fp32 acc).
+// Tensor-core policy GEMMs — multi-warp WMMA (bf16 inputs; fp32 or
+// bf16-emulated accumulate).
 //
 // This is NOT a CUDA-core tile. Each warp issues mma.sync via
 // nvcuda::wmma (PTX mma.sync.aligned.m16n16k16.*.bf16). Block is 16
@@ -11163,7 +11178,7 @@ static void cu_ensure_blas(void) {
 template <int BM, int BN, int BK>
 __global__ void __launch_bounds__(512, 1) k_cf_gemm_tc(
     const void* __restrict__ W, const float* __restrict__ X,
-    float* __restrict__ Y, int M, int N, int K, int w_is_bf16
+    float* __restrict__ Y, int M, int N, int K, int w_is_bf16, int bf16_acc
 ) {
     using namespace nvcuda::wmma;
     constexpr int WARPS_M = BM / 16;
@@ -11223,6 +11238,7 @@ __global__ void __launch_bounds__(512, 1) k_cf_gemm_tc(
         // B tile col-major at column warp_n*16: ptr = Bs + (warp_n*16)*BK
         load_matrix_sync(b_frag, Bs + (warp_n * 16) * BK, BK);
         mma_sync(c_frag, a_frag, b_frag, c_frag);
+        if (bf16_acc) cf_acc_to_bf16(c_frag);
         __syncthreads();
     }
 
@@ -11242,7 +11258,7 @@ __global__ void __launch_bounds__(512, 1) k_cf_gemm_tc(
 template <int BM, int BN, int BK>
 __global__ void __launch_bounds__(512, 1) k_cf_gemm_dh_tc(
     const float* __restrict__ W, const float* __restrict__ dpre,
-    float* __restrict__ dh, int m3, int N
+    float* __restrict__ dh, int m3, int N, int bf16_acc
 ) {
     using namespace nvcuda::wmma;
     constexpr int WARPS_M = BM / 16;
@@ -11286,6 +11302,7 @@ __global__ void __launch_bounds__(512, 1) k_cf_gemm_dh_tc(
         load_matrix_sync(a_frag, As + (warp_m * 16) * BK, BK);
         load_matrix_sync(b_frag, Bs + (warp_n * 16) * BK, BK);
         mma_sync(c_frag, a_frag, b_frag, c_frag);
+        if (bf16_acc) cf_acc_to_bf16(c_frag);
         __syncthreads();
     }
     __shared__ float Cs[NWARPS][16 * 16];
@@ -11302,7 +11319,7 @@ __global__ void __launch_bounds__(512, 1) k_cf_gemm_dh_tc(
 template <int BM, int BN, int BK>
 __global__ void __launch_bounds__(512, 1) k_cf_gemm_dw_tc(
     const float* __restrict__ X, const float* __restrict__ dpre,
-    float* __restrict__ dW, int rows, int N
+    float* __restrict__ dW, int rows, int N, int bf16_acc
 ) {
     using namespace nvcuda::wmma;
     constexpr int WARPS_M = BM / 16;
@@ -11352,6 +11369,7 @@ __global__ void __launch_bounds__(512, 1) k_cf_gemm_dw_tc(
         load_matrix_sync(a_frag, As + (warp_m * 16) * BK, BK);
         load_matrix_sync(b_frag, Bsr + (warp_n * 16), BN);
         mma_sync(c_frag, a_frag, b_frag, c_frag);
+        if (bf16_acc) cf_acc_to_bf16(c_frag);
         __syncthreads();
     }
     __shared__ float Cs[NWARPS][16 * 16];
@@ -11381,7 +11399,8 @@ static void cf_gemm_tc_fwd(int M, int N, int K, const float* W,
     constexpr int BM = 64, BN = 64, BK = 16;
     dim3 block(512);
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-    k_cf_gemm_tc<BM, BN, BK><<<grid, block, 0, s>>>(W, X, Y, M, N, K, 0);
+    k_cf_gemm_tc<BM, BN, BK><<<grid, block, 0, s>>>(
+        W, X, Y, M, N, K, /*w_is_bf16=*/0, g_mma_bf16_acc);
 }
 
 static void cf_gemm_tc_dh(int m3, int N, const float* W, const float* dpre,
@@ -11389,7 +11408,8 @@ static void cf_gemm_tc_dh(int m3, int N, const float* W, const float* dpre,
     constexpr int BM = 64, BN = 64, BK = 16;
     dim3 block(512);
     dim3 grid((N + BN - 1) / BN, (CF_NN_HIDDEN + BM - 1) / BM);
-    k_cf_gemm_dh_tc<BM, BN, BK><<<grid, block, 0, s>>>(W, dpre, dh, m3, N);
+    k_cf_gemm_dh_tc<BM, BN, BK>
+        <<<grid, block, 0, s>>>(W, dpre, dh, m3, N, g_mma_bf16_acc);
 }
 
 static void cf_gemm_tc_dw(int rows, int N, const float* X, const float* dpre,
@@ -11397,7 +11417,8 @@ static void cf_gemm_tc_dw(int rows, int N, const float* X, const float* dpre,
     constexpr int BM = 64, BN = 64, BK = 16;
     dim3 block(512);
     dim3 grid((rows + BN - 1) / BN, (CF_NN_HIDDEN + BM - 1) / BM);
-    k_cf_gemm_dw_tc<BM, BN, BK><<<grid, block, 0, s>>>(X, dpre, dW, rows, N);
+    k_cf_gemm_dw_tc<BM, BN, BK>
+        <<<grid, block, 0, s>>>(X, dpre, dW, rows, N, g_mma_bf16_acc);
 }
 
 static void cu_gemm_fwd(int m, int cols, int k, const float* W,
