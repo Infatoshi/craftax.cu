@@ -10168,6 +10168,9 @@ __global__ void k_add_dv_wv(
 // live replay actually consumed (tight layout, recorded by
 // k_mingru_epi_replay). dpre aliases pre in place (read before
 // write per element).
+//
+// Prefer k_mingru_step_bwd + reverse-time recompute in the trainer: the
+// full-T form streams multi-hundred-MB pre/x slabs and is DRAM-bound.
 __global__ void k_mingru_sweep_bwd(
     const float* __restrict__ pre,      // tight [GRU][T*mb] (aliased out)
     const float* __restrict__ x,        // tight [HIDDEN][T*mb] layer input
@@ -10211,6 +10214,144 @@ __global__ void k_mingru_sweep_bwd(
         float dsg = dout * (gh - s_in);
         dpre[o3 + CF_NN_HIDDEN] = dsg * sg * (1.0f - sg);
         dpre[o3] = dout * sg * cf_nn_dg_mingru(zh);
+    }
+}
+
+// One reverse timestep of MinGRU for the streaming recompute backward.
+// pre/x/st_used/dh* are tight [mb] columns (one t); dcarry[H*mb] is the
+// loop-carried reverse state (zeroed at BPTT segment boundaries via
+// zero_dcarry). done_row points at r_done[t*n + env_start].
+__global__ void k_mingru_step_bwd(
+    const float* __restrict__ pre,       // [GRU][mb]
+    const float* __restrict__ x,         // [HIDDEN][mb]
+    const float* __restrict__ dhGEMM,    // [HIDDEN][mb]
+    const float* __restrict__ dhExtra,   // [HIDDEN][mb] or null
+    const float* __restrict__ st_used,   // [HIDDEN][mb]
+    const uint8_t* __restrict__ done_row,
+    float* __restrict__ dpre,            // [GRU][mb]
+    float* __restrict__ dhExtraOut,      // [HIDDEN][mb] or null
+    float* __restrict__ dcarry,          // [HIDDEN][mb] in/out
+    int mb, int zero_dcarry
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= CF_NN_HIDDEN * mb) return;
+    int k = idx & (CF_NN_HIDDEN - 1);
+    int el = idx / CF_NN_HIDDEN;
+    size_t o = (size_t)el * CF_NN_HIDDEN + k;
+    size_t o3 = (size_t)el * CF_NN_GRU + k;
+
+    float dc = zero_dcarry ? 0.0f : dcarry[o];
+    float zh = pre[o3];
+    float zg = pre[o3 + CF_NN_HIDDEN];
+    float zp = pre[o3 + 2 * CF_NN_HIDDEN];
+    float dhout = dhGEMM[o];
+    if (dhExtra) dhout += dhExtra[o];
+    float s_in = st_used[o];
+    float xv = x[o];
+    bool done_t = done_row[el] != 0;
+
+    float sg = cf_nn_sigmoid(zg);
+    float gh = cf_nn_mingru_g(zh);
+    float p = cf_nn_sigmoid(zp);
+    float out_k = s_in + sg * (gh - s_in);
+    float dout = dhout * p + (done_t ? 0.0f : dc);
+    float dp_ = dhout * (out_k - xv);
+    dpre[o3 + 2 * CF_NN_HIDDEN] = dp_ * p * (1.0f - p);
+    if (dhExtraOut) dhExtraOut[o] = dhout * (1.0f - p);
+    dcarry[o] = dout * (1.0f - sg);
+    float dsg = dout * (gh - s_in);
+    dpre[o3 + CF_NN_HIDDEN] = dsg * sg * (1.0f - sg);
+    dpre[o3] = dout * sg * cf_nn_dg_mingru(zh);
+}
+
+// PPO head grads for one timestep's mb envs (tight logits/h). inv_batch
+// uses the full minibatch volume T*mb (same scale as the flat path);
+// adv stats use the full rollout n*T.
+__global__ void k_head_bwd_step(
+    const float* __restrict__ logits,   // tight [NUM_ACTIONS][mb]
+    const float* __restrict__ h_out,    // tight [HIDDEN][mb]
+    const float* __restrict__ b_a,
+    const float* __restrict__ W_v, const float* __restrict__ b_v,
+    const int32_t* __restrict__ r_act,      // [mb] row at t
+    const float* __restrict__ r_logprob,
+    const float* __restrict__ adv, const float* __restrict__ ret,
+    const double* __restrict__ adv_stats,
+    float* __restrict__ dlogits,        // tight [NUM_ACTIONS][mb]
+    float* __restrict__ dvalue,         // [mb]
+    double* __restrict__ loss_acc,
+    int mb, int n_all, int T_all,
+    float clip_eps, float vf_coef, const float* __restrict__ ent_coef_p
+) {
+    int el = blockIdx.x * blockDim.x + threadIdx.x;
+    if (el >= mb) return;
+    float ent_coef = *ent_coef_p;
+
+    double inv_count = 1.0 / ((double)n_all * (double)T_all);
+    float adv_mean = (float)(adv_stats[0] * inv_count);
+    double m = adv_stats[0] * inv_count;
+    double var = adv_stats[1] * inv_count - m * m;
+    float adv_inv_std = 1.0f / ((float)sqrt(var > 0.0 ? var : 0.0) + 1e-8f);
+    float inv_batch = 1.0f / (float)(T_all * mb);
+
+    const float* lp = logits + (size_t)el * CRAFTAX_NUM_ACTIONS;
+    float lg[CRAFTAX_NUM_ACTIONS], pi[CRAFTAX_NUM_ACTIONS];
+    float mx = -1e30f;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        lg[a] = lp[a] + b_a[a];
+        mx = fmaxf(mx, lg[a]);
+    }
+    float total = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        pi[a] = expf(lg[a] - mx);
+        total += pi[a];
+    }
+    float inv_total = 1.0f / total;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) pi[a] *= inv_total;
+    float lse = mx + logf(total);
+
+    int act = r_act[el];
+    float logp_new = lg[act] - lse;
+    float ratio = expf(logp_new - r_logprob[el]);
+    float A = (adv[el] - adv_mean) * adv_inv_std;
+    float u1 = ratio * A;
+    float u2 = fminf(fmaxf(ratio, 1.0f - clip_eps), 1.0f + clip_eps) * A;
+    float dlogp = (u1 <= u2) ? -A * ratio : 0.0f;
+    float H = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) H -= pi[a] * (lg[a] - lse);
+
+    const float* h3 = h_out + (size_t)el * CF_NN_HIDDEN;
+    float v = b_v[0];
+    #pragma unroll 4
+    for (int j = 0; j < CF_NN_HIDDEN; j++) v = fmaf(W_v[j], h3[j], v);
+    float dv = inv_batch * vf_coef * (v - ret[el]);
+    dvalue[el] = dv;
+
+    float* dq = dlogits + (size_t)el * CRAFTAX_NUM_ACTIONS;
+    #pragma unroll
+    for (int a = 0; a < CRAFTAX_NUM_ACTIONS; a++) {
+        float d = dlogp * ((a == act ? 1.0f : 0.0f) - pi[a]);
+        d += ent_coef * pi[a] * ((lg[a] - lse) + H);
+        dq[a] = d * inv_batch;
+    }
+
+    if (loss_acc) {
+        __shared__ double s_pg, s_v, s_e;
+        if (threadIdx.x == 0) { s_pg = 0.0; s_v = 0.0; s_e = 0.0; }
+        __syncthreads();
+        atomicAdd(&s_pg, -fminf(u1, u2));
+        float ve = 0.5f * (v - ret[el]) * (v - ret[el]);
+        atomicAdd(&s_v, ve);
+        atomicAdd(&s_e, H);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            atomicAdd(&loss_acc[0], s_pg);
+            atomicAdd(&loss_acc[1], s_v);
+            atomicAdd(&loss_acc[2], s_e);
+        }
     }
 }
 
@@ -11588,11 +11729,11 @@ static CuPPOConfig cu_ppo_defaults(void) {
     return cfg;
 }
 
-// The GEMM backward's tight minibatch buffers cost ~23.5 KB per sample
-// column (x[4] + preb[3] + stb[3] + dh/dlogits/dvalue + the expanded
-// fp32 feature matrix xobs); the auto-minibatcher sizes minibatches so
-// they stay under ~8 GB.
-#define CF_MB_BYTES_PER_COL 23472
+// Streaming recompute backward only keeps per-step (one t) working
+// sets sized by mb envs -- not T*mb activation slabs. ~28 KB/env covers
+// x[4]+pre[3]+dpre+dh*2+dcarry[3]+logits/dlogits/dvalue+xobs.
+// Auto-minibatcher caps mb so that footprint stays under ~8 GB.
+#define CF_MB_BYTES_PER_ENV 28672
 
 typedef struct {
     CuVec* v;
@@ -11619,18 +11760,20 @@ typedef struct {
     float* ret;         // [T][n]
     double* loss_acc;   // [3] pg, v, ent raw sums (logging / FD loss)
     double* stats;      // [2] adv sum, sumsq
-    // tight minibatch buffers (cols = T * mb)
-    float* x[4];        // [HIDDEN][cols]: enc out, layer outs
-    float* preb[3];     // [GRU][cols] (sweeps write dpre in place)
-    float* logitsb;     // [NUM_ACTIONS][cols]
-    float* dlogits;     // [NUM_ACTIONS][cols]
-    float* dvalue;      // [cols]
-    float* dh3b;        // [HIDDEN][cols]
-    float* dhG;         // [HIDDEN][cols]
-    float* dhX;         // [HIDDEN][cols]
-    float* stb[3];      // [HIDDEN][cols] post-zero input states from replay
-    float* xobs;        // [OBS][cols] expanded fp32 feature matrix
-    float* live_st[3];  // [HIDDEN][mb] replay carry across t
+    // Per-step recompute workspace (columns = mb, not T*mb). Flash-style
+    // reverse walks t = T-1..0, regenerating pre/x from r_obs+r_state,
+    // never materializing full-horizon activation slabs in HBM.
+    float* x[4];        // [HIDDEN][mb]
+    float* preb[3];     // [GRU][mb] (also holds dpre in place)
+    float* logitsb;     // [NUM_ACTIONS][mb]
+    float* dlogits;     // [NUM_ACTIONS][mb]
+    float* dvalue;      // [mb]
+    float* dh3b;        // [HIDDEN][mb] head-side / layer dh
+    float* dhG;         // [HIDDEN][mb] gemm-dh / layer workspace
+    float* dhX;         // [HIDDEN][mb] highway term
+    float* dcarry[3];   // [HIDDEN][mb] reverse recurrence per layer
+    float* xobs;        // [OBS][mb]
+    float* live_st[3];  // [HIDDEN][mb] loss()/gradcheck replay carry
     int mb;             // envs per minibatch
     long total_updates; // adam steps over the whole run (annealing)
     long updates_done;
@@ -11660,7 +11803,7 @@ static void cu_train_init(
         exit(1);
     }
     size_t nt = (size_t)tr->n * T;
-    size_t cols = (size_t)T * tr->mb;
+    size_t mb = (size_t)tr->mb;
     CU_CHECK(cudaMalloc(&tr->r_obs, nt * CF_TRAIN_OBS));
     CU_CHECK(cudaMalloc(&tr->r_state,
                         nt * CF_NN_LAYERS * CF_NN_HIDDEN * sizeof(float)));
@@ -11694,28 +11837,28 @@ static void cu_train_init(
     CU_CHECK(cudaMalloc(&tr->stats, 2 * sizeof(double)));
     for (int i = 0; i < 4; i++)
         CU_CHECK(cudaMalloc(&tr->x[i],
-                            (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+                            (size_t)CF_NN_HIDDEN * mb * sizeof(float)));
     for (int l = 0; l < 3; l++) {
         CU_CHECK(cudaMalloc(&tr->preb[l],
-                            (size_t)CF_NN_GRU * cols * sizeof(float)));
-        CU_CHECK(cudaMalloc(&tr->stb[l],
-                            (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+                            (size_t)CF_NN_GRU * mb * sizeof(float)));
         CU_CHECK(cudaMalloc(&tr->live_st[l],
-                            (size_t)CF_NN_HIDDEN * tr->mb * sizeof(float)));
+                            (size_t)CF_NN_HIDDEN * mb * sizeof(float)));
+        CU_CHECK(cudaMalloc(&tr->dcarry[l],
+                            (size_t)CF_NN_HIDDEN * mb * sizeof(float)));
     }
     CU_CHECK(cudaMalloc(&tr->logitsb,
-                        (size_t)CRAFTAX_NUM_ACTIONS * cols * sizeof(float)));
+                        (size_t)CRAFTAX_NUM_ACTIONS * mb * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->dlogits,
-                        (size_t)CRAFTAX_NUM_ACTIONS * cols * sizeof(float)));
-    CU_CHECK(cudaMalloc(&tr->dvalue, cols * sizeof(float)));
+                        (size_t)CRAFTAX_NUM_ACTIONS * mb * sizeof(float)));
+    CU_CHECK(cudaMalloc(&tr->dvalue, mb * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->dh3b,
-                        (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+                        (size_t)CF_NN_HIDDEN * mb * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->dhG,
-                        (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+                        (size_t)CF_NN_HIDDEN * mb * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->dhX,
-                        (size_t)CF_NN_HIDDEN * cols * sizeof(float)));
+                        (size_t)CF_NN_HIDDEN * mb * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->xobs,
-                        (size_t)CF_NN_OBS * cols * sizeof(float)));
+                        (size_t)CF_NN_OBS * mb * sizeof(float)));
     const char* prof = getenv("CRAFTAX_CU_TRAIN_PROF");
     tr->prof = prof != NULL && atoi(prof) != 0;
 }
@@ -11733,7 +11876,8 @@ static void cu_train_free(CuTrain* tr) {
     cudaFree(tr->loss_acc); cudaFree(tr->stats);
     for (int i = 0; i < 4; i++) cudaFree(tr->x[i]);
     for (int l = 0; l < 3; l++) {
-        cudaFree(tr->preb[l]); cudaFree(tr->stb[l]); cudaFree(tr->live_st[l]);
+        cudaFree(tr->preb[l]); cudaFree(tr->live_st[l]);
+        cudaFree(tr->dcarry[l]);
     }
     cudaFree(tr->logitsb); cudaFree(tr->dlogits); cudaFree(tr->dvalue);
     cudaFree(tr->dh3b); cudaFree(tr->dhG); cudaFree(tr->dhX);
@@ -11787,97 +11931,112 @@ static void cu_train_collect(CuTrain* tr) {
 }
 
 // Gradients over one contiguous env range, accumulated into the
-// (k_adam-zeroed) grads arena. Forward recompute at current theta:
-// live recurrence within BPTT segments (stored state reloaded at
-// segment starts), the same function the sweep's dcarry chain
-// differentiates.
+// (k_adam-zeroed) grads arena.
+//
+// Flash-style streaming reverse: never materializes pre/x for all T.
+// For t = T-1..0, recompute one forward step from r_obs[t] + r_state[t]
+// (weights ~3 MB stay L2-hot), form head grads, reverse the three
+// MinGRU layers with live dcarry, and accumulate dW online via beta=1
+// GEMMs on the mb-wide step. Working set is O(mb), not O(T*mb).
 static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
     CuPolicy* p = tr->p;
     cudaStream_t st = p->stream;
     const int T = tr->T, n = tr->n;
-    const int cols = T * env_count;
-    int bgrid = (cols + 255) / 256;
-    int hgrid = (int)(((size_t)CF_NN_HIDDEN * cols + 255) / 256);
-    int seg = cu_seg_len(tr);
+    const int mb = env_count;
+    const int seg = cu_seg_len(tr);
+    int egrid = (int)(((size_t)CF_NN_HIDDEN * mb + 255) / 256);
+    int xgrid = (int)(((size_t)CF_NN_OBS * mb + 255) / 256);
+    int hgrid = egrid;
+    int head_grid = (mb + 255) / 256;
 
-    int xgrid = (int)(((size_t)CF_NN_OBS * cols + 255) / 256);
-    k_expand_obs<<<xgrid, 256, 0, st>>>(
-        tr->r_obs, tr->xobs, 0, cols, env_count, n, env_start);
-    cu_gemm_enc_fwd(cols, p->w.W_enc, tr->xobs, tr->x[0], st);
-    k_add_bias<<<hgrid, 256, 0, st>>>(tr->x[0], p->w.b_enc, cols);
-    int egrid = (int)(((size_t)CF_NN_HIDDEN * env_count + 255) / 256);
-    for (int t = 0; t < T; t++) {
-        size_t co = (size_t)t * env_count;
-        bool segstart = (t % seg) == 0;
-        const uint8_t* prev = segstart ? NULL
-            : tr->r_done + (size_t)(t - 1) * n + env_start;
-        for (int l = 0; l < CF_NN_LAYERS; l++) {
-            cu_gemm_fwd(CF_NN_GRU, env_count, CF_NN_HIDDEN,
-                        p->w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
-                        tr->x[l] + co * CF_NN_HIDDEN,
-                        tr->preb[l] + co * CF_NN_GRU, st);
-            k_mingru_epi_replay<<<egrid, 256, 0, st>>>(
-                tr->preb[l] + co * CF_NN_GRU, tr->x[l] + co * CF_NN_HIDDEN,
-                segstart ? tr->r_state
-                        + ((size_t)t * CF_NN_LAYERS + l)
-                            * (size_t)CF_NN_HIDDEN * n
-                        + (size_t)env_start * CF_NN_HIDDEN
-                    : NULL,
-                tr->live_st[l], prev, tr->stb[l] + co * CF_NN_HIDDEN,
-                tr->x[l + 1] + co * CF_NN_HIDDEN, env_count);
-        }
-    }
-    cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, cols, CF_NN_HIDDEN, p->w.W_a, tr->x[3],
-                tr->logitsb, st);
+    const float* Wl[3] = {
+        p->w.W_gru,
+        p->w.W_gru + (size_t)CF_NN_GRU * CF_NN_HIDDEN,
+        p->w.W_gru + 2 * (size_t)CF_NN_GRU * CF_NN_HIDDEN,
+    };
 
-    k_head_bwd<<<bgrid, 256, 0, st>>>(
-        tr->logitsb, tr->x[3], p->w.b_a, p->w.W_v, p->w.b_v,
-        tr->r_act + env_start, tr->r_logprob + env_start,
-        tr->adv + env_start, tr->ret + env_start,
-        tr->stats, tr->dlogits, tr->dvalue, tr->loss_acc, T, env_count, n,
-        tr->cfg.clip, tr->cfg.vf, tr->d_ent);
-
-    // dh chain: heads -> layer 2 -> 1 -> 0
-    const float* Wl2 = p->w.W_gru + 2 * (size_t)CF_NN_GRU * CF_NN_HIDDEN;
-    const float* Wl1 = p->w.W_gru + (size_t)CF_NN_GRU * CF_NN_HIDDEN;
-    const float* Wl0 = p->w.W_gru;
-    cu_gemm_dh(CRAFTAX_NUM_ACTIONS, cols, p->w.W_a, tr->dlogits, tr->dh3b,
-               st);
-    k_add_dv_wv<<<hgrid, 256, 0, st>>>(tr->dh3b, tr->dvalue, p->w.W_v, cols);
-    int sgrid = (int)(((size_t)CF_NN_HIDDEN * env_count + 255) / 256);
-    const uint8_t* rdone = tr->r_done + env_start;
-    k_mingru_sweep_bwd<<<sgrid, 256, 0, st>>>(
-        tr->preb[2], tr->x[2], tr->dh3b, NULL, tr->stb[2],
-        rdone, tr->preb[2], tr->dhX, T, env_count, n, seg);
-    cu_gemm_dh(CF_NN_GRU, cols, Wl2, tr->preb[2], tr->dhG, st);
-    k_mingru_sweep_bwd<<<sgrid, 256, 0, st>>>(
-        tr->preb[1], tr->x[1], tr->dhG, tr->dhX, tr->stb[1],
-        rdone, tr->preb[1], tr->dhX, T, env_count, n, seg);
-    cu_gemm_dh(CF_NN_GRU, cols, Wl1, tr->preb[1], tr->dhG, st);
-    k_mingru_sweep_bwd<<<sgrid, 256, 0, st>>>(
-        tr->preb[0], tr->x[0], tr->dhG, tr->dhX, tr->stb[0],
-        rdone, tr->preb[0], tr->dhX, T, env_count, n, seg);
-    cu_gemm_dh(CF_NN_GRU, cols, Wl0, tr->preb[0], tr->dhG, st);
-    // dh_enc = dhG + highway term; then db_enc as a colsum and dW_enc
-    // as one flat GEMM against the expanded feature matrix.
-    k_vadd<<<hgrid, 256, 0, st>>>(tr->dhG, tr->dhX,
-                                  (size_t)CF_NN_HIDDEN * cols);
-    k_colsum<<<CF_NN_HIDDEN, 128, 0, st>>>(
-        tr->dhG, tr->grads + CF_NN_B_ENC, CF_NN_HIDDEN, cols);
-    cu_gemm_dw(CF_NN_OBS, cols, tr->dhG, tr->xobs,
-               tr->grads + CF_NN_W_ENC, st);
-
-    // weight grads: flat GEMMs over samples (beta=1 accumulate)
+    // dcarry starts fresh at t=T-1 (and at each BPTT cut).
     for (int l = 0; l < CF_NN_LAYERS; l++)
-        cu_gemm_dw(CF_NN_GRU, cols, tr->x[l], tr->preb[l],
-                   tr->grads + CF_NN_W_GRU
-                       + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN, st);
-    cu_gemm_dw(CRAFTAX_NUM_ACTIONS, cols, tr->x[3], tr->dlogits,
-               tr->grads + CF_NN_W_A, st);
-    cu_gemv_dwv(tr->x[3], tr->dvalue, tr->grads + CF_NN_W_V, cols, st);
-    k_colsum<<<CRAFTAX_NUM_ACTIONS, 128, 0, st>>>(
-        tr->dlogits, tr->grads + CF_NN_B_A, CRAFTAX_NUM_ACTIONS, cols);
-    k_colsum<<<1, 128, 0, st>>>(tr->dvalue, tr->grads + CF_NN_B_V, 1, cols);
+        CU_CHECK(cudaMemsetAsync(tr->dcarry[l], 0,
+                                 (size_t)CF_NN_HIDDEN * mb * sizeof(float),
+                                 st));
+
+    for (int t = T - 1; t >= 0; t--) {
+        // ---- recompute forward for this t only ----
+        // r_state[t,l] is the post-zero input the collect forward used,
+        // so each step reloads it (no need for live cross-t carry here).
+        k_expand_obs<<<xgrid, 256, 0, st>>>(
+            tr->r_obs, tr->xobs, t, mb, mb, n, env_start);
+        cu_gemm_enc_fwd(mb, p->w.W_enc, tr->xobs, tr->x[0], st);
+        k_add_bias<<<hgrid, 256, 0, st>>>(tr->x[0], p->w.b_enc, mb);
+        for (int l = 0; l < CF_NN_LAYERS; l++) {
+            cu_gemm_fwd(CF_NN_GRU, mb, CF_NN_HIDDEN, Wl[l], tr->x[l],
+                        tr->preb[l], st);
+            const float* rst =
+                tr->r_state
+                + ((size_t)t * CF_NN_LAYERS + l) * (size_t)CF_NN_HIDDEN * n
+                + (size_t)env_start * CF_NN_HIDDEN;
+            k_mingru_epi_replay<<<egrid, 256, 0, st>>>(
+                tr->preb[l], tr->x[l], rst, tr->live_st[l], NULL,
+                NULL, tr->x[l + 1], mb);
+        }
+        cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, mb, CF_NN_HIDDEN, p->w.W_a,
+                    tr->x[3], tr->logitsb, st);
+
+        // ---- head grads for this t ----
+        size_t row = (size_t)t * n + env_start;
+        k_head_bwd_step<<<head_grid, 256, 0, st>>>(
+            tr->logitsb, tr->x[3], p->w.b_a, p->w.W_v, p->w.b_v,
+            tr->r_act + row, tr->r_logprob + row, tr->adv + row,
+            tr->ret + row, tr->stats, tr->dlogits, tr->dvalue, tr->loss_acc,
+            mb, n, T, tr->cfg.clip, tr->cfg.vf, tr->d_ent);
+
+        cu_gemm_dh(CRAFTAX_NUM_ACTIONS, mb, p->w.W_a, tr->dlogits, tr->dh3b,
+                   st);
+        k_add_dv_wv<<<hgrid, 256, 0, st>>>(tr->dh3b, tr->dvalue, p->w.W_v,
+                                           mb);
+
+        // Actor weight/bias grads for this step
+        cu_gemm_dw(CRAFTAX_NUM_ACTIONS, mb, tr->x[3], tr->dlogits,
+                   tr->grads + CF_NN_W_A, st);
+        cu_gemv_dwv(tr->x[3], tr->dvalue, tr->grads + CF_NN_W_V, mb, st);
+        k_colsum<<<CRAFTAX_NUM_ACTIONS, 128, 0, st>>>(
+            tr->dlogits, tr->grads + CF_NN_B_A, CRAFTAX_NUM_ACTIONS, mb);
+        k_colsum<<<1, 128, 0, st>>>(tr->dvalue, tr->grads + CF_NN_B_V, 1,
+                                    mb);
+
+        // ---- reverse MinGRU layers l = 2..0 ----
+        // Match the flat path: dhGEMM = W_{l+1}^T @ dpre_{l+1} (or head
+        // dh for l=2), dhExtra = highway from the layer above; each
+        // layer carries its own dcarry with BPTT cuts.
+        int zero_dc = (t == T - 1 || ((t + 1) % seg) == 0) ? 1 : 0;
+        const uint8_t* done_row = tr->r_done + row;
+        const float* dh_gemm = tr->dh3b;
+        const float* dh_extra = NULL;
+        for (int l = CF_NN_LAYERS - 1; l >= 0; l--) {
+            const float* st_used =
+                tr->r_state
+                + ((size_t)t * CF_NN_LAYERS + l) * (size_t)CF_NN_HIDDEN * n
+                + (size_t)env_start * CF_NN_HIDDEN;
+            k_mingru_step_bwd<<<egrid, 256, 0, st>>>(
+                tr->preb[l], tr->x[l], dh_gemm, dh_extra, st_used, done_row,
+                tr->preb[l], tr->dhX, tr->dcarry[l], mb, zero_dc);
+            cu_gemm_dw(CF_NN_GRU, mb, tr->x[l], tr->preb[l],
+                       tr->grads + CF_NN_W_GRU
+                           + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                       st);
+            cu_gemm_dh(CF_NN_GRU, mb, Wl[l], tr->preb[l], tr->dhG, st);
+            dh_gemm = tr->dhG;
+            dh_extra = tr->dhX;  // highway for the layer below
+        }
+        // Encoder: dh = W0^T@dpre0 + highway0
+        k_vadd<<<hgrid, 256, 0, st>>>(tr->dhG, tr->dhX,
+                                      (size_t)CF_NN_HIDDEN * mb);
+        k_colsum<<<CF_NN_HIDDEN, 128, 0, st>>>(
+            tr->dhG, tr->grads + CF_NN_B_ENC, CF_NN_HIDDEN, mb);
+        cu_gemm_dw(CF_NN_OBS, mb, tr->dhG, tr->xobs, tr->grads + CF_NN_W_ENC,
+                   st);
+    }
     CU_CHECK(cudaGetLastError());
 }
 
@@ -12048,12 +12207,12 @@ static void cu_sum_logs(
 static int cu_run_train(
     int num_envs, int T, int iters, uint64_t seed, CuPPOConfig cfg
 ) {
-    // If the user did not size minibatches, pick the smallest power of
-    // two that keeps the ~20 KB/sample backward buffers under ~8 GB.
+    // Streaming backward only needs O(mb) workspace (~28 KB/env), not
+    // O(T*mb). Cap mb so that footprint stays under ~8 GB.
     {
-        size_t max_cols = ((size_t)8 << 30) / CF_MB_BYTES_PER_COL;
+        size_t max_mb = ((size_t)8 << 30) / CF_MB_BYTES_PER_ENV;
         while (cfg.minibatches < num_envs / 32 &&
-               (size_t)(num_envs / cfg.minibatches) * T > max_cols)
+               (size_t)(num_envs / cfg.minibatches) > max_mb)
             cfg.minibatches *= 2;
     }
     CuVec v;

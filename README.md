@@ -321,39 +321,38 @@ GEMMs -> MinGRU epilogues -> sample -> step -> spawn-tail -> reset),
 replayed as one CUDA graph per PPO iteration -- not a megakernel.
 (A fused env megakernel exists for random-action bench and was measured
 slower on sm_120: one occupancy config cannot serve both register-heavy
-gameplay and resident-warp encode.) Training SPS on the RTX PRO 6000
-(h256x3, horizon 128, auto minibatches under the 8 GB backward-buffer
-cap -- equals 4 at 8192):
+gameplay and resident-warp encode.)
+
+The PPO **backward** is FlashAttention-style streaming recompute: it
+never materializes full-horizon `pre`/`x` slabs (those were multi-GB
+and DRAM-bound). For `t = T-1..0` it regenerates one step from
+`r_obs[t]` + recorded `r_state[t]` (weights ~3 MB stay L2-hot), forms
+head grads, reverse-steps the three MinGRU layers with live `dcarry`,
+and accumulates `dW` online. Workspace is O(mb) (~28 KB/env), so the
+auto-minibatcher usually keeps `minibatches=1`. Gradcheck matches FD
+on all seven parameter segments.
+
+Training SPS on the RTX PRO 6000 (h256x3, horizon 128, auto mb):
 
 | envs | train SPS | standalone `run` SPS |
 |---:|---:|---:|
-| 1024 | 2.35M | 3.9M |
-| 2048 | 3.73M | 6.9M |
-| 4096 | 5.43M | 11.8M |
-| **8192** | **6.68M** | **17.6M** |
-| 16384 | 7.63M | 23.7M |
-| 32768 | 8.34M | 31.1M |
-| 65536 | 8.43M | 31.5M |
+| 1024 | 1.85M | 3.9M |
+| 2048 | 3.23M | 6.9M |
+| 4096 | 5.18M | 11.8M |
+| **8192** | **6.8M** | **17.6M** |
+| 16384 | 8.0M | 23.7M |
+| 32768 | 8.3M | 31.1M |
+| 65536 | ~6.5-7.8M | 31.5M |
 
-Geomean train over {1k,2k,4k,8k} is 4.22M (was 4.03M before the
-small-N pass). Ladder: GEMM-ifying the backward encoder 1.9x, rollout
-record+GEMM 14.0M->22.8M `run`, L2-chunked GRU chain 22.8M->30.3M at
-65k, then small-N pass (shared-memory mob list + tail in `k_record_obs`
-58us->22us @8k, strided reset grid capped at 512 blocks, 32-wide
-`k_step_run` retiling in the 4k-12k band) 6.4M->6.68M train / 16.0M->
-17.6M `run` @8192. Below the 16k chunk width the GRU launches stay
-bit-identical to the unchunked chain (sealed runhash unchanged). At
-8192 the phase split is ~45% rollout / 55% backward; remaining
-rollout leaders are `k_step_run` (~109us, divergent gameplay) and
-`k_reset_list_warp` (~97us, real floor-0 worldgen). 131,072 envs train
-within the 96GB card. A 20-iteration smoke at 8192x128 (21M steps,
-~3s) reaches final-window episodic return 3.4 at eplen 280 (random
-actions ~1.2) with the crafting tree already opening (wood pickaxe
-1.3%, wood sword 1.1%, collect stone 0.3%). Hyperparameter sweeps and
-long runs for the h256x3 policy on the full game are open work; the
-hidden-32/128 results this section previously reported were measured
-on the retired architecture and live in git history (f4af14d and
-earlier).
+At 8192 the phase split is ~48% rollout / 52% backward. The old
+full-T `k_mingru_sweep_bwd` (1.95 ms, 86% DRAM) is gone; per-step
+reverse is ~32 us and cache-resident. Remaining backward cost is the
+serial `T` recompute GEMMs / launches -- a T-window fuse is the next
+lever. Small-N train (1k-2k) is currently launch-bound on that serial
+chain (regression vs the flat-activation path). Sealed runhash and env
+anchors unchanged. A 20-iteration smoke at 8192x128 reaches final-window
+ret/ep ~3.3. Hyperparameter sweeps and long runs for h256x3 remain open
+work; retired h32/h128 numbers live in git history (f4af14d and earlier).
 
 ## Citation
 
