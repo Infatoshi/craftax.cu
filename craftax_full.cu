@@ -9624,6 +9624,19 @@ __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
         memcpy(rec + CF_NN_MAP + 4 * j, &tail[j], sizeof(float));
 }
 
+// Streaming (evict-first) accessors for the recurrent state and the
+// training state record: neither has reuse within a step, and they
+// must not evict the L2-resident pre tensor the chunked chain
+// depends on (cu_gru_chain below).
+static __device__ __forceinline__ float cf_ldcs(const float* p) {
+    float v;
+    asm volatile("ld.global.cs.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    return v;
+}
+static __device__ __forceinline__ void cf_stcs(float* p, float v) {
+    asm volatile("st.global.cs.f32 [%0], %1;" ::"l"(p), "f"(v));
+}
+
 // ============================================================
 // MinGRU layer epilogue (elementwise, one thread per (unit, col)).
 // pre/x/state/h_out are col-major; HIDDEN is a power of two so the
@@ -9647,9 +9660,9 @@ __global__ void k_mingru_epi_fwd(
     int col = idx / CF_NN_HIDDEN;
     size_t o = (size_t)col * CF_NN_HIDDEN + k;
 
-    float st = state[o];
+    float st = cf_ldcs(&state[o]);
     if (prev_terminals[col] != 0.0f) st = 0.0f;
-    if (r_state_store) r_state_store[o] = st;
+    if (r_state_store) cf_stcs(&r_state_store[o], st);
 
     size_t o3 = (size_t)col * CF_NN_GRU + k;
     float zh = pre[o3];
@@ -9659,7 +9672,7 @@ __global__ void k_mingru_epi_fwd(
     float p = cf_nn_sigmoid(zp);
     float xv = x[o];
     h_out[o] = p * out + (1.0f - p) * xv;
-    state[o] = out;
+    cf_stcs(&state[o], out);
 }
 
 // Live-recurrence replay for the backward's forward-recompute and
@@ -11099,6 +11112,44 @@ static void cu_encode_step(
         p->h_enc, p->w.b_enc, n);
 }
 
+// L2-tiled MinGRU chain: per-layer gate GEMM + epilogue over env
+// chunks small enough that the [GRU][chunk] pre tensor the GEMM
+// writes is still L2-resident when the epilogue reads it back
+// (50MB per 16k envs on a 128MB-L2 part, vs a 201MB-per-layer DRAM
+// round trip at 65k+ -- the epilogue was 30% of run-mode GPU time,
+// almost all of it pre traffic). The epilogue streams the recurrent
+// state evict-first (cf_ldcs/cf_stcs) so it cannot push pre out.
+// Chunking changes cuBLAS GEMM shapes, i.e. per-env sums, so it is
+// a fixed constant sealed by the usual runhash reseal; below the
+// chunk width (runverify, gradcheck) the loop is a single launch
+// with exactly the previous shapes.
+#define CF_CHAIN_CHUNK 16384
+
+static void cu_gru_chain(CuPolicy* p, const float* x0, float* state,
+                         const float* terminals, float* r_state_t,
+                         float* h3, int n, cudaStream_t st) {
+    size_t hn = (size_t)CF_NN_HIDDEN * n;
+    for (int e0 = 0; e0 < n; e0 += CF_CHAIN_CHUNK) {
+        int cn = n - e0 < CF_CHAIN_CHUNK ? n - e0 : CF_CHAIN_CHUNK;
+        size_t off = (size_t)e0 * CF_NN_HIDDEN;
+        size_t hc = (size_t)CF_NN_HIDDEN * cn;
+        const float* x = x0 + off;
+        for (int l = 0; l < CF_NN_LAYERS; l++) {
+            cu_gemm_fwd(CF_NN_GRU, cn, CF_NN_HIDDEN,
+                        p->w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                        x, p->pre, st);
+            float* xn = ((l < CF_NN_LAYERS - 1) ? p->hout[l] : h3) + off;
+            float* store =
+                r_state_t ? r_state_t + (size_t)l * hn + off : NULL;
+            k_mingru_epi_fwd<<<(int)((hc + 255) / 256), 256, 0, st>>>(
+                p->pre, x, state + (size_t)l * hn + off, xn, store,
+                terminals + e0, cn);
+            x = xn;
+        }
+    }
+    CU_CHECK(cudaGetLastError());
+}
+
 // One env+policy step, batched split path, all on p->stream (graph
 // capturable: the sampler offset and every seed input are device
 // state). The float obs tensor is never written; the policy consumes
@@ -11114,23 +11165,12 @@ static void cu_rollout_step(
 ) {
     int n = v->num_envs;
     cudaStream_t st = p->stream;
-    size_t hn = (size_t)CF_NN_HIDDEN * n;
     int grid = (n + 255) / 256;
     CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int), st));
     CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int), st));
     cu_encode_step(p, r_obs_row, n, st);
-    const float* x = p->h_enc;
-    for (int l = 0; l < CF_NN_LAYERS; l++) {
-        cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
-                    p->w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
-                    x, p->pre, st);
-        float* xn = (l < CF_NN_LAYERS - 1) ? p->hout[l] : p->h3;
-        float* store = r_state_t ? r_state_t + (size_t)l * hn : NULL;
-        k_mingru_epi_fwd<<<(int)((hn + 255) / 256), 256, 0, st>>>(
-            p->pre, x, p->h_state + (size_t)l * hn, xn, store,
-            v->d_terminals, n);
-        x = xn;
-    }
+    cu_gru_chain(p, p->h_enc, p->h_state, v->d_terminals, r_state_t,
+                 p->h3, n, st);
     cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p->w.W_a, p->h3,
                 p->logits, st);
     k_value_sample<<<grid, 256, 0, st>>>(
@@ -11164,8 +11204,11 @@ static void cu_rollout_step_plain(CuVec* v, CuPolicy* p, uint64_t seed) {
 // inside graph capture): dummy GEMMs into the scratch buffers.
 static void cu_warm_blas_fwd(CuPolicy* p, int n) {
     cu_gemm_enc_fwd(n, p->w.W_enc, p->xobs, p->h_enc, p->stream);
-    cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN, p->w.W_gru, p->h_enc, p->pre,
-                p->stream);
+    for (int e0 = 0; e0 < n; e0 += CF_CHAIN_CHUNK) {
+        int cn = n - e0 < CF_CHAIN_CHUNK ? n - e0 : CF_CHAIN_CHUNK;
+        cu_gemm_fwd(CF_NN_GRU, cn, CF_NN_HIDDEN, p->w.W_gru, p->h_enc,
+                    p->pre, p->stream);
+    }
     cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p->w.W_a, p->h_enc,
                 p->logits, p->stream);
     CU_CHECK(cudaStreamSynchronize(p->stream));
@@ -11394,17 +11437,8 @@ static int cu_run_rollout_verify(int num_envs, int num_steps,
             CU_CHECK(cudaMemsetAsync(v.d_spawn_count, 0, sizeof(int), st));
             // Batched forward (same launches as cu_rollout_step).
             cu_encode_step(&p, NULL, n, st);
-            const float* x = p.h_enc;
-            for (int l = 0; l < CF_NN_LAYERS; l++) {
-                cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
-                            p.w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
-                            x, p.pre, st);
-                float* xn = (l < CF_NN_LAYERS - 1) ? p.hout[l] : p.h3;
-                k_mingru_epi_fwd<<<(int)((hn + 255) / 256), 256, 0, st>>>(
-                    p.pre, x, p.h_state + (size_t)l * hn, xn, NULL,
-                    v.d_terminals, n);
-                x = xn;
-            }
+            cu_gru_chain(&p, p.h_enc, p.h_state, v.d_terminals, NULL,
+                         p.h3, n, st);
             cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p.w.W_a, p.h3,
                         p.logits, st);
             k_value_sample<<<grid, 256, 0, st>>>(
@@ -11687,17 +11721,8 @@ static void cu_train_collect(CuTrain* tr) {
                              (size_t)CF_NN_LAYERS * hn * sizeof(float),
                              cudaMemcpyDeviceToDevice, st));
     cu_encode_step(p, NULL, n, st);
-    const float* x = p->h_enc;
-    for (int l = 0; l < CF_NN_LAYERS; l++) {
-        cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
-                    p->w.W_gru + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
-                    x, p->pre, st);
-        float* xn = (l < CF_NN_LAYERS - 1) ? p->hout[l] : p->h3;
-        k_mingru_epi_fwd<<<(int)((hn + 255) / 256), 256, 0, st>>>(
-            p->pre, x, tr->boot_state + (size_t)l * hn, xn, NULL,
-            v->d_terminals, n);
-        x = xn;
-    }
+    cu_gru_chain(p, p->h_enc, tr->boot_state, v->d_terminals, NULL,
+                 p->h3, n, st);
     int grid = (n + 255) / 256;
     k_value_dot<<<grid, 256, 0, st>>>(p->h3, p->w.W_v, p->w.b_v,
                                       tr->v_boot, n);

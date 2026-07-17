@@ -30,7 +30,7 @@ Env steps per second:
 
 Full game (random actions for env-only, auto-reset included; env+policy
 is the `run` rollout path with the h256x3 policy in the loop -- it is
-policy-GEMM-bound and flat at ~22.5M SPS from 65k envs on the PRO 6000;
+policy-GEMM-bound and flat at ~30M SPS from 65k envs on the PRO 6000;
 the retired hidden-32 gathered-scalar policy reached ~103M at 524k,
 see git history):
 
@@ -40,9 +40,9 @@ see git history):
 | CUDA, 524k envs, compact obs | RTX PRO 6000 Blackwell | 122.3M | - |
 | CUDA, 524k envs | RTX PRO 6000 Blackwell | 102.0M | - |
 | CUDA, 262k envs, compact obs | RTX PRO 6000 Blackwell | 104.5M | - |
-| CUDA, 262k envs | RTX PRO 6000 Blackwell | 94.3M | 22.4M |
+| CUDA, 262k envs | RTX PRO 6000 Blackwell | 94.3M | 30.0M |
 | CUDA, 65k envs, compact obs | RTX PRO 6000 Blackwell | 89.5M | - |
-| CUDA, 65k envs | RTX PRO 6000 Blackwell | 85.6M | 22.8M |
+| CUDA, 65k envs | RTX PRO 6000 Blackwell | 85.6M | 30.3M |
 | CUDA, 186k envs, compact obs | RTX 3090 | 46.4M | - |
 | CUDA, 182k envs | RTX 3090 | 43.0M | - |
 | CUDA, 65k envs, compact obs | RTX 3090 | 40.4M | - |
@@ -108,7 +108,13 @@ the 996-byte compact obs record (one warp per env, lane per view
 cell), the record expands into an fp32 feature matrix, and the encoder
 forward is one cuBLAS GEMM -- the same record the trainer stores and
 replays. Each GRU layer is a cuBLAS GEMM plus an elementwise epilogue,
-and a fused value/sampling kernel writes the rollout and the env's
+run over 16k-env chunks so the [768][chunk] pre-activation tensor the
+GEMM writes is still L2-resident when the epilogue reads it back
+(50MB per chunk on a 128MB-L2 part instead of a 201MB-per-layer DRAM
+round trip; the epilogue streams the recurrent state evict-first so
+it cannot push pre out -- the epilogue fell from 918us to 273us per
+step at 65k, 22.8M -> 30.3M SPS). A fused value/sampling kernel
+writes the rollout and the env's
 action slot. The whole step replays as a CUDA graph (`--graph 1`);
 eager and graph rollouts are bitwise identical, and `runhash` seals
 the whole rollout (actions, logprobs, values, rewards, terminals)
@@ -310,12 +316,15 @@ leave the env code untouched: all random-action trajectory anchors and
 the state hash are bit-exact.
 
 Training SPS on the RTX PRO 6000 (h256x3, horizon 128, defaults
-epochs 1 / minibatches 4): 8192 envs 6.4M, 32768 7.5M, 65536 7.5M,
-131072 7.5M -- 2.4x over the scatter-encoder trainer (2.5M @8192,
-saturating at 3.1M): GEMM-ifying the backward encoder gave 1.9x, and
+epochs 1 / minibatches 4): 8192 envs 6.4M, 32768 8.0M, 65536 8.2M,
+131072 7.7M -- 2.6x over the scatter-encoder trainer (2.5M @8192,
+saturating at 3.1M): GEMM-ifying the backward encoder gave 1.9x,
 replacing the rollout's live warp encoder with the record+GEMM path
-(the standalone `run` rollout went 14.0M -> 22.8M SPS) gave the
-rest. The split at 8192 is now 46% rollout / 54% backward. 131,072
+gave 14.0M -> 22.8M standalone `run` SPS, and L2-chunking the rollout
+GRU chain (see above) gave 22.8M -> 30.3M. Below the 16k chunk width
+(8192 envs, and every sealed hash/gradcheck config) the launches are
+bit-identical to the unchunked chain. The split at 65536 is now 30%
+rollout / 70% backward, so the backward pass is the lever. 131,072
 envs train within the 96GB card. A 20-iteration smoke at 8192x128
 (21M steps, ~3s) reaches final-window episodic return 3.4 at eplen
 280 (random actions ~1.2) with the crafting tree already opening
