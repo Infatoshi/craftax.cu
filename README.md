@@ -271,34 +271,40 @@ forces eager per-phase timing). Per step each env stores a 996-byte
 compact obs record (792 packed-map bytes + the 51-float scalar tail --
 the `CRAFTAX_WG_COMPACT_OBS_SIZE` layout, written independently of the
 obs build flag), its three MinGRU state inputs, and
-action/logprob/value/reward/done. Backward recomputes the forward from
-the record bit-identically to the rollout (gradcheck's replay gate:
-0/512 env-steps mismatching): stored states enter as constants at BPTT
-segment starts, the recurrence is live (done-gated) within segments,
-per-layer sweeps run the dcarry chain per (unit, env) descending t,
-and the dense weight gradients are flat GEMMs over all T x mb samples
-with beta=1 accumulation into a single grads arena that Adam consumes
-and zeroes. The encoder's active set is exactly the nonzero record
-entries, so the W_enc gradient scatters `x_f * dh_enc` into only the
-columns the forward touched. Unlike classic's one-hot features,
-full-game features are scalar-coded (block/item/mob ids) or continuous
-(inventory sqrt-scales, health, light level), so every active column's
-gradient is weighted by its actual feature value.
-`./craftax_full_cuda gradcheck` verifies all seven parameter segments
-against central finite differences of the PPO loss at bptt-split 1, 2,
-and 4 (max |fd-g| ~1.3e-4; the default FD step sits at the fp32 noise
-floor for near-zero encoder biases, where the FD value drifts with
-step size and seed while the analytic value is stable). The training
-kernels leave the env code untouched: all random-action trajectory
-anchors and the state hash are bit-exact.
+action/logprob/value/reward/done. The record write is
+warp-cooperative (one warp per env, lane per view cell; the serial
+scatter form ran 32 blocks on 188 SMs at 8192 envs). Backward
+recomputes the forward from the record: stored states enter as
+constants at BPTT segment starts, the recurrence is live (done-gated)
+within segments, per-layer sweeps run the dcarry chain per (unit, env)
+descending t, and every dense gradient -- including the encoder's --
+is a flat GEMM over all T x mb samples with beta=1 accumulation into a
+single grads arena that Adam consumes and zeroes. Unlike classic's
+sparse one-hots, full-game features are scalar-coded (block/item/mob
+ids) or continuous (inventory sqrt-scales, health, light level) and
+mostly nonzero, so the "sparse" per-feature encoder walk was really a
+dense 843x256 matmul in scalar fmafs/atomics (k_enc_bwd alone was 25%
+of all GPU time, L2-atomic-bound); the records now expand into an fp32
+feature matrix per minibatch (k_expand_obs) and the encoder forward
+and W_enc gradient are cuBLAS GEMMs. `./craftax_full_cuda gradcheck`
+runs a two-pass replay gate -- the scalar record encoder (fmaf order
+identical to the rollout's warp encoder) must reproduce stored
+logprobs/values BITWISE at every (env, t), sealing record integrity
+and replay semantics, and the production GEMM-encode path must match
+within 1e-3 (measured max |d| 4.8e-7) -- then verifies all seven
+parameter segments against central finite differences of the PPO loss
+at bptt-split 1, 2, and 4 (max |fd-g| ~1.7e-4). The training kernels
+leave the env code untouched: all random-action trajectory anchors and
+the state hash are bit-exact.
 
 Training SPS on the RTX PRO 6000 (h256x3, horizon 128, defaults
-epochs 1 / minibatches 4): 8192 envs 2.5M, 32768 3.1M, 65536 3.1M,
-131072 3.1M -- the trainer saturates at ~3.1M SPS from 32k envs
-(policy GEMMs dominate; the rollout alone runs 14M SPS), and 131,072
+epochs 1 / minibatches 4): 8192 envs 4.9M, 32768 5.9M, 65536 5.9M,
+131072 5.9M -- 1.9x over the scatter-encoder trainer (2.5M @8192,
+saturating at 3.1M), now split roughly evenly between rollout and
+backward (at 8192: 57% rollout / 42% backward, was 43/57). 131,072
 envs train within the 96GB card. A 20-iteration smoke at 8192x128
-(21M steps, ~8s) reaches final-window episodic return 3.6 at eplen
-279 (random actions ~1.2) with the crafting tree already opening
+(21M steps, ~4s) reaches final-window episodic return 3.6 at eplen
+280 (random actions ~1.2) with the crafting tree already opening
 (wood pickaxe 1.8%, wood sword 1.0%, collect stone 0.4%).
 Hyperparameter sweeps and long runs for the h256x3 policy on the full
 game are open work; the hidden-32/128 results this section previously
