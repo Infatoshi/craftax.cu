@@ -9523,153 +9523,12 @@ static __device__ int cf_nn_sample_action(
     return action;
 }
 
-// ============================================================
-// Warp-cooperative live encoder: one warp per env, lane owns
-// CF_ENC_W = HIDDEN/32 = 8 hidden units. All 32 lanes redundantly
-// walk the same env's feature decode (uniform loads broadcast
-// through L1); each lane FMAs its W_enc row slice, so the warp
-// covers each 1-KB weight column line-exactly. Output is col-major
-// [HIDDEN][n]: h_enc[k + e*HIDDEN], fed straight to cuBLAS.
-// Feature values, order and zero-skip predicates are exactly
-// cf_encode / cf_encode_tail's (same walk the old scalar gather
-// used; only the unit->thread mapping changed, so per-unit fmaf
-// chains are bit-identical).
-// ============================================================
-#define CF_ENC_W (CF_NN_HIDDEN / 32)
-
-static __device__ __forceinline__ void cf_enc_acc(
-    float* hv, float x, const float* __restrict__ colp, int lane
-) {
-    const float* col = colp + lane * CF_ENC_W;
-    #pragma unroll
-    for (int i = 0; i < CF_ENC_W; i++) hv[i] = fmaf(x, col[i], hv[i]);
-}
-
-__global__ void k_encode_env_warp(
-    const float* __restrict__ W_enc, const float* __restrict__ b_enc,
-    float* __restrict__ h_enc, int num_envs
-) {
-    const int lane = threadIdx.x & 31;
-    int e = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    if (e >= num_envs) return;
-    const CraftaxState* cs = &((const CraftaxState*)g_cf_state_base)[e];
-    const CraftaxWorldState* state = (const CraftaxWorldState*)(const void*)cs;
-
-    float hv[CF_ENC_W];
-    {
-        const float* be = b_enc + lane * CF_ENC_W;
-        #pragma unroll
-        for (int i = 0; i < CF_ENC_W; i++) hv[i] = be[i];
-    }
-
-    const int level = CF(player_level, state);
-    const int mob_level =
-        craftax_wg_jax_index(CF(player_level, state), CRAFTAX_WG_NUM_LEVELS);
-    const int top = CF2(player_position, 0, state) - CRAFTAX_WG_OBS_ROWS / 2;
-    const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
-
-    // Visible-mob list (same predicates and class/slot order as the
-    // k_encode scatter). Last-slot-wins per (cell, channel) is reproduced
-    // by overwriting an existing entry instead of appending. Built
-    // redundantly by every lane (uniform).
-    int16_t mob_cell[14];
-    int8_t mob_ch[14];
-    float mob_val[14];
-    int nm = 0;
-    for (int c = 0; c < CRAFTAX_WG_NUM_MOB_CLASSES; c++) {
-        const int nslots = c == 2 ? 2 : 3;
-        for (int i = 0; i < nslots; i++) {
-            int type_id = MOB_TYPE(c, mob_level, i, state);
-            if (type_id < 0 || type_id >= CRAFTAX_WG_NUM_MOB_TYPES
-                || !MOB_MASK(c, mob_level, i, state)) {
-                continue;
-            }
-            int mob_row = MOB_POS(c, mob_level, i, 0, state);
-            int mob_col = MOB_POS(c, mob_level, i, 1, state);
-            int local_row = mob_row - top;
-            int local_col = mob_col - left;
-            if (local_row < 0 || local_row >= CRAFTAX_WG_OBS_ROWS
-                || local_col < 0 || local_col >= CRAFTAX_WG_OBS_COLS) {
-                continue;
-            }
-            bool in_bounds = mob_row >= 0 && mob_row < CRAFTAX_WG_MAP_SIZE
-                && mob_col >= 0 && mob_col < CRAFTAX_WG_MAP_SIZE;
-            if (!in_bounds
-                || state->light_map[mob_level][mob_row][mob_col] <= 12) {
-                continue;
-            }
-            int16_t cell =
-                (int16_t)(local_row * CRAFTAX_WG_OBS_COLS + local_col);
-            int8_t ch = (int8_t)(3 + c);
-            int found = -1;
-            for (int j = 0; j < nm; j++)
-                if (mob_cell[j] == cell && mob_ch[j] == ch) found = j;
-            if (found >= 0) {
-                mob_val[found] = (float)(type_id + 1);
-            } else {
-                mob_cell[nm] = cell;
-                mob_ch[nm] = ch;
-                mob_val[nm] = (float)(type_id + 1);
-                nm++;
-            }
-        }
-    }
-
-    for (int cell = 0; cell < CRAFTAX_WG_OBS_ROWS * CRAFTAX_WG_OBS_COLS;
-         cell++) {
-        int row = cell / CRAFTAX_WG_OBS_COLS;
-        int col = cell % CRAFTAX_WG_OBS_COLS;
-        int world_row = top + row;
-        int world_col = left + col;
-        bool in_bounds = world_row >= 0 && world_row < CRAFTAX_WG_MAP_SIZE
-            && world_col >= 0 && world_col < CRAFTAX_WG_MAP_SIZE;
-        bool visible =
-            in_bounds && state->light_map[level][world_row][world_col] > 12;
-        int fbase = cell * CRAFTAX_WG_PACKED_CHANNELS_PER_CELL;
-        if (visible) {
-            float v0 = (float)state->map[level][world_row][world_col];
-            if (v0 != 0.0f)
-                cf_enc_acc(hv, v0, W_enc + (size_t)fbase * CF_NN_HIDDEN, lane);
-            float v1 =
-                (float)state->item_map[level][world_row][world_col] + 1.0f;
-            if (v1 != 0.0f)
-                cf_enc_acc(hv, v1,
-                           W_enc + (size_t)(fbase + 1) * CF_NN_HIDDEN, lane);
-            cf_enc_acc(hv, 1.0f,
-                       W_enc + (size_t)(fbase + 2) * CF_NN_HIDDEN, lane);
-        }
-        for (int m = 0; m < nm; m++) {
-            if ((int)mob_cell[m] == cell) {
-                cf_enc_acc(
-                    hv, mob_val[m],
-                    W_enc + (size_t)(fbase + mob_ch[m]) * CF_NN_HIDDEN, lane);
-            }
-        }
-    }
-
-    // Scalar tail: exact values of cf_encode_tail, zero terms skipped.
-    float tail[CF_NN_TAIL];
-    craftax_encode_scalar_observation_tail_at(state, tail, 0);
-    for (int j = 0; j < CF_NN_TAIL; j++) {
-        float x = tail[j];
-        if (x == 0.0f) continue;
-        cf_enc_acc(hv, x, W_enc + (size_t)(CF_NN_MAP + j) * CF_NN_HIDDEN,
-                   lane);
-    }
-
-    float4* dst = (float4*)(h_enc + (size_t)e * CF_NN_HIDDEN
-                            + lane * CF_ENC_W);
-    dst[0] = make_float4(hv[0], hv[1], hv[2], hv[3]);
-    dst[1] = make_float4(hv[4], hv[5], hv[6], hv[7]);
-}
-
 // Compact obs record for the training rollout (row t of r_obs).
 // Warp-cooperative: one warp per env, lane per view cell (gather form
 // of craftax_encode_compact_observation -- per-cell bytes are pure
 // functions of state, and the serial mob scatter's last-slot-wins is
-// reproduced by the same overwrite-on-(cell,ch)-match list build as
-// k_encode_env_warp, so the record bytes are identical to the old
-// thread-per-env scatter). The thread-per-env form ran as 32 blocks
+// reproduced by an overwrite-on-(cell,ch)-match mob list, so the
+// record bytes are identical to the old thread-per-env scatter). The thread-per-env form ran as 32 blocks
 // at 8192 envs (16.6% occupancy, 565us/step, grid starvation).
 __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
     const int lane = threadIdx.x & 31;
@@ -9686,8 +9545,8 @@ __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
     const int left = CF2(player_position, 1, state) - CRAFTAX_WG_OBS_COLS / 2;
 
     // Visible-mob list, built redundantly by every lane (uniform walk;
-    // same predicates, class/slot order and overwrite semantics as
-    // k_encode_env_warp / the serial compact scatter).
+    // same predicates, class/slot order and overwrite semantics as the
+    // serial compact scatter).
     int16_t mob_cell[14];
     int8_t mob_ch[14];
     uint8_t mob_val[14];
@@ -10063,7 +9922,8 @@ __global__ void k_nan_scan(
 // One thread per (hidden unit k, sample w); sample w maps to
 // (t = t0 + w / mb, env offset env_start + w % mb). Output column w
 // (tight [HIDDEN][count]). Dense ascending feature walk, exact-zero
-// terms skipped: bit-identical to k_encode_env_warp's per-unit sums.
+// terms skipped: the scalar fmaf reference the gradcheck replay gate
+// checks the production GEMM encode against.
 // NOTE: thread-per-unit on purpose. The classic warp-cooperative
 // form of this stored-obs kernel (and its backward twin) miscompiled
 // under nvcc 13.2 sm_120 -O3 (garbage tail reads, dropped final
@@ -11136,6 +10996,8 @@ typedef struct {
     float* params;
     CfWeights w;
     float* h_state;   // [LAYERS][HIDDEN][n] live recurrent state
+    uint8_t* rec;     // [n][CF_TRAIN_OBS] obs record scratch (non-training)
+    float* xobs;      // [OBS][n] expanded fp32 features for the enc GEMM
     float* h_enc;     // [HIDDEN][n] col-major forward chain
     float* hout[2];   // [HIDDEN][n]
     float* h3;        // [HIDDEN][n]
@@ -11152,7 +11014,7 @@ static void cu_policy_init(CuPolicy* p, int num_envs) {
     if (num_envs % 32 != 0) {
         fprintf(stderr,
                 "policy modes need --envs to be a multiple of 32 "
-                "(warp encoder)\n");
+                "(warp record kernel)\n");
         exit(1);
     }
     cu_ensure_blas();
@@ -11187,6 +11049,9 @@ static void cu_policy_init(CuPolicy* p, int num_envs) {
                         (size_t)CF_NN_LAYERS * hn * sizeof(float)));
     CU_CHECK(cudaMemset(p->h_state, 0,
                         (size_t)CF_NN_LAYERS * hn * sizeof(float)));
+    CU_CHECK(cudaMalloc(&p->rec, (size_t)num_envs * CF_TRAIN_OBS));
+    CU_CHECK(cudaMalloc(&p->xobs,
+                        (size_t)CF_NN_OBS * num_envs * sizeof(float)));
     CU_CHECK(cudaMalloc(&p->h_enc, hn * sizeof(float)));
     CU_CHECK(cudaMalloc(&p->hout[0], hn * sizeof(float)));
     CU_CHECK(cudaMalloc(&p->hout[1], hn * sizeof(float)));
@@ -11206,17 +11071,40 @@ static void cu_policy_init(CuPolicy* p, int num_envs) {
 static void cu_policy_free(CuPolicy* p) {
     cudaStreamDestroy(p->stream);
     cudaFree(p->params); cudaFree(p->h_state);
+    cudaFree(p->rec); cudaFree(p->xobs);
     cudaFree(p->h_enc); cudaFree(p->hout[0]); cudaFree(p->hout[1]);
     cudaFree(p->h3); cudaFree(p->pre); cudaFree(p->logits);
     cudaFree(p->d_act); cudaFree(p->d_logprob); cudaFree(p->d_value);
     cudaFree(p->step_ctr);
 }
 
+// Live encoder: warp-cooperative compact record write from SoA state,
+// expand to fp32, then h_enc = W_enc^T x as one cuBLAS GEMM (+ bias).
+// The record is the single observation path -- the rollout policy
+// consumes the same bytes training stores (rec_row = the training
+// slab row when recording, p->rec scratch otherwise). This replaced a
+// warp-per-env gather that serially fmaf'd ~250 mostly-nonzero
+// features per env (388us/step at 8192 envs, 26% of training GPU
+// time; the GEMM route is ~100us total).
+static void cu_encode_step(
+    CuPolicy* p, uint8_t* rec_row, int n, cudaStream_t st
+) {
+    if (!rec_row) rec_row = p->rec;
+    k_record_obs<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
+        rec_row, n);
+    k_expand_obs<<<(int)(((size_t)CF_NN_OBS * n + 255) / 256), 256, 0, st>>>(
+        rec_row, p->xobs, 0, n, n, n, 0);
+    cu_gemm_enc_fwd(n, p->w.W_enc, p->xobs, p->h_enc, st);
+    k_add_bias<<<(int)(((size_t)CF_NN_HIDDEN * n + 255) / 256), 256, 0, st>>>(
+        p->h_enc, p->w.b_enc, n);
+}
+
 // One env+policy step, batched split path, all on p->stream (graph
 // capturable: the sampler offset and every seed input are device
-// state). No observation tensor is ever written. Optional recording
-// pointers (training): compact obs record, per-layer post-zero state
-// inputs (slab base for this t), and the reward/done row.
+// state). The float obs tensor is never written; the policy consumes
+// the 996-byte compact record (cu_encode_step). Optional recording
+// pointers (training): the record row itself, per-layer post-zero
+// state inputs (slab base for this t), and the reward/done row.
 static void cu_rollout_step(
     CuVec* v, CuPolicy* p, uint64_t seed,
     uint8_t* r_obs_row,   // [n][CF_TRAIN_OBS] or NULL
@@ -11230,11 +11118,7 @@ static void cu_rollout_step(
     int grid = (n + 255) / 256;
     CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int), st));
     CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int), st));
-    k_encode_env_warp<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
-        p->w.W_enc, p->w.b_enc, p->h_enc, n);
-    if (r_obs_row)
-        k_record_obs<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
-            r_obs_row, n);
+    cu_encode_step(p, r_obs_row, n, st);
     const float* x = p->h_enc;
     for (int l = 0; l < CF_NN_LAYERS; l++) {
         cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
@@ -11279,6 +11163,7 @@ static void cu_rollout_step_plain(CuVec* v, CuPolicy* p, uint64_t seed) {
 // touching env or policy state (workspace allocation is illegal
 // inside graph capture): dummy GEMMs into the scratch buffers.
 static void cu_warm_blas_fwd(CuPolicy* p, int n) {
+    cu_gemm_enc_fwd(n, p->w.W_enc, p->xobs, p->h_enc, p->stream);
     cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN, p->w.W_gru, p->h_enc, p->pre,
                 p->stream);
     cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p->w.W_a, p->h_enc,
@@ -11508,8 +11393,7 @@ static int cu_run_rollout_verify(int num_envs, int num_steps,
             CU_CHECK(cudaMemsetAsync(v.d_reset_count, 0, sizeof(int), st));
             CU_CHECK(cudaMemsetAsync(v.d_spawn_count, 0, sizeof(int), st));
             // Batched forward (same launches as cu_rollout_step).
-            k_encode_env_warp<<<(int)(((size_t)n * 32 + 255) / 256), 256,
-                                0, st>>>(p.w.W_enc, p.w.b_enc, p.h_enc, n);
+            cu_encode_step(&p, NULL, n, st);
             const float* x = p.h_enc;
             for (int l = 0; l < CF_NN_LAYERS; l++) {
                 cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
@@ -11802,8 +11686,7 @@ static void cu_train_collect(CuTrain* tr) {
     CU_CHECK(cudaMemcpyAsync(tr->boot_state, p->h_state,
                              (size_t)CF_NN_LAYERS * hn * sizeof(float),
                              cudaMemcpyDeviceToDevice, st));
-    k_encode_env_warp<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
-        p->w.W_enc, p->w.b_enc, p->h_enc, n);
+    cu_encode_step(p, NULL, n, st);
     const float* x = p->h_enc;
     for (int l = 0; l < CF_NN_LAYERS; l++) {
         cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
@@ -12227,15 +12110,14 @@ static int cu_run_train(
 // advantages as constants, so it is a pure function of the parameters
 // and FD is exact up to fp32 forward noise. cuBLAS runs in strict
 // FP32 here (no TF32) so loss() and backward() agree op-for-op.
-// Before FD, a two-pass replay-fidelity gate. Pass 0: the scalar
-// record encoder (k_encode_obs, fmaf order identical to the rollout's
-// warp encoder) + live-recurrence replay, per-step GEMM shapes
-// matching the rollout's, must reproduce the stored logprob/value
-// BITWISE at every (env, t) -- this seals record integrity and replay
-// semantics. Pass 1: the production path (k_expand_obs + encoder
-// GEMM, what backward/loss actually differentiate) must match within
-// a small tolerance -- a wrong slab/offset shows up as O(1) error,
-// GEMM reassociation as ~1e-5.
+// Before FD, a two-pass replay-fidelity gate. Pass 0: the production
+// encode path (k_expand_obs + encoder GEMM -- exactly what the
+// rollout sampled from, replayed per-step so every GEMM shape matches
+// the rollout's) must reproduce the stored logprob/value BITWISE at
+// every (env, t) -- this seals record round-trip and replay
+// semantics. Pass 1: the scalar fmaf reference encoder
+// (k_encode_obs) must match within a small tolerance -- a wrong
+// slab/offset shows up as O(1) error, GEMM reassociation as ~1e-6.
 static int cu_run_gradcheck(uint64_t seed) {
     cu_ensure_blas();
     CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_DEFAULT_MATH));
@@ -12268,15 +12150,15 @@ static int cu_run_gradcheck(uint64_t seed) {
             const uint8_t* prev = segstart ? NULL
                 : tr.r_done + (size_t)(t - 1) * n;
             if (pass == 0) {
-                k_encode_obs<<<egrid, 256, 0, p.stream>>>(
-                    tr.r_obs, p.w.W_enc, p.w.b_enc, tr.x[0], t, n, n, n, 0);
-            } else {
                 k_expand_obs<<<(int)(((size_t)CF_NN_OBS * n + 255) / 256),
                                256, 0, p.stream>>>(
                     tr.r_obs, tr.xobs, t, n, n, n, 0);
                 cu_gemm_enc_fwd(n, p.w.W_enc, tr.xobs, tr.x[0], p.stream);
                 k_add_bias<<<egrid, 256, 0, p.stream>>>(tr.x[0], p.w.b_enc,
                                                         n);
+            } else {
+                k_encode_obs<<<egrid, 256, 0, p.stream>>>(
+                    tr.r_obs, p.w.W_enc, p.w.b_enc, tr.x[0], t, n, n, n, 0);
             }
             for (int l = 0; l < CF_NN_LAYERS; l++) {
                 cu_gemm_fwd(CF_NN_GRU, n, CF_NN_HIDDEN,
@@ -12309,13 +12191,13 @@ static int cu_run_gradcheck(uint64_t seed) {
         cudaFree(d_mis);
         cudaFree(d_max);
         if (pass == 0) {
-            printf("record replay (scalar): %s (%d/%d env-steps "
+            printf("record replay (gemm encode): %s (%d/%d env-steps "
                    "mismatching)\n",
                    mis == 0 ? "EXACT" : "MISMATCH", mis, n * T);
         } else {
             float md;
             memcpy(&md, &max_bits, sizeof(float));
-            printf("record replay (gemm encode): %s (max |d| %.3e, "
+            printf("record replay (scalar ref): %s (max |d| %.3e, "
                    "%d/%d env-steps over %.0e)\n",
                    mis == 0 ? "PASS" : "MISMATCH", md, mis, n * T, tol);
         }
