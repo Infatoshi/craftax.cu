@@ -960,13 +960,14 @@ static __device__ inline void cf_soa_zero_env_warp(const void* s, unsigned lane)
 // Lazy variant: clears flat fields fully but level-indexed fields only for
 // levels in gen_mask (bit L = level L was generated and must be re-cleared).
 // Never-generated levels provably still hold their post-reset values.
+template <int NT>
 static __device__ inline void cf_soa_zero_env_warp_lazy(
     const void* s, unsigned lane, uint32_t gen_mask
 ) {
 #define CF_SOA_ZERO_WF(f, t, k) \
-    for (int _j = (int)lane; _j < (k); _j += 32) CF2(f, _j, s) = (t)0;
+    for (int _j = (int)lane; _j < (k); _j += NT) CF2(f, _j, s) = (t)0;
 #define CF_SOA_ZERO_WL(f, t, k) \
-    for (int _j = (int)lane; _j < (k); _j += 32) { \
+    for (int _j = (int)lane; _j < (k); _j += NT) { \
         if (((gen_mask >> CF_LVL_##f(_j)) & 1u) == 0u) continue; \
         CF2(f, _j, s) = (t)0; \
     }
@@ -980,10 +981,11 @@ static __device__ inline void cf_soa_zero_env_warp_lazy(
 // health = 1.0f for every (class, level, slot) except the padded ranged
 // slot 2, which the scalar path never writes (stays 0 from the zero pass).
 // Same gen_mask predicate: skipped levels already hold health = 1.0f.
+template <int NT>
 static __device__ inline void cf_init_empty_mobs_warp(
     void* s, unsigned lane, uint32_t gen_mask
 ) {
-    for (int j = (int)lane; j < 135; j += 32) {
+    for (int j = (int)lane; j < 135; j += NT) {
         int c = j / 27;
         int r = j % 27;
         if (c == 2 && r % 3 == 2) continue;
@@ -3823,9 +3825,127 @@ typedef struct CraftaxWarpScratch {
 
 #define CRAFTAX_WARP_ALL 0xffffffffu
 
+// Block-width generalizations of the warp primitives used by the worldgen.
+// Every reduction here is exact (int sums, float min/max on NaN-free data),
+// so reduction order is irrelevant and any NT produces bit-identical
+// results. NT=32 keeps the original warp-shuffle forms -- k_mega runs the
+// worldgen per-warp inside larger blocks, where __syncthreads is illegal.
+// NT>32 runs one env per block (k_reset_list_block) with smem trees: at
+// small env counts the reset is a serial-latency tail on the rollout
+// critical path (~30 resets across 188 SMs = duration is ONE env's
+// worldgen), so more lanes per env cut wall latency directly.
+template <int NT>
+static __device__ inline void cf_wg_sync(void) {
+    if constexpr (NT == 32) __syncwarp();
+    else __syncthreads();
+}
+
+template <int NT>
+static __device__ inline void cf_wg_minmax_f(float* mn, float* mx,
+                                             unsigned lane) {
+    if constexpr (NT == 32) {
+        for (int off = 16; off > 0; off >>= 1) {
+            float omn = __shfl_xor_sync(CRAFTAX_WARP_ALL, *mn, off);
+            float omx = __shfl_xor_sync(CRAFTAX_WARP_ALL, *mx, off);
+            if (omn < *mn) *mn = omn;
+            if (omx > *mx) *mx = omx;
+        }
+    } else {
+        __shared__ float smn[NT], smx[NT];
+        smn[lane] = *mn;
+        smx[lane] = *mx;
+        __syncthreads();
+        for (int off = NT / 2; off > 0; off >>= 1) {
+            if (lane < (unsigned)off) {
+                if (smn[lane + off] < smn[lane]) smn[lane] = smn[lane + off];
+                if (smx[lane + off] > smx[lane]) smx[lane] = smx[lane + off];
+            }
+            __syncthreads();
+        }
+        *mn = smn[0];
+        *mx = smx[0];
+        __syncthreads();  // smem reused by the next call
+    }
+}
+
+// Inclusive prefix sum of per-lane int counts plus the block total.
+template <int NT>
+static __device__ inline void cf_wg_scan_incl(int count, int* incl,
+                                              int* total, unsigned lane) {
+    if constexpr (NT == 32) {
+        int v = count;
+        for (int off = 1; off < 32; off <<= 1) {
+            int n = __shfl_up_sync(CRAFTAX_WARP_ALL, v, off);
+            if (lane >= (unsigned)off) v += n;
+        }
+        *incl = v;
+        *total = __shfl_sync(CRAFTAX_WARP_ALL, v, 31);
+    } else {
+        __shared__ int sc[NT];
+        sc[lane] = count;
+        __syncthreads();
+        int acc = 0;
+        for (int k = 0; k <= (int)lane; k++) acc += sc[k];
+        int tot = acc;
+        for (int k = (int)lane + 1; k < NT; k++) tot += sc[k];
+        *incl = acc;
+        *total = tot;
+        __syncthreads();
+    }
+}
+
+template <int NT>
+static __device__ inline int cf_wg_min_i(int v, unsigned lane) {
+    if constexpr (NT == 32) {
+        for (int off = 16; off > 0; off >>= 1) {
+            int other = __shfl_xor_sync(CRAFTAX_WARP_ALL, v, off);
+            if (other < v) v = other;
+        }
+        return v;
+    } else {
+        __shared__ int sv[NT];
+        sv[lane] = v;
+        __syncthreads();
+        for (int off = NT / 2; off > 0; off >>= 1) {
+            if (lane < (unsigned)off) {
+                if (sv[lane + off] < sv[lane]) sv[lane] = sv[lane + off];
+            }
+            __syncthreads();
+        }
+        int r = sv[0];
+        __syncthreads();
+        return r;
+    }
+}
+
+template <int NT>
+static __device__ inline int cf_wg_max_i(int v, unsigned lane) {
+    if constexpr (NT == 32) {
+        for (int off = 16; off > 0; off >>= 1) {
+            int other = __shfl_xor_sync(CRAFTAX_WARP_ALL, v, off);
+            if (other > v) v = other;
+        }
+        return v;
+    } else {
+        __shared__ int sv[NT];
+        sv[lane] = v;
+        __syncthreads();
+        for (int off = NT / 2; off > 0; off >>= 1) {
+            if (lane < (unsigned)off) {
+                if (sv[lane + off] > sv[lane]) sv[lane] = sv[lane + off];
+            }
+            __syncthreads();
+        }
+        int r = sv[0];
+        __syncthreads();
+        return r;
+    }
+}
+
 // Fractal noise with octaves=1 (every smoothworld call), warp-parallel over
 // cells. Reproduces craftax_generate_fractal_noise_2d + perlin_2d_scalar
 // bitwise: same key chain, same per-cell expressions, order-free min/max.
+template <int NT>
 static __device__ inline void craftax_fractal_noise_warp(
     CraftaxThreefryKey rng,
     int res_rows,
@@ -3850,18 +3970,18 @@ static __device__ inline void craftax_fractal_noise_warp(
     int cell_cols = cols / res_cols;
     int grad_w = res_cols + 1;
     int grad_h = res_rows + 1;
-    for (int g = (int)lane; g < grad_h * grad_w; g += 32) {
+    for (int g = (int)lane; g < grad_h * grad_w; g += NT) {
         // craftax_noise_gradient_angle with width == grad_w: index == g.
         float angle = CRAFTAX_NOISE_PI2
             * craftax_threefry_uniform_f32_at(angle_key, (uint64_t)g);
         grad_x[g] = cosf(angle);
         grad_y[g] = sinf(angle);
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 
     float local_min = INFINITY;
     float local_max = -INFINITY;
-    for (int i = (int)lane; i < rows * cols; i += 32) {
+    for (int i = (int)lane; i < rows * cols; i += NT) {
         int row = i / cols;
         int col = i % cols;
         int grad_row = row / cell_rows;
@@ -3899,31 +4019,29 @@ static __device__ inline void craftax_fractal_noise_warp(
         if (acc < local_min) local_min = acc;
         if (acc > local_max) local_max = acc;
     }
-    for (int off = 16; off > 0; off >>= 1) {
-        float other_min = __shfl_xor_sync(CRAFTAX_WARP_ALL, local_min, off);
-        float other_max = __shfl_xor_sync(CRAFTAX_WARP_ALL, local_max, off);
-        if (other_min < local_min) local_min = other_min;
-        if (other_max > local_max) local_max = other_max;
-    }
+    cf_wg_minmax_f<NT>(&local_min, &local_max, lane);
     float scale = local_max - local_min;
-    __syncwarp();
-    for (int i = (int)lane; i < rows * cols; i += 32) {
+    cf_wg_sync<NT>();
+    for (int i = (int)lane; i < rows * cols; i += NT) {
         out[i] = (out[i] - local_min) / scale;
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 }
 
 // Warp version of craftax_choice_bool_flat over the predicate
-// map[cell] == target. Chunked so lane L owns cells [72L, 72L+72): the lane
-// whose chunk straddles the draw replays the scalar cumulative loop with the
-// exact float sums the serial code would have at its chunk boundary.
+// map[cell] == target. Chunked so lane L owns cells [CL, CL+C), C =
+// CELLS/NT: the lane whose chunk straddles the draw replays the scalar
+// cumulative loop with the exact float sums the serial code would have at
+// its chunk boundary (the cumsum only ever adds 1.0f to an exact integer,
+// so any chunk size reproduces the scalar values bitwise).
+template <int NT>
 static __device__ inline int craftax_warp_choice_map_eq(
     CraftaxThreefryKey key,
     const uint8_t* map_flat,
     uint8_t target,
     unsigned lane
 ) {
-    const int chunk = CRAFTAX_WG_MAP_CELLS / 32;
+    const int chunk = CRAFTAX_WG_MAP_CELLS / NT;
     int base = (int)lane * chunk;
     int count = 0;
     int last_valid_local = -1;
@@ -3933,12 +4051,8 @@ static __device__ inline int craftax_warp_choice_map_eq(
             last_valid_local = base + k;
         }
     }
-    int incl = count;
-    for (int off = 1; off < 32; off <<= 1) {
-        int n = __shfl_up_sync(CRAFTAX_WARP_ALL, incl, off);
-        if (lane >= (unsigned)off) incl += n;
-    }
-    int total = __shfl_sync(CRAFTAX_WARP_ALL, incl, 31);
+    int incl, total;
+    cf_wg_scan_incl<NT>(count, &incl, &total, lane);
     if (total == 0) return 0;
 
     float draw = (float)total * (1.0f - craftax_threefry_uniform_f32(key));
@@ -3951,22 +4065,16 @@ static __device__ inline int craftax_warp_choice_map_eq(
             if (cumulative >= draw) { result = base + k; break; }
         }
     }
-    for (int off = 16; off > 0; off >>= 1) {
-        int other = __shfl_xor_sync(CRAFTAX_WARP_ALL, result, off);
-        if (other < result) result = other;
-    }
+    result = cf_wg_min_i<NT>(result, lane);
     if (result != INT_MAX) return result;
     // Scalar fallback: cumulative never reached draw -> last valid cell.
-    int last_valid = last_valid_local;
-    for (int off = 16; off > 0; off >>= 1) {
-        int other = __shfl_xor_sync(CRAFTAX_WARP_ALL, last_valid, off);
-        if (other > last_valid) last_valid = other;
-    }
+    int last_valid = cf_wg_max_i<NT>(last_valid_local, lane);
     return last_valid < 0 ? 0 : last_valid;
 }
 
 // Warp version of craftax_generate_smoothworld_config: identical key chain
 // (replicated on all lanes), per-cell passes strided across the warp.
+template <int NT>
 static __device__ inline void craftax_smoothworld_config_warp(
     CraftaxThreefryKey rng,
     int config_idx,
@@ -3985,26 +4093,26 @@ static __device__ inline void craftax_smoothworld_config_warp(
 
     CraftaxThreefryKey subkey;
     craftax_threefry_split(rng, &rng, &subkey);
-    craftax_fractal_noise_warp(subkey, 3, 3, s->grad_x, s->grad_y, s->water, lane);
+    craftax_fractal_noise_warp<NT>(subkey, 3, 3, s->grad_x, s->grad_y, s->water, lane);
 
     craftax_threefry_split(rng, &rng, &subkey);
     (void)subkey;
 
     craftax_threefry_split(rng, &rng, &subkey);
-    craftax_fractal_noise_warp(subkey, 3, 3, s->grad_x, s->grad_y, s->mountain, lane);
+    craftax_fractal_noise_warp<NT>(subkey, 3, 3, s->grad_x, s->grad_y, s->mountain, lane);
 
     craftax_threefry_split(rng, &rng, &subkey);
-    craftax_fractal_noise_warp(subkey, 6, 24, s->grad_x, s->grad_y, s->path_x, lane);
+    craftax_fractal_noise_warp<NT>(subkey, 6, 24, s->grad_x, s->grad_y, s->path_x, lane);
 
     craftax_threefry_split(rng, &rng, &subkey);
     (void)subkey;
 
     craftax_threefry_split(rng, &rng, &subkey);
     CraftaxThreefryKey tree_uniform_key = rng;
-    craftax_fractal_noise_warp(subkey, 12, 12, s->grad_x, s->grad_y, s->tree_noise, lane);
+    craftax_fractal_noise_warp<NT>(subkey, 12, 12, s->grad_x, s->grad_y, s->tree_noise, lane);
 
     // classify (verbatim per-cell body from craftax_smoothworld_classify_scalar)
-    for (int i = (int)lane; i < size * size; i += 32) {
+    for (int i = (int)lane; i < size * size; i += NT) {
         int row = i / size;
         int col = i % size;
         int dr = row > player_row ? row - player_row : player_row - row;
@@ -4063,7 +4171,7 @@ static __device__ inline void craftax_smoothworld_config_warp(
         item_map[row][col] = CRAFTAX_WG_ITEM_NONE;
         light_map[row][col] = (uint8_t)(config->default_light * 255.0f);
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 
     // ores
     CraftaxThreefryKey ore_rng;
@@ -4071,7 +4179,7 @@ static __device__ inline void craftax_smoothworld_config_warp(
     for (int ore_index = 0; ore_index < 5; ore_index++) {
         CraftaxThreefryKey ore_key;
         craftax_threefry_split(ore_rng, &ore_rng, &ore_key);
-        for (int i = (int)lane; i < size * size; i += 32) {
+        for (int i = (int)lane; i < size * size; i += NT) {
             int row = i / size;
             int col = i % size;
             size_t idx = craftax_wg_index(row, col);
@@ -4081,11 +4189,11 @@ static __device__ inline void craftax_smoothworld_config_warp(
                 map[row][col] = (uint8_t)config->ores[ore_index];
             }
         }
-        __syncwarp();
+        cf_wg_sync<NT>();
     }
 
     // lava
-    for (int i = (int)lane; i < size * size; i += 32) {
+    for (int i = (int)lane; i < size * size; i += NT) {
         int row = i / size;
         int col = i % size;
         size_t idx = craftax_wg_index(row, col);
@@ -4094,23 +4202,23 @@ static __device__ inline void craftax_smoothworld_config_warp(
             map[row][col] = (uint8_t)config->lava;
         }
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 
     // diamond placement (choice over stone cells; the write is a no-op value
     // change but kept for parity with the scalar code)
     craftax_threefry_split(rng, &rng, &subkey);
-    int diamond_index = craftax_warp_choice_map_eq(
+    int diamond_index = craftax_warp_choice_map_eq<NT>(
         subkey, &map[0][0], (uint8_t)CRAFTAX_WG_BLOCK_STONE, lane);
     if (lane == 0) {
         map[diamond_index / size][diamond_index % size] =
             (uint8_t)CRAFTAX_WG_BLOCK_STONE;
         map[player_row][player_col] = (uint8_t)config->player_spawn;
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 
     // ladders (both draws read the same map state, like the scalar code)
     craftax_threefry_split(rng, &rng, &subkey);
-    int ladder_down_index = craftax_warp_choice_map_eq(
+    int ladder_down_index = craftax_warp_choice_map_eq<NT>(
         subkey, &map[0][0], (uint8_t)config->valid_ladder, lane);
     if (lane == 0) {
         ladder_down[0] = ladder_down_index / size;
@@ -4122,7 +4230,7 @@ static __device__ inline void craftax_smoothworld_config_warp(
     }
 
     craftax_threefry_split(rng, &rng, &subkey);
-    int ladder_up_index = craftax_warp_choice_map_eq(
+    int ladder_up_index = craftax_warp_choice_map_eq<NT>(
         subkey, &map[0][0], (uint8_t)config->valid_ladder, lane);
     int lu_row = ladder_up_index / size;
     int lu_col = ladder_up_index % size;
@@ -4130,7 +4238,7 @@ static __device__ inline void craftax_smoothworld_config_warp(
         ladder_up[0] = lu_row;
         ladder_up[1] = lu_col;
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 
     // craftax_apply_ladder_light, 9x9 patch strided across the warp
     {
@@ -4140,14 +4248,14 @@ static __device__ inline void craftax_smoothworld_config_warp(
         if (start_col < 0) start_col += CRAFTAX_WG_MAP_SIZE;
         start_row = craftax_wg_clampi(start_row, 0, CRAFTAX_WG_MAP_SIZE - 9);
         start_col = craftax_wg_clampi(start_col, 0, CRAFTAX_WG_MAP_SIZE - 9);
-        for (int p = (int)lane; p < 81; p += 32) {
+        for (int p = (int)lane; p < 81; p += NT) {
             int row = p / 9;
             int col = p % 9;
             light_map[start_row + row][start_col + col] = (uint8_t)(
                 craftax_torch_light_value(row, col, config->default_light) * 255.0f);
         }
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 
     // craftax_add_lava_light, per-cell over the shared lava map
     if (config->lava == CRAFTAX_WG_BLOCK_LAVA) {
@@ -4156,7 +4264,7 @@ static __device__ inline void craftax_smoothworld_config_warp(
             {0.7f, 1.0f, 0.7f},
             {0.2f, 0.7f, 0.2f},
         };
-        for (int i = (int)lane; i < size * size; i += 32) {
+        for (int i = (int)lane; i < size * size; i += NT) {
             int row = i / size;
             int col = i % size;
             float add = 0.0f;
@@ -4174,16 +4282,17 @@ static __device__ inline void craftax_smoothworld_config_warp(
             light_map[row][col] = (uint8_t)(new_light * 255.0f);
         }
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 
     if (config->ladder_up && lane == 0) {
         item_map[lu_row][lu_col] = CRAFTAX_WG_ITEM_LADDER_UP;
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 }
 
 // Warp version of craftax_generate_world_from_key_lazy(lazy=true) plus the
 // spawn-bit refresh from craftax_generate_state_from_world_key.
+template <int NT>
 static __device__ inline void craftax_generate_state_from_world_key_warp(
     CraftaxThreefryKey rng,
     CraftaxState* state,
@@ -4196,7 +4305,7 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
     {
         uint32_t* words = (uint32_t*)(void*)out;
         const size_t nwords = sizeof(*out) / sizeof(uint32_t);
-        for (size_t i = lane; i < nwords; i += 32) words[i] = 0u;
+        for (size_t i = lane; i < nwords; i += NT) words[i] = 0u;
         if (lane == 0) {
             uint8_t* bytes = (uint8_t*)(void*)out;
             for (size_t b = nwords * sizeof(uint32_t); b < sizeof(*out); b++) {
@@ -4209,9 +4318,9 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
     // only generated levels (prev pending bit clear) need re-clearing.
     const uint32_t cf_gen_mask =
         ~CF(lazy_floors_pending, out) & 0x1FFu;
-    __syncwarp();
-    cf_soa_zero_env_warp_lazy(out, lane, cf_gen_mask);
-    __syncwarp();
+    cf_wg_sync<NT>();
+    cf_soa_zero_env_warp_lazy<NT>(out, lane, cf_gen_mask);
+    cf_wg_sync<NT>();
 
     CraftaxThreefryKey smooth_split[7];
     craftax_threefry_split_n(rng, smooth_split, 7);
@@ -4226,7 +4335,7 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
         }
     }
     // floor 0 (smooth config 0), warp-cooperative; floors 1..8 stay deferred
-    craftax_smoothworld_config_warp(
+    craftax_smoothworld_config_warp<NT>(
         smooth_split[1], 0,
         out->map[0], out->item_map[0], out->light_map[0],
         out->down_ladders[0], out->up_ladders[0], s, lane);
@@ -4245,8 +4354,8 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
         CF(lazy_floors_pending, out) = 0x1FEu;  // floors 1..8 deferred
     }
     // warp-distributed: same lane-per-entry stride as the zero pass above
-    cf_init_empty_mobs_warp(out, lane, cf_gen_mask);
-    for (int j = (int)lane; j < 54; j += 32) {
+    cf_init_empty_mobs_warp<NT>(out, lane, cf_gen_mask);
+    for (int j = (int)lane; j < 54; j += NT) {
         if (((cf_gen_mask >> (j / 6)) & 1u) != 0u) {
             CF2(mob_projectile_directions, j, out) = 1;
             CF2(player_projectile_directions, j, out) = 1;
@@ -4279,10 +4388,10 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
         CF(boss_timesteps_to_spawn_this_round, out) = CRAFTAX_WG_BOSS_FIGHT_SPAWN_TURNS;
         CF(light_level, out) = craftax_calculate_initial_light_level();
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 
     // spawn bits for the one generated floor, one row per lane
-    for (int row = (int)lane; row < CRAFTAX_MAP_SIZE; row += 32) {
+    for (int row = (int)lane; row < CRAFTAX_MAP_SIZE; row += NT) {
         uint64_t all_bits = 0;
         uint64_t grave_bits = 0;
         uint64_t water_bits = 0;
@@ -4297,11 +4406,12 @@ static __device__ inline void craftax_generate_state_from_world_key_warp(
         CF_BITS(spawn_grave_bits, 0, row, state) = grave_bits;
         CF_BITS(spawn_water_bits, 0, row, state) = water_bits;
     }
-    __syncwarp();
+    cf_wg_sync<NT>();
 }
 
 // Full on-done reset, warp-cooperative: mirrors craftax_reset_state_on_done
 // -> craftax_reset_state_from_reset_key (lazy path).
+template <int NT>
 static __device__ inline void craftax_reset_state_on_done_warp(
     CraftaxState* state,
     CraftaxThreefryKey reset_key,
@@ -4311,7 +4421,7 @@ static __device__ inline void craftax_reset_state_on_done_warp(
     CraftaxThreefryKey unused;
     CraftaxThreefryKey world_key;
     craftax_threefry_split(reset_key, &unused, &world_key);
-    craftax_generate_state_from_world_key_warp(world_key, state, s, lane);
+    craftax_generate_state_from_world_key_warp<NT>(world_key, state, s, lane);
 }
 
 static __device__ inline void craftax_encode_native_observation(
@@ -9365,12 +9475,66 @@ __global__ void __launch_bounds__(32) k_reset_list_warp(
         CraftaxThreefryKey reset_key;
         reset_key.word[0] = resets[idx].key0;
         reset_key.word[1] = resets[idx].key1;
-        craftax_reset_state_on_done_warp(env->state, reset_key, &s, lane);
+        craftax_reset_state_on_done_warp<32>(env->state, reset_key, &s, lane);
         if (lane == 0) {
             cf_encode_tail(env->state, env->observations);
         }
         __syncwarp();
     }
+}
+
+// Block-cooperative reset: one NT-thread block per finished env instead of
+// one warp. Bit-identical to k_reset_list_warp (see the cf_wg_* helpers:
+// every per-cell draw is a pure function of (key, cell) and every reduction
+// is exact), but ~NT/32 lanes attack the single-env worldgen latency. At
+// small env counts (~4 resets/step @1024) reset duration IS one env's
+// worldgen wall time on the rollout critical path, so this converts thread
+// parallelism the GPU has to spare directly into latency.
+template <int NT>
+__global__ void __launch_bounds__(NT) k_reset_list_block(
+    Craftax* envs, const CraftaxResetRec* resets
+) {
+    __shared__ CraftaxWarpScratch s;
+    unsigned tid = threadIdx.x;
+    for (int idx = (int)blockIdx.x; idx < g_reset_count; idx += (int)gridDim.x) {
+        Craftax* env = &envs[resets[idx].env];
+        CraftaxThreefryKey reset_key;
+        reset_key.word[0] = resets[idx].key0;
+        reset_key.word[1] = resets[idx].key1;
+        craftax_reset_state_on_done_warp<NT>(env->state, reset_key, &s, tid);
+        if (tid == 0) {
+            cf_encode_tail(env->state, env->observations);
+        }
+        __syncthreads();
+    }
+}
+
+// Reset-list launch: CRAFTAX_CU_RESET_BLOCK picks the per-env thread count
+// (128 default; 32 = legacy warp kernel for A/B).
+static int cu_reset_block_threads(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("CRAFTAX_CU_RESET_BLOCK");
+        v = e ? atoi(e) : 128;
+        if (v != 32 && v != 128 && v != 256) v = 128;
+    }
+    return v;
+}
+
+static void cu_launch_reset_list_warp(Craftax* envs,
+                                      const CraftaxResetRec* resets,
+                                      int num_envs, cudaStream_t st) {
+    // Cap the grid: worldgen is ~one block of work per finished env and the
+    // list is almost always tiny; 512 blocks still covers a worst-case
+    // all-die step via the grid-stride loop.
+    int rgrid = num_envs > 512 ? 512 : num_envs;
+    int nt = cu_reset_block_threads();
+    if (nt == 256)
+        k_reset_list_block<256><<<rgrid, 256, 0, st>>>(envs, resets);
+    else if (nt == 128)
+        k_reset_list_block<128><<<rgrid, 128, 0, st>>>(envs, resets);
+    else
+        k_reset_list_warp<<<rgrid, 32, 0, st>>>(envs, resets);
 }
 
 // ============================================================
@@ -9414,7 +9578,7 @@ __global__ void k_mega(
             rk.word[0] = __shfl_sync(0xffffffffu, reset_key.word[0], src);
             rk.word[1] = __shfl_sync(0xffffffffu, reset_key.word[1], src);
             Craftax* denv = &envs[warp_base + src];
-            craftax_reset_state_on_done_warp(denv->state, rk, ws, lane);
+            craftax_reset_state_on_done_warp<32>(denv->state, rk, ws, lane);
             if (lane == 0) cf_encode_tail(denv->state, denv->observations);
         }
         __syncwarp();
@@ -11123,9 +11287,7 @@ static void cu_step_launch(CuVec* v) {
     // typical load is tens of resets, not num_envs. Stride covers the rare
     // all-die step. (See k_reset_list_warp.)
     if (v->lazy) {
-        int rgrid = v->num_envs;
-        if (rgrid > 512) rgrid = 512;
-        k_reset_list_warp<<<rgrid, 32>>>(v->d_envs, v->d_resets);
+        cu_launch_reset_list_warp(v->d_envs, v->d_resets, v->num_envs, 0);
     } else {
         k_reset_list<<<(v->num_envs + 63) / 64, 64>>>(v->d_envs, v->d_resets);
     }
@@ -11501,13 +11663,19 @@ static void cu_ensure_blas(void) {
     }
 }
 
-// Small-N auto-gate: below 4096 envs the bf16 conversion overhead
-// (producer shadows, bf16 round trips) loses to plain TF32 GEMMs
-// (PRO 6000 @1024: 2.39 -> 2.23 M train SPS). An explicit
-// CF_GEMM_BF16 setting always wins over the auto-gate.
+// Small-N auto-gate: on Blackwell (sm_100+) the bf16 conversion overhead
+// (producer shadows, bf16 round trips) loses to plain TF32 GEMMs below
+// ~4k envs (PRO 6000 @1024: 2.39 -> 2.23 M train SPS; also restores the
+// fp32 runhash canonical 0x667d0e43f5b14ead there). On the 3090 bf16 wins
+// at every measured N (@1024: 1.14 -> 1.27 M), so pre-sm_100 keeps it. An
+// explicit CF_GEMM_BF16 setting always wins over the auto-gate.
 static void cu_bf16_autogate(int num_envs) {
-    if (getenv("CF_GEMM_BF16") == NULL && num_envs < 4096)
-        g_gemm_bf16 = 0;
+    if (getenv("CF_GEMM_BF16") != NULL || num_envs >= 4096) return;
+    int dev = 0, major = 0;
+    CU_CHECK(cudaGetDevice(&dev));
+    CU_CHECK(cudaDeviceGetAttribute(&major,
+                                    cudaDevAttrComputeCapabilityMajor, dev));
+    if (major >= 10) g_gemm_bf16 = 0;
 }
 
 template <typename Frag>
@@ -12172,8 +12340,7 @@ static void cu_rollout_step(
         k_spawn_tail<<<tail_blocks, 256, 0, st>>>();
     }
     if (v->lazy) {
-        int rgrid = n > 512 ? 512 : n;
-        k_reset_list_warp<<<rgrid, 32, 0, st>>>(v->d_envs, v->d_resets);
+        cu_launch_reset_list_warp(v->d_envs, v->d_resets, n, st);
     } else {
         k_reset_list<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, v->d_resets);
     }
@@ -12465,8 +12632,7 @@ static int cu_run_rollout_verify(int num_envs, int num_steps,
                 k_spawn_tail<<<tail_blocks, 256, 0, st>>>();
             }
             if (v.lazy) {
-                int rgrid = n > 512 ? 512 : n;
-                k_reset_list_warp<<<rgrid, 32, 0, st>>>(v.d_envs, v.d_resets);
+                cu_launch_reset_list_warp(v.d_envs, v.d_resets, n, st);
             } else {
                 k_reset_list<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs,
                                                            v.d_resets);
