@@ -11448,6 +11448,8 @@ static int cu_run_bench(int num_envs, int iters, uint64_t seed) {
     } } while (0)
 
 static cublasHandle_t g_blas = NULL;
+static cublasHandle_t g_blas2;
+static cublasHandle_t g_blas3;
 static float g_one = 1.0f, g_zero = 0.0f;
 // 1 = cuBLAS TF32 (default), 0 = multi-warp bf16 TC (CF_USE_CUBLAS=0).
 // CF_MMA_BF16_ACC=1: after each mma.sync, quantize fp32 accumulator
@@ -11465,6 +11467,13 @@ static void cu_ensure_blas(void) {
     if (!g_blas) {
         CUBLAS_CHECK(cublasCreate(&g_blas));
         CUBLAS_CHECK(cublasSetMathMode(g_blas, CUBLAS_TF32_TENSOR_OP_MATH));
+        // Second handle (own workspace) for dW GEMMs issued on the
+        // backward's side stream -- one handle across two streams would
+        // race its cublas workspace.
+        CUBLAS_CHECK(cublasCreate(&g_blas2));
+        CUBLAS_CHECK(cublasSetMathMode(g_blas2, CUBLAS_TF32_TENSOR_OP_MATH));
+        CUBLAS_CHECK(cublasCreate(&g_blas3));
+        CUBLAS_CHECK(cublasSetMathMode(g_blas3, CUBLAS_TF32_TENSOR_OP_MATH));
     }
     if (g_use_cublas < 0) {
         const char* e = getenv("CF_USE_CUBLAS");
@@ -11822,10 +11831,11 @@ static void cu_gemmex_bf16(cublasOperation_t opA, cublasOperation_t opB,
                            const __nv_bfloat16* A, int lda,
                            const __nv_bfloat16* B, int ldb,
                            const float* beta, float* C, int ldc,
-                           cudaStream_t s) {
+                           cudaStream_t s, cublasHandle_t h = NULL) {
     cu_ensure_blas();
-    CUBLAS_CHECK(cublasSetStream(g_blas, s));
-    CUBLAS_CHECK(cublasGemmEx(g_blas, opA, opB, m, n, k, &g_one,
+    if (!h) h = g_blas;
+    CUBLAS_CHECK(cublasSetStream(h, s));
+    CUBLAS_CHECK(cublasGemmEx(h, opA, opB, m, n, k, &g_one,
                               A, CUDA_R_16BF, lda, B, CUDA_R_16BF, ldb,
                               beta, C, CUDA_R_32F, ldc,
                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -11857,9 +11867,9 @@ static void cu_gemm_fwd_bfc(int m, int cols, int k, const __nv_bfloat16* W,
 // ldb may exceed k (padded xobs).
 static void cu_gemm_nn_bf(int k, int cols, const __nv_bfloat16* A,
                           const __nv_bfloat16* B, int ldb, float* y,
-                          cudaStream_t s) {
+                          cudaStream_t s, cublasHandle_t h = NULL) {
     cu_gemmex_bf16(CUBLAS_OP_N, CUBLAS_OP_N, CF_NN_HIDDEN, cols, k,
-                   A, CF_NN_HIDDEN, B, ldb, &g_zero, y, CF_NN_HIDDEN, s);
+                   A, CF_NN_HIDDEN, B, ldb, &g_zero, y, CF_NN_HIDDEN, s, h);
 }
 
 // dW[HIDDEN][rows] += x dpre^T  (beta=1 window accumulate).
@@ -11869,6 +11879,20 @@ static void cu_gemm_dw_bf(int rows, int cols, const __nv_bfloat16* x,
                           cudaStream_t s) {
     cu_gemmex_bf16(CUBLAS_OP_N, CUBLAS_OP_T, CF_NN_HIDDEN, rows, cols,
                    x, CF_NN_HIDDEN, dpre, ldb, &g_one, dW, CF_NN_HIDDEN, s);
+}
+
+// Same, on the side-stream handle (dW off the reverse critical path).
+static void cu_gemm_dw_bf2(int rows, int cols, const __nv_bfloat16* x,
+                           const __nv_bfloat16* dpre, int ldb, float* dW,
+                           cudaStream_t s) {
+    cu_ensure_blas();
+    CUBLAS_CHECK(cublasSetStream(g_blas3, s));
+    CUBLAS_CHECK(cublasGemmEx(g_blas3, CUBLAS_OP_N, CUBLAS_OP_T,
+                              CF_NN_HIDDEN, rows, cols, &g_one,
+                              x, CUDA_R_16BF, CF_NN_HIDDEN,
+                              dpre, CUDA_R_16BF, ldb, &g_one,
+                              dW, CUDA_R_32F, CF_NN_HIDDEN,
+                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
 
 typedef struct {
@@ -12564,6 +12588,22 @@ typedef struct {
     int warmed;
     cudaGraph_t tgraph;
     cudaGraphExec_t texec;
+    // bf16 pipelined backward: window w+1's forward recompute runs on
+    // st2 while window w's reverse chain runs on the main stream and its
+    // dW GEMMs drain on st3. Slot-1 duplicates of the window workspace
+    // let the two windows coexist (slot = window index & 1; slot 0 uses
+    // the fields above).
+    float* x1[4];
+    float* dh3b1;
+    float* dhG1;
+    float* dhX1;
+    __nv_bfloat16* xb1[4];
+    __nv_bfloat16* prebb1[3];
+    __nv_bfloat16* xobsb1;
+    __nv_bfloat16* dhGb1;
+    cudaStream_t st2, st3;
+    cudaEvent_t ev_wb[3], ev_dw[3], ev_enc_in, ev_dw_enc;
+    cudaEvent_t ev_fork, ev_fwd[2], ev_rev[2], ev_dwdone[2];
     int prof;           // CRAFTAX_CU_TRAIN_PROF=1: eager + per-phase sync
     double t_rollout, t_gae, t_backward, t_adam;
 } CuTrain;
@@ -12667,6 +12707,54 @@ static void cu_train_init(
         CU_CHECK(cudaMalloc(&tr->dhGb,
                             (size_t)CF_NN_HIDDEN * cols_cap
                                 * sizeof(__nv_bfloat16)));
+        for (int i = 0; i < 4; i++) {
+            CU_CHECK(cudaMalloc(&tr->x1[i], (size_t)CF_NN_HIDDEN * cols_cap
+                                                * sizeof(float)));
+            CU_CHECK(cudaMalloc(&tr->xb1[i], (size_t)CF_NN_HIDDEN * cols_cap
+                                                 * sizeof(__nv_bfloat16)));
+        }
+        for (int l = 0; l < 3; l++)
+            CU_CHECK(cudaMalloc(&tr->prebb1[l], (size_t)CF_NN_GRU * cols_cap
+                                                    * sizeof(__nv_bfloat16)));
+        CU_CHECK(cudaMalloc(&tr->xobsb1,
+                            (size_t)CF_NN_OBS_PAD * cols_cap
+                                * sizeof(__nv_bfloat16)));
+        CU_CHECK(cudaMalloc(&tr->dh3b1,
+                            (size_t)CF_NN_HIDDEN * cols_cap * sizeof(float)));
+        CU_CHECK(cudaMalloc(&tr->dhG1,
+                            (size_t)CF_NN_HIDDEN * cols_cap * sizeof(float)));
+        CU_CHECK(cudaMalloc(&tr->dhX1,
+                            (size_t)CF_NN_HIDDEN * cols_cap * sizeof(float)));
+        CU_CHECK(cudaMalloc(&tr->dhGb1,
+                            (size_t)CF_NN_HIDDEN * cols_cap
+                                * sizeof(__nv_bfloat16)));
+    } else {
+        memset(tr->x1, 0, sizeof(tr->x1));
+        memset(tr->xb1, 0, sizeof(tr->xb1));
+        memset(tr->prebb1, 0, sizeof(tr->prebb1));
+        tr->xobsb1 = NULL; tr->dh3b1 = NULL;
+        tr->dhG1 = NULL; tr->dhX1 = NULL; tr->dhGb1 = NULL;
+    }
+    CU_CHECK(cudaStreamCreateWithFlags(&tr->st2, cudaStreamNonBlocking));
+    CU_CHECK(cudaStreamCreateWithFlags(&tr->st3, cudaStreamNonBlocking));
+    for (int l = 0; l < 3; l++) {
+        CU_CHECK(cudaEventCreateWithFlags(&tr->ev_wb[l],
+                                          cudaEventDisableTiming));
+        CU_CHECK(cudaEventCreateWithFlags(&tr->ev_dw[l],
+                                          cudaEventDisableTiming));
+    }
+    CU_CHECK(cudaEventCreateWithFlags(&tr->ev_enc_in,
+                                      cudaEventDisableTiming));
+    CU_CHECK(cudaEventCreateWithFlags(&tr->ev_dw_enc,
+                                      cudaEventDisableTiming));
+    CU_CHECK(cudaEventCreateWithFlags(&tr->ev_fork, cudaEventDisableTiming));
+    for (int s = 0; s < 2; s++) {
+        CU_CHECK(cudaEventCreateWithFlags(&tr->ev_fwd[s],
+                                          cudaEventDisableTiming));
+        CU_CHECK(cudaEventCreateWithFlags(&tr->ev_rev[s],
+                                          cudaEventDisableTiming));
+        CU_CHECK(cudaEventCreateWithFlags(&tr->ev_dwdone[s],
+                                          cudaEventDisableTiming));
     }
     const char* prof = getenv("CRAFTAX_CU_TRAIN_PROF");
     tr->prof = prof != NULL && atoi(prof) != 0;
@@ -12694,6 +12782,24 @@ static void cu_train_free(CuTrain* tr) {
     for (int i = 0; i < 4; i++) cudaFree(tr->xb[i]);
     for (int l = 0; l < 3; l++) cudaFree(tr->prebb[l]);
     cudaFree(tr->xobsb); cudaFree(tr->dlogitsb); cudaFree(tr->dhGb);
+    for (int i = 0; i < 4; i++) { cudaFree(tr->x1[i]); cudaFree(tr->xb1[i]); }
+    for (int l = 0; l < 3; l++) cudaFree(tr->prebb1[l]);
+    cudaFree(tr->xobsb1); cudaFree(tr->dh3b1);
+    cudaFree(tr->dhG1); cudaFree(tr->dhX1); cudaFree(tr->dhGb1);
+    cudaStreamDestroy(tr->st2);
+    cudaStreamDestroy(tr->st3);
+    for (int l = 0; l < 3; l++) {
+        cudaEventDestroy(tr->ev_wb[l]);
+        cudaEventDestroy(tr->ev_dw[l]);
+    }
+    cudaEventDestroy(tr->ev_enc_in);
+    cudaEventDestroy(tr->ev_dw_enc);
+    cudaEventDestroy(tr->ev_fork);
+    for (int s = 0; s < 2; s++) {
+        cudaEventDestroy(tr->ev_fwd[s]);
+        cudaEventDestroy(tr->ev_rev[s]);
+        cudaEventDestroy(tr->ev_dwdone[s]);
+    }
 }
 
 static int cu_seg_len(const CuTrain* tr) { return tr->T / tr->cfg.bptt_split; }
@@ -12742,6 +12848,142 @@ static void cu_train_collect(CuTrain* tr) {
     tr->t_gae += t2 - t1;
 }
 
+
+// bf16 pipelined variant: forward recompute of window w+1 (st2, cuBLAS
+// handle g_blas) overlaps the reverse chain of window w (main stream,
+// dh GEMMs on g_blas2) while dW GEMMs drain on st3 (g_blas3). Window
+// workspaces are double-buffered by window parity; grads segments
+// touched from different streams are disjoint (W_A/B_A/W_V/B_V from
+// the fwd stream, W_GRU/W_ENC from st3, B_ENC from the main stream),
+// and the final waits order everything before adam.
+static void cu_train_backward_bf_pipe(
+    CuTrain* tr, int env_start, int env_count
+) {
+    CuPolicy* p = tr->p;
+    cudaStream_t st = p->stream, stf = tr->st2, stw = tr->st3;
+    const int T = tr->T, n = tr->n;
+    const int mb = env_count;
+    const int seg = cu_seg_len(tr);
+    const int W = tr->bwd_win;
+    int egrid = (int)(((size_t)CF_NN_HIDDEN * mb + 255) / 256);
+
+    const __nv_bfloat16* Wbf[3];
+    for (int l = 0; l < 3; l++)
+        Wbf[l] = p->params_bf + CF_NN_W_GRU
+                 + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN;
+
+    float* x_[2][4];
+    float* dh3b_[2] = {tr->dh3b, tr->dh3b1};
+    float* dhG_[2] = {tr->dhG, tr->dhG1};
+    float* dhX_[2] = {tr->dhX, tr->dhX1};
+    __nv_bfloat16* xb_[2][4];
+    __nv_bfloat16* prebb_[2][3];
+    __nv_bfloat16* xobsb_[2] = {tr->xobsb, tr->xobsb1};
+    __nv_bfloat16* dhGb_[2] = {tr->dhGb, tr->dhGb1};
+    for (int i = 0; i < 4; i++) {
+        x_[0][i] = tr->x[i]; x_[1][i] = tr->x1[i];
+        xb_[0][i] = tr->xb[i]; xb_[1][i] = tr->xb1[i];
+    }
+    for (int l = 0; l < 3; l++) {
+        prebb_[0][l] = tr->prebb[l]; prebb_[1][l] = tr->prebb1[l];
+    }
+
+    for (int l = 0; l < CF_NN_LAYERS; l++)
+        CU_CHECK(cudaMemsetAsync(tr->dcarry[l], 0,
+                                 (size_t)CF_NN_HIDDEN * mb * sizeof(float),
+                                 st));
+    CU_CHECK(cudaEventRecord(tr->ev_fork, st));
+    CU_CHECK(cudaStreamWaitEvent(stf, tr->ev_fork, 0));
+
+    int w = 0;
+    for (int t_end = T; t_end > 0; t_end -= W, w++) {
+        const int s = w & 1;
+        const int t0 = t_end - W > 0 ? t_end - W : 0;
+        const int Tw = t_end - t0;
+        const int cols = Tw * mb;
+        int xgrid = (int)(((size_t)CF_NN_OBS * cols + 255) / 256);
+        int hgrid = (int)(((size_t)CF_NN_HIDDEN * cols + 255) / 256);
+
+        // ---- forward recompute + head grads for this window on stf ----
+        if (w >= 2) {
+            CU_CHECK(cudaStreamWaitEvent(stf, tr->ev_rev[s], 0));
+            CU_CHECK(cudaStreamWaitEvent(stf, tr->ev_dwdone[s], 0));
+        }
+        k_expand_obs<<<xgrid, 256, 0, stf>>>(
+            tr->r_obs, tr->xobs, t0, cols, mb, n, env_start, xobsb_[s]);
+        cu_gemm_nn_bf(CF_NN_OBS, cols, p->params_bf + CF_NN_W_ENC,
+                      xobsb_[s], CF_NN_OBS_PAD, x_[s][0], stf);
+        k_add_bias<<<hgrid, 256, 0, stf>>>(x_[s][0], p->w.b_enc, cols,
+                                           xb_[s][0]);
+        for (int l = 0; l < CF_NN_LAYERS; l++) {
+            cu_gemm_fwd_bfc(CF_NN_GRU, cols, CF_NN_HIDDEN, Wbf[l],
+                            xb_[s][l], prebb_[s][l], stf);
+            k_mingru_epi_replay_win<<<hgrid, 256, 0, stf>>>(
+                tr->preb[l], x_[s][l], tr->r_state, x_[s][l + 1], t0, Tw,
+                mb, n, env_start, l, xb_[s][l + 1], prebb_[s][l]);
+        }
+        cu_gemm_fwd_bf(CRAFTAX_NUM_ACTIONS, cols, CF_NN_HIDDEN,
+                       p->params_bf + CF_NN_W_A, xb_[s][3], tr->logitsb,
+                       stf);
+        k_head_bwd_win<<<(cols + 255) / 256, 256, 0, stf>>>(
+            tr->logitsb, x_[s][3], p->w.b_a, p->w.W_v, p->w.b_v,
+            tr->r_act + env_start, tr->r_logprob + env_start,
+            tr->adv + env_start, tr->ret + env_start, tr->stats,
+            tr->dlogits, tr->dvalue, tr->loss_acc, t0, Tw, mb, n, n, T,
+            tr->cfg.clip, tr->cfg.vf, tr->d_ent, tr->dlogitsb, xb_[s][3]);
+        cu_gemm_nn_bf(CRAFTAX_NUM_ACTIONS, cols, p->params_bf + CF_NN_W_A,
+                      tr->dlogitsb, CRAFTAX_NUM_ACTIONS, dh3b_[s], stf);
+        k_add_dv_wv<<<hgrid, 256, 0, stf>>>(dh3b_[s], tr->dvalue, p->w.W_v,
+                                            cols);
+        cu_gemm_dw_bf(CRAFTAX_NUM_ACTIONS, cols, xb_[s][3], tr->dlogitsb,
+                      CRAFTAX_NUM_ACTIONS, tr->grads + CF_NN_W_A, stf);
+        cu_gemv_dwv(x_[s][3], tr->dvalue, tr->grads + CF_NN_W_V, cols, stf);
+        k_colsum_small<<<256, 256, CRAFTAX_NUM_ACTIONS * sizeof(float),
+                         stf>>>(
+            tr->dlogits, tr->grads + CF_NN_B_A, CRAFTAX_NUM_ACTIONS, cols);
+        k_colsum<<<1, 128, 0, stf>>>(tr->dvalue, tr->grads + CF_NN_B_V, 1,
+                                     cols);
+        CU_CHECK(cudaEventRecord(tr->ev_fwd[s], stf));
+
+        // ---- reverse chain on st, dW drains on stw ----
+        CU_CHECK(cudaStreamWaitEvent(st, tr->ev_fwd[s], 0));
+        const float* dh_gemm = dh3b_[s];
+        const float* dh_extra = NULL;
+        for (int l = CF_NN_LAYERS - 1; l >= 0; l--) {
+            k_mingru_window_bwd<<<egrid, 256, 0, st>>>(
+                tr->preb[l], x_[s][l], dh_gemm, dh_extra, tr->r_state,
+                tr->r_done, dhX_[s], tr->dcarry[l], t0, Tw, mb, n,
+                env_start, l, T, seg, prebb_[s][l]);
+            CU_CHECK(cudaEventRecord(tr->ev_wb[l], st));
+            CU_CHECK(cudaStreamWaitEvent(stw, tr->ev_wb[l], 0));
+            cu_gemm_dw_bf2(CF_NN_GRU, cols, xb_[s][l], prebb_[s][l],
+                           CF_NN_GRU, tr->grads + CF_NN_W_GRU
+                               + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                           stw);
+            cu_gemm_nn_bf(CF_NN_GRU, cols, Wbf[l], prebb_[s][l], CF_NN_GRU,
+                          dhG_[s], st, g_blas2);
+            dh_gemm = dhG_[s];
+            dh_extra = dhX_[s];
+        }
+        k_vadd<<<hgrid, 256, 0, st>>>(dhG_[s], dhX_[s],
+                                      (size_t)CF_NN_HIDDEN * cols,
+                                      dhGb_[s]);
+        k_colsum256<<<256, 256, 0, st>>>(
+            dhG_[s], tr->grads + CF_NN_B_ENC, cols);
+        CU_CHECK(cudaEventRecord(tr->ev_enc_in, st));
+        CU_CHECK(cudaStreamWaitEvent(stw, tr->ev_enc_in, 0));
+        cu_gemm_dw_bf2(CF_NN_OBS, cols, dhGb_[s], xobsb_[s],
+                       CF_NN_OBS_PAD, tr->grads + CF_NN_W_ENC, stw);
+        CU_CHECK(cudaEventRecord(tr->ev_dwdone[s], stw));
+        CU_CHECK(cudaEventRecord(tr->ev_rev[s], st));
+    }
+    // Join st3 (and transitively st2) before adam reads grads.
+    CU_CHECK(cudaStreamWaitEvent(st, tr->ev_dwdone[(w - 1) & 1], 0));
+    if (w >= 2)
+        CU_CHECK(cudaStreamWaitEvent(st, tr->ev_dwdone[w & 1], 0));
+    CU_CHECK(cudaGetLastError());
+}
+
 // Gradients over one contiguous env range, accumulated into the
 // (k_adam-zeroed) grads arena.
 //
@@ -12754,6 +12996,10 @@ static void cu_train_collect(CuTrain* tr) {
 // accumulate dW online via beta=1 GEMMs over the window columns.
 // Working set is O(W*mb), not O(T*mb). r_state[t] is reloaded per step.
 static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
+    if (g_gemm_bf16) {
+        cu_train_backward_bf_pipe(tr, env_start, env_count);
+        return;
+    }
     CuPolicy* p = tr->p;
     cudaStream_t st = p->stream;
     const int T = tr->T, n = tr->n;
@@ -12791,6 +13037,13 @@ static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
             for (int l = 0; l < 3; l++)
                 Wbf[l] = p->params_bf + CF_NN_W_GRU
                          + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN;
+        if (bf && t_end < T) {
+            // dW GEMMs of the previous window still read prebb/xobsb on
+            // st2; block the recompute overwrites until they finish.
+            for (int l = 0; l < 3; l++)
+                CU_CHECK(cudaStreamWaitEvent(st, tr->ev_dw[l], 0));
+            CU_CHECK(cudaStreamWaitEvent(st, tr->ev_dw_enc, 0));
+        }
         k_expand_obs<<<xgrid, 256, 0, st>>>(
             tr->r_obs, tr->xobs, t0, cols, mb, n, env_start, tr->xobsb);
         if (bf)
@@ -12867,10 +13120,13 @@ static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
                 tr->r_done, tr->dhX, tr->dcarry[l], t0, Tw, mb, n,
                 env_start, l, T, seg, tr->prebb[l]);
             if (bf) {
-                cu_gemm_dw_bf(CF_NN_GRU, cols, tr->xb[l], tr->prebb[l],
-                              CF_NN_GRU, tr->grads + CF_NN_W_GRU
-                                  + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
-                              st);
+                CU_CHECK(cudaEventRecord(tr->ev_wb[l], st));
+                CU_CHECK(cudaStreamWaitEvent(tr->st2, tr->ev_wb[l], 0));
+                cu_gemm_dw_bf2(CF_NN_GRU, cols, tr->xb[l], tr->prebb[l],
+                               CF_NN_GRU, tr->grads + CF_NN_W_GRU
+                                   + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
+                               tr->st2);
+                CU_CHECK(cudaEventRecord(tr->ev_dw[l], tr->st2));
                 cu_gemm_nn_bf(CF_NN_GRU, cols, Wbf[l], tr->prebb[l],
                               CF_NN_GRU, tr->dhG, st);
             } else {
@@ -12888,12 +13144,22 @@ static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
                                       (size_t)CF_NN_HIDDEN * cols, tr->dhGb);
         k_colsum256<<<256, 256, 0, st>>>(
             tr->dhG, tr->grads + CF_NN_B_ENC, cols);
-        if (bf)
-            cu_gemm_dw_bf(CF_NN_OBS, cols, tr->dhGb, tr->xobsb,
-                          CF_NN_OBS_PAD, tr->grads + CF_NN_W_ENC, st);
-        else
+        if (bf) {
+            CU_CHECK(cudaEventRecord(tr->ev_enc_in, st));
+            CU_CHECK(cudaStreamWaitEvent(tr->st2, tr->ev_enc_in, 0));
+            cu_gemm_dw_bf2(CF_NN_OBS, cols, tr->dhGb, tr->xobsb,
+                           CF_NN_OBS_PAD, tr->grads + CF_NN_W_ENC, tr->st2);
+            CU_CHECK(cudaEventRecord(tr->ev_dw_enc, tr->st2));
+        } else {
             cu_gemm_dw(CF_NN_OBS, cols, tr->dhG, tr->xobs,
                        tr->grads + CF_NN_W_ENC, st);
+        }
+    }
+    if (g_gemm_bf16) {
+        // Join st2 before adam consumes grads.
+        for (int l = 0; l < 3; l++)
+            CU_CHECK(cudaStreamWaitEvent(st, tr->ev_dw[l], 0));
+        CU_CHECK(cudaStreamWaitEvent(st, tr->ev_dw_enc, 0));
     }
     CU_CHECK(cudaGetLastError());
 }
@@ -13091,7 +13357,7 @@ static int cu_run_train(
     // footprint stays under ~8 GB.
     {
         cu_ensure_blas();
-        size_t bpe = (size_t)(CF_MB_BYTES_PER_ENV + (g_gemm_bf16 ? 9216 : 0))
+        size_t bpe = (size_t)(CF_MB_BYTES_PER_ENV + (g_gemm_bf16 ? 25600 : 0))
                      * (size_t)cu_bwd_win();
         size_t max_mb = ((size_t)8 << 30) / bpe;
         while (cfg.minibatches < num_envs / 32 &&
