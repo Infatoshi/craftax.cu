@@ -114,13 +114,21 @@ GEMM writes is still L2-resident when the epilogue reads it back
 (50MB per chunk on a 128MB-L2 part instead of a 201MB-per-layer DRAM
 round trip; the epilogue streams the recurrent state evict-first so
 it cannot push pre out -- the epilogue fell from 918us to 273us per
-step at 65k, 22.8M -> 30.3M SPS). A fused value/sampling kernel
-writes the rollout and the env's
-action slot. The whole step replays as a CUDA graph (`--graph 1`);
+step at 65k, 22.8M -> 30.3M SPS). The actor GEMM carries W_v as row
+43, so logits and value come out of one launch; a sampling epilogue
+adds biases and writes the rollout and the env's action slot. The whole step replays as a CUDA graph (`--graph 1`);
 eager and graph rollouts are bitwise identical, and `runhash` seals
 the whole rollout (actions, logprobs, values, rewards, terminals)
-across graph/eager, both obs builds, and repeated runs (canonical
-1024x500 rollout hash 0x667d0e43f5b14ead). `runverify` checks the
+across graph/eager, both obs builds, and repeated runs. The hash is
+GPU-arch-specific because cuBLAS picks different GEMM kernels per
+arch; canonical 1024x500 seal (RTX PRO 6000, fp32 autogate):
+0x1dc7e4e16d65e32d. Resealed when the value head was folded into the
+actor GEMM as row 43 (value summation order changed; prior seals
+0x667d0e43f5b14ead fp32 / 0xf1bb646444f92b3f 3090 bf16), and before
+that when the bf16 tensor-core GEMM path became the rollout default;
+CF_GEMM_BF16=0 removes only the bf16 delta, not the fold. The env-side trajectory anchors
+(64x2000 and 4x20000 vs the C reference)
+are unchanged bit-exactly. `runverify` checks the
 batched forward against a scalar fp32 reference (max |d_h3| 5.5e-4
 under TF32 GEMMs, 23/131072 action flips) on top of the bitwise
 eager-vs-graph gate. Action
