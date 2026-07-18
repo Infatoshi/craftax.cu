@@ -9713,17 +9713,11 @@ static __device__ int cf_nn_sample_action(
 // the previous "every lane rebuilds the same list" form burned ~half of
 // k_record_obs on redundant serial walks of the 14-slot mob pool; bytes
 // are unchanged because the predicates and last-slot-wins order match.
-__global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
-    // 256-thread blocks = 8 warps; each warp owns one env.
-    __shared__ int16_t sm_mob_cell[8][14];
-    __shared__ int8_t sm_mob_ch[8][14];
-    __shared__ uint8_t sm_mob_val[8][14];
-    __shared__ int sm_nm[8];
-
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    int e = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    if (e >= num_envs) return;
+static __device__ __forceinline__ void cf_record_env_warp(
+    int e, uint8_t* __restrict__ r_obs_row, int lane,
+    int16_t* sm_cell, int8_t* sm_chn, uint8_t* sm_valv, int* sm_nm1,
+    float* sm_tail1
+) {
     const CraftaxState* cs = &((const CraftaxState*)g_cf_state_base)[e];
     const CraftaxWorldState* state = (const CraftaxWorldState*)(const void*)cs;
     uint8_t* rec = r_obs_row + (size_t)e * CF_TRAIN_OBS;
@@ -9765,22 +9759,22 @@ __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
                 int8_t ch = (int8_t)(3 + c);
                 int found = -1;
                 for (int j = 0; j < nm; j++)
-                    if (sm_mob_cell[warp][j] == cell && sm_mob_ch[warp][j] == ch)
+                    if (sm_cell[j] == cell && sm_chn[j] == ch)
                         found = j;
                 if (found >= 0) {
-                    sm_mob_val[warp][found] = (uint8_t)(type_id + 1);
+                    sm_valv[found] = (uint8_t)(type_id + 1);
                 } else {
-                    sm_mob_cell[warp][nm] = cell;
-                    sm_mob_ch[warp][nm] = ch;
-                    sm_mob_val[warp][nm] = (uint8_t)(type_id + 1);
+                    sm_cell[nm] = cell;
+                    sm_chn[nm] = ch;
+                    sm_valv[nm] = (uint8_t)(type_id + 1);
                     nm++;
                 }
             }
         }
-        sm_nm[warp] = nm;
+        *sm_nm1 = nm;
     }
     __syncwarp();
-    const int nm = sm_nm[warp];
+    const int nm = *sm_nm1;
 
     for (int cell = lane; cell < CRAFTAX_WG_OBS_ROWS * CRAFTAX_WG_OBS_COLS;
          cell += 32) {
@@ -9797,8 +9791,8 @@ __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
             b[2] = 1;
         }
         for (int m = 0; m < nm; m++)
-            if ((int)sm_mob_cell[warp][m] == cell)
-                b[sm_mob_ch[warp][m]] = sm_mob_val[warp][m];
+            if ((int)sm_cell[m] == cell)
+                b[sm_chn[m]] = sm_valv[m];
         // rec + cell*8 is 4-byte aligned (CF_TRAIN_OBS = 996 = 4*249)
         uint32_t w0, w1;
         memcpy(&w0, b, 4);
@@ -9811,12 +9805,53 @@ __global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs) {
 
     // Scalar tail: lane 0 computes once, warp stores cooperatively.
     // (Previously every lane recomputed the same 51 floats.)
-    __shared__ float sm_tail[8][CF_NN_TAIL];
     if (lane == 0)
-        craftax_encode_scalar_observation_tail_at(state, sm_tail[warp], 0);
+        craftax_encode_scalar_observation_tail_at(state, sm_tail1, 0);
     __syncwarp();
     for (int j = lane; j < CF_NN_TAIL; j += 32)
-        memcpy(rec + CF_NN_MAP + 4 * j, &sm_tail[warp][j], sizeof(float));
+        memcpy(rec + CF_NN_MAP + 4 * j, &sm_tail1[j], sizeof(float));
+}
+
+// 256-thread blocks = 8 warps; each warp owns one env. `skip` (optional)
+// marks envs whose reset (launched on the side stream) has not been
+// joined yet -- k_record_obs_list records exactly those rows after the
+// join, so every env row is written exactly once and the record bytes
+// are identical to the single-kernel form.
+__global__ void k_record_obs(uint8_t* __restrict__ r_obs_row, int num_envs,
+                             const uint8_t* __restrict__ skip = nullptr) {
+    __shared__ int16_t sm_mob_cell[8][14];
+    __shared__ int8_t sm_mob_ch[8][14];
+    __shared__ uint8_t sm_mob_val[8][14];
+    __shared__ int sm_nm[8];
+    __shared__ float sm_tail[8][CF_NN_TAIL];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    int e = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (e >= num_envs) return;
+    if (skip != nullptr && skip[e]) return;
+    cf_record_env_warp(e, r_obs_row, lane, sm_mob_cell[warp],
+                       sm_mob_ch[warp], sm_mob_val[warp], &sm_nm[warp],
+                       sm_tail[warp]);
+}
+
+// Record rows for just-reset envs (compacted list), one warp per entry,
+// grid-strided. Runs after the reset side stream joins.
+__global__ void k_record_obs_list(uint8_t* __restrict__ r_obs_row,
+                                  const CraftaxResetRec* __restrict__ resets) {
+    __shared__ int16_t sm_mob_cell[8][14];
+    __shared__ int8_t sm_mob_ch[8][14];
+    __shared__ uint8_t sm_mob_val[8][14];
+    __shared__ int sm_nm[8];
+    __shared__ float sm_tail[8][CF_NN_TAIL];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int idx = blockIdx.x * 8 + warp; idx < g_reset_count;
+         idx += (int)gridDim.x * 8) {
+        cf_record_env_warp(resets[idx].env, r_obs_row, lane,
+                           sm_mob_cell[warp], sm_mob_ch[warp],
+                           sm_mob_val[warp], &sm_nm[warp], sm_tail[warp]);
+        __syncwarp();
+    }
 }
 
 // Streaming (evict-first) accessors for the recurrent state and the
@@ -10337,12 +10372,14 @@ __global__ void k_policy_ref_l3(
 
 // Step kernel for the rollout path: actions come from the policy (already
 // in env->actions), and no observation bytes are written at all.
-__global__ void CRAFTAX_STEP_LB k_step_run(Craftax* envs, int num_envs, CraftaxResetRec* resets) {
+__global__ void CRAFTAX_STEP_LB k_step_run(Craftax* envs, int num_envs, CraftaxResetRec* resets,
+                                           uint8_t* __restrict__ reset_flags) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_envs) return;
     Craftax* env = &envs[i];
     CraftaxThreefryKey reset_key;
     bool done = c_step_gameplay_core(env, &reset_key);
+    if (reset_flags) reset_flags[i] = done ? 1 : 0;
     if (done) {
         int slot = atomicAdd(&g_reset_count, 1);
         resets[slot].env = i;
@@ -11072,6 +11109,7 @@ typedef struct {
     float* d_terminals;
     uint32_t* d_action_rng;
     CraftaxResetRec* d_resets;
+    uint8_t* d_reset_flags;  // per-env "reset pending" (k_step_run, overlap)
     int* d_reset_count;  // symbol address of g_reset_count
     CraftaxSpawnRec* d_spawn_queue;
     int* d_spawn_count;  // symbol address of g_cf_spawn_count
@@ -11123,7 +11161,10 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
     CU_CHECK(cudaMalloc(&v->d_action_rng, (size_t)num_envs * sizeof(uint32_t)));
     CU_CHECK(cudaMalloc(&v->d_resets,
                         (size_t)num_envs * sizeof(CraftaxResetRec)));
+    CU_CHECK(cudaMalloc(&v->d_reset_flags, (size_t)num_envs));
+    CU_CHECK(cudaMemset(v->d_reset_flags, 0, (size_t)num_envs));
     CU_CHECK(cudaGetSymbolAddress((void**)&v->d_reset_count, g_reset_count));
+    CU_CHECK(cudaMemset(v->d_reset_count, 0, sizeof(int)));
     CU_CHECK(cudaMalloc(&v->d_spawn_queue,
                         (size_t)num_envs * sizeof(CraftaxSpawnRec)));
     CU_CHECK(cudaGetSymbolAddress((void**)&v->d_spawn_count, g_cf_spawn_count));
@@ -11207,6 +11248,7 @@ static void cu_vec_free(CuVec* v) {
     cudaFree(v->d_envs); cudaFree(v->d_states); cudaFree(v->d_obs);
     cudaFree(v->d_actions); cudaFree(v->d_rewards); cudaFree(v->d_terminals);
     cudaFree(v->d_action_rng); cudaFree(v->d_resets);
+    cudaFree(v->d_reset_flags);
     cudaFree(v->d_spawn_queue);
     cudaFree(v->d_wg_scratch);
     if (v->d_warp_scratch != NULL) cudaFree(v->d_warp_scratch);
@@ -12109,6 +12151,18 @@ typedef struct {
     __nv_bfloat16* h3_bf;      // [HIDDEN][n]
     __nv_bfloat16* pre_bf;     // [GRU][n] gate GEMM C (bf16)
     cudaStream_t stream;
+    // Reset/record overlap (trainer only): the reset-list worldgen for
+    // envs that died at step t runs on st_reset while step t+1's record
+    // covers the survivors; the record for the just-reset envs joins via
+    // ev_reset before the encoder GEMM consumes the full record.
+    cudaStream_t st_reset;
+    cudaEvent_t ev_spawn, ev_reset;
+    int overlap;
+    // Host-side "a reset is in flight on st_reset" marker. At iteration
+    // start it is always 0 (the bootstrap encode joins the last fork), so
+    // the t=0 record is a full one -- required for graph capture: the wait
+    // may only reference an event recorded inside the same capture.
+    int reset_inflight;
 } CuPolicy;
 
 // r_state slab element offset -> pointer, honoring the bf16 slab
@@ -12199,10 +12253,17 @@ static void cu_policy_init(CuPolicy* p, int num_envs) {
         cu_params_refresh_bf16(p, 0);
     }
     CU_CHECK(cudaStreamCreateWithFlags(&p->stream, cudaStreamNonBlocking));
+    CU_CHECK(cudaStreamCreateWithFlags(&p->st_reset, cudaStreamNonBlocking));
+    CU_CHECK(cudaEventCreateWithFlags(&p->ev_spawn, cudaEventDisableTiming));
+    CU_CHECK(cudaEventCreateWithFlags(&p->ev_reset, cudaEventDisableTiming));
+    p->overlap = 0;  // enabled by the trainer (whole-iteration graph)
+    p->reset_inflight = 0;
 }
 
 static void cu_policy_free(CuPolicy* p) {
     cudaStreamDestroy(p->stream);
+    cudaStreamDestroy(p->st_reset);
+    cudaEventDestroy(p->ev_spawn); cudaEventDestroy(p->ev_reset);
     cudaFree(p->params); cudaFree(p->h_state);
     cudaFree(p->rec); cudaFree(p->xobs);
     cudaFree(p->h_enc); cudaFree(p->hout[0]); cudaFree(p->hout[1]);
@@ -12223,11 +12284,24 @@ static void cu_policy_free(CuPolicy* p) {
 // features per env (388us/step at 8192 envs, 26% of training GPU
 // time; the GEMM route is ~100us total).
 static void cu_encode_step(
-    CuPolicy* p, uint8_t* rec_row, int n, cudaStream_t st
+    CuPolicy* p, CuVec* v, uint8_t* rec_row, int n, cudaStream_t st
 ) {
     if (!rec_row) rec_row = p->rec;
-    k_record_obs<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
-        rec_row, n);
+    if (p->overlap && p->reset_inflight) {
+        // Survivors first (does not depend on the in-flight reset);
+        // just-reset envs join via ev_reset and get their rows from the
+        // compacted list. Rows are byte-identical to the single-kernel
+        // form -- each env is written exactly once either way.
+        k_record_obs<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
+            rec_row, n, v->d_reset_flags);
+        CU_CHECK(cudaStreamWaitEvent(st, p->ev_reset, 0));
+        int lgrid = (n + 7) / 8 > 128 ? 128 : (n + 7) / 8;
+        k_record_obs_list<<<lgrid, 256, 0, st>>>(rec_row, v->d_resets);
+        p->reset_inflight = 0;
+    } else {
+        k_record_obs<<<(int)(((size_t)n * 32 + 255) / 256), 256, 0, st>>>(
+            rec_row, n);
+    }
     k_expand_obs<<<(int)(((size_t)CF_NN_OBS * n + 255) / 256), 256, 0, st>>>(
         rec_row, p->xobs, 0, n, n, n, 0, p->xobs_bf);
     if (g_gemm_bf16)
@@ -12306,9 +12380,12 @@ static void cu_rollout_step(
     int n = v->num_envs;
     cudaStream_t st = p->stream;
     int grid = (n + 255) / 256;
+    cu_encode_step(p, v, r_obs_row, n, st);
+    // After the encode: the previous step's reset list has been consumed
+    // (k_record_obs_list reads g_reset_count under overlap), so the
+    // counters are safe to clear for this step's k_step_run.
     CU_CHECK(cudaMemsetAsync(v->d_reset_count, 0, sizeof(int), st));
     CU_CHECK(cudaMemsetAsync(v->d_spawn_count, 0, sizeof(int), st));
-    cu_encode_step(p, r_obs_row, n, st);
     cu_gru_chain(p, p->h_enc, p->h_state, v->d_terminals, r_state_t,
                  p->h3, n, st);
     if (g_gemm_bf16)
@@ -12326,10 +12403,13 @@ static void cu_rollout_step(
     // ~4k the 32-wide form was measured slightly slower (launch/sched
     // noise dominates), and above ~12k the wider block wins on the
     // 3090-measured L1-share curve -- so only retile the mid band.
+    uint8_t* rf = p->overlap ? v->d_reset_flags : NULL;
     if (n >= 4096 && n <= 12288) {
-        k_step_run<<<(n + 31) / 32, 32, 0, st>>>(v->d_envs, n, v->d_resets);
+        k_step_run<<<(n + 31) / 32, 32, 0, st>>>(v->d_envs, n, v->d_resets,
+                                                 rf);
     } else {
-        k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, n, v->d_resets);
+        k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, n, v->d_resets,
+                                                 rf);
     }
     if (r_reward_row)
         k_record_rd<<<grid, 256, 0, st>>>(v->d_rewards, v->d_terminals,
@@ -12340,7 +12420,21 @@ static void cu_rollout_step(
         k_spawn_tail<<<tail_blocks, 256, 0, st>>>();
     }
     if (v->lazy) {
-        cu_launch_reset_list_warp(v->d_envs, v->d_resets, n, st);
+        if (p->overlap) {
+            // Fork: the reset worldgen runs on st_reset concurrently with
+            // the next step's survivor record on the main stream; the
+            // join is the ev_reset wait in cu_encode_step. Under graph
+            // capture the events become graph edges (same pattern as the
+            // pipelined backward).
+            CU_CHECK(cudaEventRecord(p->ev_spawn, st));
+            CU_CHECK(cudaStreamWaitEvent(p->st_reset, p->ev_spawn, 0));
+            cu_launch_reset_list_warp(v->d_envs, v->d_resets, n,
+                                      p->st_reset);
+            CU_CHECK(cudaEventRecord(p->ev_reset, p->st_reset));
+            p->reset_inflight = 1;
+        } else {
+            cu_launch_reset_list_warp(v->d_envs, v->d_resets, n, st);
+        }
     } else {
         k_reset_list<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, v->d_resets);
     }
@@ -12606,7 +12700,7 @@ static int cu_run_rollout_verify(int num_envs, int num_steps,
             CU_CHECK(cudaMemsetAsync(v.d_reset_count, 0, sizeof(int), st));
             CU_CHECK(cudaMemsetAsync(v.d_spawn_count, 0, sizeof(int), st));
             // Batched forward (same launches as cu_rollout_step).
-            cu_encode_step(&p, NULL, n, st);
+            cu_encode_step(&p, &v, NULL, n, st);
             cu_gru_chain(&p, p.h_enc, p.h_state, v.d_terminals, NULL,
                          p.h3, n, st);
             cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, n, CF_NN_HIDDEN, p.w.W_a, p.h3,
@@ -12621,10 +12715,10 @@ static int cu_run_rollout_verify(int num_envs, int num_steps,
             // Advance the env with the batched path's actions.
             if (n >= 4096 && n <= 12288) {
                 k_step_run<<<(n + 31) / 32, 32, 0, st>>>(v.d_envs, n,
-                                                         v.d_resets);
+                                                         v.d_resets, NULL);
             } else {
                 k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs, n,
-                                                         v.d_resets);
+                                                         v.d_resets, NULL);
             }
             {
                 int tail_blocks = (n * 32 + 255) / 256;
@@ -12811,6 +12905,18 @@ static void cu_train_init(
     memset(tr, 0, sizeof(*tr));
     tr->v = v; tr->p = p; tr->cfg = cfg;
     tr->n = v->num_envs; tr->T = T; tr->seed = seed;
+    // Reset/record overlap (CRAFTAX_CU_RESET_OVERLAP): trainer-only --
+    // the whole-iteration graph lets the fork/join span adjacent rollout
+    // steps (run modes capture one step per graph, where cross-step
+    // overlap is impossible anyway). Default on at >=4096 envs: the win
+    // scales with the survivor-record time it hides while the event
+    // fork/join cost is constant (3090: -2% @1024, +1.3% @4096,
+    // +0.5% @8192).
+    {
+        const char* e = getenv("CRAFTAX_CU_RESET_OVERLAP");
+        int dflt = tr->n >= 4096;
+        p->overlap = v->lazy && (e == NULL ? dflt : atoi(e) != 0);
+    }
     if (cfg.minibatches < 1 || tr->n % cfg.minibatches != 0) {
         fprintf(stderr, "--minibatches must divide num_envs (%d %% %d != 0)\n",
                 tr->n, cfg.minibatches);
@@ -13031,7 +13137,7 @@ static void cu_train_collect(CuTrain* tr) {
     CU_CHECK(cudaMemcpyAsync(tr->boot_state, p->h_state,
                              (size_t)CF_NN_LAYERS * hn * sizeof(float),
                              cudaMemcpyDeviceToDevice, st));
-    cu_encode_step(p, NULL, n, st);
+    cu_encode_step(p, v, NULL, n, st);
     cu_gru_chain(p, p->h_enc, tr->boot_state, v->d_terminals, NULL,
                  p->h3, n, st);
     int grid = (n + 255) / 256;
