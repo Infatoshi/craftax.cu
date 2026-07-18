@@ -11501,6 +11501,15 @@ static void cu_ensure_blas(void) {
     }
 }
 
+// Small-N auto-gate: below 4096 envs the bf16 conversion overhead
+// (producer shadows, bf16 round trips) loses to plain TF32 GEMMs
+// (PRO 6000 @1024: 2.39 -> 2.23 M train SPS). An explicit
+// CF_GEMM_BF16 setting always wins over the auto-gate.
+static void cu_bf16_autogate(int num_envs) {
+    if (getenv("CF_GEMM_BF16") == NULL && num_envs < 4096)
+        g_gemm_bf16 = 0;
+}
+
 template <typename Frag>
 static __device__ __forceinline__ void cf_acc_to_bf16(Frag& c) {
 #pragma unroll
@@ -11955,6 +11964,7 @@ static void cu_policy_init(CuPolicy* p, int num_envs) {
         exit(1);
     }
     cu_ensure_blas();
+    cu_bf16_autogate(num_envs);
     CU_CHECK(cudaMalloc(&p->params,
                         (size_t)CF_NN_PARAM_COUNT * sizeof(float)));
     float be = 1.0f / sqrtf((float)CF_NN_OBS);
@@ -13382,6 +13392,7 @@ static int cu_run_train(
     // footprint stays under ~8 GB.
     {
         cu_ensure_blas();
+        cu_bf16_autogate(num_envs);
         size_t bpe = (size_t)(CF_MB_BYTES_PER_ENV + (g_gemm_bf16 ? 25600 : 0))
                      * (size_t)cu_bwd_win();
         size_t max_mb = ((size_t)8 << 30) / bpe;
