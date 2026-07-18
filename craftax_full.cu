@@ -9685,7 +9685,8 @@ __global__ void k_mingru_epi_fwd(
     const float* __restrict__ prev_terminals,  // [cols]
     int cols,
     __nv_bfloat16* __restrict__ h_out_bf = nullptr,  // bf16 GEMM shadow
-    const __nv_bfloat16* __restrict__ pre_bf = nullptr  // bf16 GEMM C
+    const __nv_bfloat16* __restrict__ pre_bf = nullptr,  // bf16 GEMM C
+    int r_state_bf16 = 0  // store the BPTT state record in bf16
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= CF_NN_HIDDEN * cols) return;
@@ -9695,7 +9696,12 @@ __global__ void k_mingru_epi_fwd(
 
     float st = cf_ldcs(&state[o]);
     if (prev_terminals[col] != 0.0f) st = 0.0f;
-    if (r_state_store) cf_stcs(&r_state_store[o], st);
+    if (r_state_bf16) {
+        if (r_state_store)
+            ((__nv_bfloat16*)r_state_store)[o] = __float2bfloat16(st);
+    } else if (r_state_store) {
+        cf_stcs(&r_state_store[o], st);
+    }
 
     size_t o3 = (size_t)col * CF_NN_GRU + k;
     float zh, zg, zp;
@@ -9735,8 +9741,9 @@ __global__ void k_mingru_epi_replay(
     float* __restrict__ st_store,        // [HIDDEN][mb] tight st record for the sweep, or null
     float* __restrict__ x_next,          // [HIDDEN][mb]
     int mb,
-    __nv_bfloat16* __restrict__ x_next_bf = nullptr,  // bf16 GEMM shadow
-    const __nv_bfloat16* __restrict__ pre_bf = nullptr  // bf16 GEMM C
+    __nv_bfloat16* __restrict__ x_next_bf = nullptr,  // bf16 GEMM C
+    const __nv_bfloat16* __restrict__ pre_bf = nullptr,  // bf16 GEMM C
+    int r_state_bf16 = 0
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= CF_NN_HIDDEN * mb) return;
@@ -9746,7 +9753,9 @@ __global__ void k_mingru_epi_replay(
 
     float st;
     if (r_state_t) {
-        st = r_state_t[o];
+        st = r_state_bf16
+            ? __bfloat162float(((const __nv_bfloat16*)r_state_t)[o])
+            : r_state_t[o];
     } else {
         st = live[o];
         if (prev_dones[el]) st = 0.0f;
@@ -9784,7 +9793,8 @@ __global__ void k_mingru_epi_replay_win(
     float* __restrict__ x_next,          // [HIDDEN][Tw*mb]
     int t0, int Tw, int mb, int n, int env_start, int layer,
     __nv_bfloat16* __restrict__ x_next_bf = nullptr,  // bf16 GEMM shadow
-    const __nv_bfloat16* __restrict__ pre_bf = nullptr  // bf16 GEMM C
+    const __nv_bfloat16* __restrict__ pre_bf = nullptr,  // bf16 GEMM C
+    int r_state_bf16 = 0
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int cols = Tw * mb;
@@ -9797,11 +9807,12 @@ __global__ void k_mingru_epi_replay_win(
     size_t o = (size_t)w * CF_NN_HIDDEN + k;
     size_t o3 = (size_t)w * CF_NN_GRU + k;
 
-    const float* rst =
-        r_state
-        + ((size_t)t * CF_NN_LAYERS + layer) * (size_t)CF_NN_HIDDEN * n
-        + (size_t)env_start * CF_NN_HIDDEN;
-    float st = rst[(size_t)el * CF_NN_HIDDEN + k];
+    size_t rst_off =
+        ((size_t)t * CF_NN_LAYERS + layer) * (size_t)CF_NN_HIDDEN * n
+        + (size_t)(env_start + el) * CF_NN_HIDDEN + k;
+    float st = r_state_bf16
+        ? __bfloat162float(((const __nv_bfloat16*)r_state)[rst_off])
+        : r_state[rst_off];
 
     float zh, zg, zp;
     if (pre_bf) {
@@ -9836,7 +9847,8 @@ __global__ void k_mingru_window_bwd(
     float* __restrict__ dcarry,          // [HIDDEN][mb] in/out
     int t0, int Tw, int mb, int n, int env_start, int layer,
     int T_all, int seg_len,
-    __nv_bfloat16* __restrict__ preb_bf = nullptr  // bf16 pre in / dpre out
+    __nv_bfloat16* __restrict__ preb_bf = nullptr,  // bf16 pre in / dpre out
+    int r_state_bf16 = 0
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= CF_NN_HIDDEN * mb) return;
@@ -9865,11 +9877,12 @@ __global__ void k_mingru_window_bwd(
         float dhout = dhGEMM[o];
         if (dhExtra) dhout += dhExtra[o];
 
-        const float* rst =
-            r_state
-            + ((size_t)t * CF_NN_LAYERS + layer) * (size_t)CF_NN_HIDDEN * n
-            + (size_t)env_start * CF_NN_HIDDEN;
-        float s_in = rst[(size_t)el * CF_NN_HIDDEN + k];
+        size_t rst_off =
+            ((size_t)t * CF_NN_LAYERS + layer) * (size_t)CF_NN_HIDDEN * n
+            + (size_t)(env_start + el) * CF_NN_HIDDEN + k;
+        float s_in = r_state_bf16
+            ? __bfloat162float(((const __nv_bfloat16*)r_state)[rst_off])
+            : r_state[rst_off];
         float xv = x[o];
         bool done_t = r_done[(size_t)t * n + env_start + el] != 0;
 
@@ -11921,6 +11934,13 @@ typedef struct {
     cudaStream_t stream;
 } CuPolicy;
 
+// r_state slab element offset -> pointer, honoring the bf16 slab
+// layout (CF_GEMM_BF16 stores the BPTT state record in bf16).
+static float* cu_rstate_at(float* r_state, size_t elem_off) {
+    return g_gemm_bf16 ? (float*)((__nv_bfloat16*)r_state + elem_off)
+                       : r_state + elem_off;
+}
+
 static void cu_params_refresh_bf16(CuPolicy* p, cudaStream_t st) {
     if (!g_gemm_bf16) return;
     k_to_bf16<<<(CF_NN_PARAM_COUNT + 255) / 256, 256, 0, st>>>(
@@ -12079,11 +12099,12 @@ static void cu_gru_chain(CuPolicy* p, const float* x0, float* state,
                 ? ((l < CF_NN_LAYERS - 1) ? p->hout_bf[l] : p->h3_bf) + off
                 : NULL;
             float* store =
-                r_state_t ? r_state_t + (size_t)l * hn + off : NULL;
+                r_state_t ? cu_rstate_at(r_state_t, (size_t)l * hn + off)
+                          : NULL;
             k_mingru_epi_fwd<<<(int)((hc + 255) / 256), 256, 0, st>>>(
                 p->pre, x, state + (size_t)l * hn + off, xn, store,
                 terminals + e0, cn, xnb,
-                g_gemm_bf16 ? p->pre_bf : NULL);
+                g_gemm_bf16 ? p->pre_bf : NULL, g_gemm_bf16);
             x = xn;
             xb = xnb;
         }
@@ -12633,7 +12654,9 @@ static void cu_train_init(
     size_t cols_cap = (size_t)tr->bwd_win * mb;  // window workspace columns
     CU_CHECK(cudaMalloc(&tr->r_obs, nt * CF_TRAIN_OBS));
     CU_CHECK(cudaMalloc(&tr->r_state,
-                        nt * CF_NN_LAYERS * CF_NN_HIDDEN * sizeof(float)));
+                        nt * CF_NN_LAYERS * CF_NN_HIDDEN
+                            * (g_gemm_bf16 ? sizeof(__nv_bfloat16)
+                                           : sizeof(float))));
     CU_CHECK(cudaMalloc(&tr->r_act, nt * sizeof(int32_t)));
     CU_CHECK(cudaMalloc(&tr->r_logprob, nt * sizeof(float)));
     CU_CHECK(cudaMalloc(&tr->r_value, nt * sizeof(float)));
@@ -12822,7 +12845,8 @@ static void cu_train_collect(CuTrain* tr) {
         size_t o = (size_t)t * n;
         cu_rollout_step(v, p, tr->seed,
                         tr->r_obs + o * CF_TRAIN_OBS,
-                        tr->r_state + (size_t)t * CF_NN_LAYERS * hn,
+                        cu_rstate_at(tr->r_state,
+                                     (size_t)t * CF_NN_LAYERS * hn),
                         tr->r_act + o, tr->r_logprob + o, tr->r_value + o,
                         tr->r_reward + o, tr->r_done + o);
     }
@@ -12920,7 +12944,7 @@ static void cu_train_backward_bf_pipe(
                             xb_[s][l], prebb_[s][l], stf);
             k_mingru_epi_replay_win<<<hgrid, 256, 0, stf>>>(
                 tr->preb[l], x_[s][l], tr->r_state, x_[s][l + 1], t0, Tw,
-                mb, n, env_start, l, xb_[s][l + 1], prebb_[s][l]);
+                mb, n, env_start, l, xb_[s][l + 1], prebb_[s][l], 1);
         }
         cu_gemm_fwd_bf(CRAFTAX_NUM_ACTIONS, cols, CF_NN_HIDDEN,
                        p->params_bf + CF_NN_W_A, xb_[s][3], tr->logitsb,
@@ -12953,7 +12977,7 @@ static void cu_train_backward_bf_pipe(
             k_mingru_window_bwd<<<egrid, 256, 0, st>>>(
                 tr->preb[l], x_[s][l], dh_gemm, dh_extra, tr->r_state,
                 tr->r_done, dhX_[s], tr->dcarry[l], t0, Tw, mb, n,
-                env_start, l, T, seg, prebb_[s][l]);
+                env_start, l, T, seg, prebb_[s][l], 1);
             CU_CHECK(cudaEventRecord(tr->ev_wb[l], st));
             CU_CHECK(cudaStreamWaitEvent(stw, tr->ev_wb[l], 0));
             cu_gemm_dw_bf2(CF_NN_GRU, cols, xb_[s][l], prebb_[s][l],
@@ -13277,14 +13301,15 @@ static double cu_train_loss(CuTrain* tr) {
                                 tr->x[l], tr->preb[l], st);
                 k_mingru_epi_replay<<<egrid, 256, 0, st>>>(
                     tr->preb[l], tr->x[l],
-                    segstart ? tr->r_state
-                            + ((size_t)t * CF_NN_LAYERS + l)
-                                * (size_t)CF_NN_HIDDEN * n
-                            + (size_t)e0 * CF_NN_HIDDEN
+                    segstart ? cu_rstate_at(
+                          tr->r_state,
+                          ((size_t)t * CF_NN_LAYERS + l)
+                              * (size_t)CF_NN_HIDDEN * n
+                          + (size_t)e0 * CF_NN_HIDDEN)
                         : NULL,
                     tr->live_st[l], prev, NULL,
                     tr->x[l + 1], cn, tr->xb[l + 1],
-                    g_gemm_bf16 ? tr->prebb[l] : NULL);
+                    g_gemm_bf16 ? tr->prebb[l] : NULL, g_gemm_bf16);
             }
             if (g_gemm_bf16)
                 cu_gemm_fwd_bf(CRAFTAX_NUM_ACTIONS, cn, CF_NN_HIDDEN,
