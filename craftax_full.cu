@@ -820,11 +820,20 @@ static __device__ inline void craftax_wg_init_cell_templates(void) {
 
 #define CF_SOA_FIELDS(X) CF_SOA_FIELDS_FLAT(X) CF_SOA_FIELDS_LEVEL(X)
 
-#define CF_SOA_DECL(f, t, k) __device__ t* g_cf_##f = NULL;
+// The SoA field pointers, the state base pointer and the env count are
+// written exactly once from the host (cudaMemcpyToSymbol at arena init) and
+// never from device code. Declaring them __constant__ instead of __device__
+// (a) serves every CF() pointer fetch from the constant bank instead of a
+// global-memory load (the single largest long-scoreboard stall site in
+// k_step_run), and (b) lets the compiler CSE cf_slot()'s pointer-difference
+// division, which was ~34% of the kernel's executed instructions. Pure
+// address-path change: the loaded values and all arithmetic on the field
+// data are untouched, so trajectories stay bit-exact.
+#define CF_SOA_DECL(f, t, k) __constant__ t* g_cf_##f = NULL;
 CF_SOA_FIELDS(CF_SOA_DECL)
 #undef CF_SOA_DECL
-__device__ char* g_cf_state_base = NULL;
-__device__ int g_cf_n = 0;
+__constant__ char* g_cf_state_base = NULL;
+__constant__ int g_cf_n = 0;
 
 // cf_slot is defined after CraftaxWorldState (needs its sizeof); any pointer
 // into an env's state block (including interior pointers) maps to that env.
