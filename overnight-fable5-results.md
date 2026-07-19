@@ -148,6 +148,38 @@ next big lever; (2) k_step_run (78-110us, 4% occupancy, divergent
 gameplay latency) is the small-N floor -- only warp-cooperative
 gameplay or more envs move it.
 
+## Follow-up 3 (2026-07-18 night): both candidates landed via parallel worktree agents
+
+Merged into main: `0537e5d` (backward: bf16 dh/dhX/x streams,
+evict-first hints, L2-sized auto window W=clamp(16384/mb,2,16) on the
+bf16 pipe when L2>=64MB) and `fb35353` (k_step_run envs-per-warp
+retile: template<EPW>, schedule n<=1536->2 .. else 32, CF_STEP_EPW
+override; plus a latent OOB fix -- worldgen scratch was tid-indexed,
+now env-keyed). Key profile insights: window_bwd was 86-88% DRAM SOL
+(byte reduction, not access efficiency, was the lever; the small
+window only paid AFTER the byte cuts); k_step_run is NOT
+divergence-bound (25/32 avg active lanes) but latency-bound (54%
+long-scoreboard at 3.95% occupancy) -- EPW=2 at 1024 gives 16x the
+resident warps, bit-identical trajectories at any EPW.
+
+Merged verification: env anchors EXACT (split + CRAFTAX_CU_MEGA=1 +
+compact), gradcheck PASS both CRAFTAX_GC_SPLIT=1/2 with replay EXACT,
+runverify PASS both GPUs, runhash 0x1dc7e4e16d65e32d UNCHANGED.
+sm_120 EPW sweep confirms the 3090-tuned schedule transfers (EPW2 best
+@1024: 5.58M vs 4.95M dense run SPS; 4/8/16 within 0.3% @8192).
+
+Final interleaved matrices (pre = post-fold aa69062, 2 reps):
+| envs | PRO 6000 pre | PRO 6000 merged | 3090 pre | 3090 merged |
+|------|--------------|-----------------|----------|-------------|
+| 1024 | 3.01 M | 3.25 M (+8%)  | 1.50 M | 1.62 M (+8%) |
+| 4096 | 6.47 M | 7.26 M (+12%) | 3.02 M | 3.14 M (+4%) |
+| 8192 | 8.12 M | 9.40 M (+16%) | 3.61 M | 3.79 M (+5%) |
+
+BEST at <=8192 envs: 9.40 M train SPS @8192 (PRO 6000) -- 1.49x vs
+the 29fe464 overnight baseline (6.29 M), 4.2x vs pre-overnight 2.24M
+3090 days. Convergence stats in family on both GPUs (bf16 dh chain is
+the one numerics change, same class as existing bf16 dpre storage).
+
 ## Recommended next step
 
 Rollout is now the bottleneck at every N (50.8% @8192, 79% @1024 on the 3090). The floor is env-side per-step latency: the worldgen reset warp (~200us serial latency whenever any env resets) and the divergent step kernel. Two candidate attacks, both need care with anchors:
