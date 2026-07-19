@@ -1455,9 +1455,17 @@ typedef struct CraftaxWorldgenScratch {
 
 __device__ CraftaxWorldgenScratch* g_craftax_wg_scratch = NULL;
 
-static __device__ inline CraftaxWorldgenScratch* craftax_wg_scratch_slot(void) {
-    size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    return &g_craftax_wg_scratch[tid];
+// Scratch slot keyed by the env that owns `p` (any pointer into the state
+// arena, e.g. the floor map being generated): one slot per env regardless
+// of which thread/kernel runs the generation. The previous tid-based slot
+// assumed every worldgen-capable grid has exactly num_envs threads at
+// tid==env; env-keyed slots keep the arena in bounds for any launch shape
+// and can never alias two envs onto one slot. Scratch is fully rewritten
+// before use, so slot choice is invisible in results.
+static __device__ inline CraftaxWorldgenScratch* craftax_wg_scratch_slot(
+    const void* p
+) {
+    return &g_craftax_wg_scratch[(size_t)cf_slot(p)];
 }
 
 static __device__ inline void craftax_smoothworld_classify_scalar(
@@ -1805,7 +1813,7 @@ static __device__ inline void craftax_generate_smoothworld_config(
     const size_t cells = CRAFTAX_WG_MAP_CELLS;
 
     CraftaxThreefryKey subkey;
-    CraftaxWorldgenScratch* scratch = craftax_wg_scratch_slot();
+    CraftaxWorldgenScratch* scratch = craftax_wg_scratch_slot(map);
     float* water = scratch->u.smooth.water;
     float* mountain = scratch->u.smooth.mountain;
     float* path_x = scratch->u.smooth.path_x;
@@ -1963,7 +1971,7 @@ static __device__ inline void craftax_generate_dungeon_config(
     const int max_room_size = 10;
     const int padded_size = CRAFTAX_WG_MAP_SIZE + 2 * max_room_size;
 
-    CraftaxWorldgenScratch* scratch = craftax_wg_scratch_slot();
+    CraftaxWorldgenScratch* scratch = craftax_wg_scratch_slot(map);
     uint8_t (*padded_map)[68] = scratch->u.dungeon.padded_map;
     uint8_t (*padded_item_map)[68] = scratch->u.dungeon.padded_item_map;
     bool room_occupancy_chunks[9];
@@ -10394,10 +10402,21 @@ __global__ void k_policy_ref_l3(
 
 // Step kernel for the rollout path: actions come from the policy (already
 // in env->actions), and no observation bytes are written at all.
+// Envs per warp for k_step_run. 32 = dense thread-per-env tiling (the
+// historical mapping). Lower values spread the same envs across more warps
+// (lanes 0..EPW-1 active): each warp then unions fewer distinct per-env
+// control paths and -- the measured lever -- the SM schedulers get enough
+// resident warps to hide the ~54% long-scoreboard (dependent-load) stalls
+// this kernel spends its life in at small n (3.95% occupancy at 1024 envs).
+// The same scalar code runs per env at any EPW, so the trajectory is
+// bit-identical for every value; only the thread mapping moves.
+template <int EPW>
 __global__ void CRAFTAX_STEP_LB k_step_run(Craftax* envs, int num_envs, CraftaxResetRec* resets,
                                            uint8_t* __restrict__ reset_flags) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_envs) return;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = t & 31;
+    int i = (t >> 5) * EPW + lane;
+    if (lane >= EPW || i >= num_envs) return;
     Craftax* env = &envs[i];
     CraftaxThreefryKey reset_key;
     bool done = c_step_gameplay_core(env, &reset_key);
@@ -10407,6 +10426,55 @@ __global__ void CRAFTAX_STEP_LB k_step_run(Craftax* envs, int num_envs, CraftaxR
         resets[slot].env = i;
         resets[slot].key0 = reset_key.word[0];
         resets[slot].key1 = reset_key.word[1];
+    }
+}
+
+// EPW schedule: keep total step warps around the count that fills the SMs
+// without spilling into extra register-file waves (the kernel runs at ~250
+// regs/thread, so ~8 warps/SM is the ceiling). 3090-measured rollout SPS
+// winners (graph=1, 3000 iters, CF_GEMM_BF16=0): 1024->EPW2 (+8.9% vs the
+// dense mapping), 2048->EPW4 (+5.3%), 4096->EPW8/16 (+1.2%), 8192->EPW16
+// (+0.7%); EPW1 regresses everywhere (2x the warp waves). Above the mid
+// band the dense mapping is already even with the best retile, so keep it.
+// CF_STEP_EPW=<1|2|4|8|16|32> forces a value (0/unset = this schedule);
+// larger-SM parts (sm_120: 188 SMs) may prefer one notch lower per n.
+static int cf_step_epw_for(int n) {
+    static int forced = -1;
+    if (forced < 0) {
+        const char* e = getenv("CF_STEP_EPW");
+        forced = e ? atoi(e) : 0;
+    }
+    if (forced > 0) return forced;
+    if (n <= 1536) return 2;
+    if (n <= 3072) return 4;
+    if (n <= 6144) return 8;
+    if (n <= 12288) return 16;
+    return 32;
+}
+
+// Launch tiling for k_step_run: ceil(n/EPW) warps carry the envs. At EPW=32
+// this reproduces the historical dense grids exactly
+// (ceil(ceil(n/32)*32/64) == ceil(n/64)); the 32-wide mid-band retile is
+// the measured-and-kept configuration from the register-pressure pass.
+static void cu_launch_step_run(Craftax* envs, int n, CraftaxResetRec* resets,
+                               uint8_t* rf, cudaStream_t st) {
+    int epw = cf_step_epw_for(n);
+    long threads = (long)((n + epw - 1) / epw) * 32;
+    dim3 grid, block;
+    if (n >= 4096 && n <= 12288) {
+        grid = dim3((unsigned)((threads + 31) / 32));
+        block = dim3(32);
+    } else {
+        grid = dim3((unsigned)((threads + 63) / 64));
+        block = dim3(64);
+    }
+    switch (epw) {
+        case 1:  k_step_run<1><<<grid, block, 0, st>>>(envs, n, resets, rf); break;
+        case 2:  k_step_run<2><<<grid, block, 0, st>>>(envs, n, resets, rf); break;
+        case 4:  k_step_run<4><<<grid, block, 0, st>>>(envs, n, resets, rf); break;
+        case 8:  k_step_run<8><<<grid, block, 0, st>>>(envs, n, resets, rf); break;
+        case 16: k_step_run<16><<<grid, block, 0, st>>>(envs, n, resets, rf); break;
+        default: k_step_run<32><<<grid, block, 0, st>>>(envs, n, resets, rf); break;
     }
 }
 
@@ -12505,13 +12573,7 @@ static void cu_rollout_step(
     // noise dominates), and above ~12k the wider block wins on the
     // 3090-measured L1-share curve -- so only retile the mid band.
     uint8_t* rf = p->overlap ? v->d_reset_flags : NULL;
-    if (n >= 4096 && n <= 12288) {
-        k_step_run<<<(n + 31) / 32, 32, 0, st>>>(v->d_envs, n, v->d_resets,
-                                                 rf);
-    } else {
-        k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v->d_envs, n, v->d_resets,
-                                                 rf);
-    }
+    cu_launch_step_run(v->d_envs, n, v->d_resets, rf, st);
     if (r_reward_row)
         k_record_rd<<<grid, 256, 0, st>>>(v->d_rewards, v->d_terminals,
                                           r_reward_row, r_done_row, n);
@@ -12815,13 +12877,7 @@ static int cu_run_rollout_verify(int num_envs, int num_steps,
                 p.w, ref_state, v.d_terminals, v.d_obs, act2, lp2, val2,
                 ref_h3, n, seed, p.step_ctr);
             // Advance the env with the batched path's actions.
-            if (n >= 4096 && n <= 12288) {
-                k_step_run<<<(n + 31) / 32, 32, 0, st>>>(v.d_envs, n,
-                                                         v.d_resets, NULL);
-            } else {
-                k_step_run<<<(n + 63) / 64, 64, 0, st>>>(v.d_envs, n,
-                                                         v.d_resets, NULL);
-            }
+            cu_launch_step_run(v.d_envs, n, v.d_resets, NULL, st);
             {
                 int tail_blocks = (n * 32 + 255) / 256;
                 if (tail_blocks > 512) tail_blocks = 512;
