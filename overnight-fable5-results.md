@@ -185,3 +185,14 @@ the one numerics change, same class as existing bf16 dpre storage).
 Rollout is now the bottleneck at every N (50.8% @8192, 79% @1024 on the 3090). The floor is env-side per-step latency: the worldgen reset warp (~200us serial latency whenever any env resets) and the divergent step kernel. Two candidate attacks, both need care with anchors:
 1. Overlap the reset-list worldgen for envs that died at step t with the policy forward of step t+1 for the surviving envs (the dead envs' obs are not needed until t+1's record). Keeps bit-exactness if the graph ordering is preserved per env.
 2. Split the reset warp's 9-floor worldgen across multiple warps per env (block-per-env with intra-block barriers) -- bit-exact if the per-floor RNG streams are already independent; verify against the 64x2000 / 4x20000 anchors.
+
+## Follow-up 4 (2026-07-18 late): head-GEMM pad — measured negative, reverted
+
+Hypothesis from the rollout profile: the fused head GEMM's align1 kernel
+(26.9us @8192, ~7 TFLOPS) was an alignment casualty of the 44-row ld.
+Padding to 48 rows changed nothing — cuBLAS selects the same
+cutlass_75 align1 kernel because bf16-in/fp32-OUT GemmEx is restricted
+to that family; alignment is irrelevant. Fix would require bf16 C
+(quantizes the value feeding GAE) or splitting the head again. Reverted;
+interleaved matrix confirmed wash. Bonus datum: runhash survived m=44->48
+unchanged on the fp32 path. k_step_run hot-field study running separately.
