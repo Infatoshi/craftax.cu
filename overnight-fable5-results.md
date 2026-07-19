@@ -196,3 +196,33 @@ to that family; alignment is irrelevant. Fix would require bf16 C
 (quantizes the value feeding GAE) or splitting the head again. Reverted;
 interleaved matrix confirmed wash. Bonus datum: runhash survived m=44->48
 unchanged on the fp32 path. k_step_run hot-field study running separately.
+
+## Follow-up 5 (2026-07-18 night): SoA pointers to the constant bank -- largest single win of the day
+
+ncu source-level stall attribution on k_step_run found a universal tax:
+the g_cf_* SoA field pointers, g_cf_state_base and g_cf_n were
+__device__, so every CF()/CF2() access re-loaded them from global
+memory (no CSE possible -- stores could alias them) and re-ran
+cf_slot's 64-bit pointer-difference division: 39% of all executed
+instructions, the #1 long-scoreboard site. They are host-written once
+and never device-mutated, so __constant__ is free (commit b10b4ab,
+merged 12-line change): kernel 108->76us @1024 on the 3090, executed
+instructions 7.04M -> 3.19M.
+
+Interleaved matrices (pre = post-follow-up-3 merge):
+| envs | PRO 6000 pre | PRO 6000 const | 3090 pre | 3090 const |
+|------|--------------|----------------|----------|------------|
+| 1024 | 3.30 M | 3.86 M (+17%) | 1.62 M | 1.83 M (+13%) |
+| 4096 | 7.35 M | 8.06 M (+10%) | 3.80 M* | 3.95 M (+4%) |
+| 8192 | 9.55 M | 10.10 M (+5.8%) | 3.80 M | 3.95 M (+4%) |
+(3090 rows from the agent's session; 4096 not separately run there.)
+
+BEST at <=8192 envs: 10.10 M train SPS @8192 (PRO 6000) -- 1.61x vs
+the 29fe464 overnight baseline. Bit-exact everywhere: env anchors
+(split/mega/compact), gradcheck EXACT replay, runverify, runhash
+0x1dc7e4e16d65e32d all unchanged.
+
+Remaining scoped-but-unbuilt from the study: single-pass achievements
+(3 passes/step + 67-float AoS copy, ~18% of remaining step L2 sectors;
+monotonic-write trick keeps it exact) and achievements as 2xu64
+bitsets (~30 call sites, medium invasive).
