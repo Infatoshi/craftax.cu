@@ -29,7 +29,7 @@ Env steps per second:
 | C, 32k envs | Ryzen 9 9950X3D | 47.8M | - |
 
 Full game (random actions for env-only, auto-reset included; env+policy
-is the `run` rollout path with the h256x3 policy in the loop -- it is
+is the `run` rollout path with the h256x2 policy (default since the capacity sweep; perf numbers below were measured at h256x3) in the loop -- it is
 policy-GEMM-bound and flat at ~30M SPS from 65k envs on the PRO 6000;
 the retired hidden-32 gathered-scalar policy reached ~103M at 524k,
 see git history):
@@ -122,7 +122,10 @@ the whole rollout (actions, logprobs, values, rewards, terminals)
 across graph/eager, both obs builds, and repeated runs. The hash is
 GPU-arch-specific because cuBLAS picks different GEMM kernels per
 arch; canonical 1024x500 seal (RTX PRO 6000, fp32 autogate):
-0x1dc7e4e16d65e32d. Resealed when the value head was folded into the
+0xae60328bd232c81d. Resealed when the default policy shrank from
+h256x3 to h256x2 (a 1B/5B-step capacity sweep showed both 3-layer
+nets losing to 2-layer on return and the iron ladder; prior h256x3
+seal 0x1dc7e4e16d65e32d), before that when the value head was folded into the
 actor GEMM as row 43 (value summation order changed; prior seals
 0x667d0e43f5b14ead fp32 / 0xf1bb646444f92b3f 3090 bf16), and before
 that when the bf16 tensor-core GEMM path became the rollout default;
@@ -284,7 +287,7 @@ longer runs, which is open work.
 
 `./craftax_full_cuda train` runs the same on-device PPO stack as
 classic on the full game (43 actions, 67 achievements, 9 floors), on
-the same h256x3 policy: rollout with training storage, bootstrap
+the same h256x2 policy (h256x3 at the time these numbers were taken): rollout with training storage, bootstrap
 value, GAE, full-batch advantage normalization, a batched cuBLAS-GEMM
 backward, and Adam, all resident on device. One PPO iteration
 (collect + epochs x minibatches of backward + Adam) is captured once
@@ -340,7 +343,7 @@ and accumulates `dW` online. Workspace is O(mb) (~28 KB/env), so the
 auto-minibatcher usually keeps `minibatches=1`. Gradcheck matches FD
 on all seven parameter segments.
 
-Training SPS on the RTX PRO 6000 (h256x3, horizon 128, auto mb):
+Training SPS on the RTX PRO 6000 (measured at h256x3, horizon 128, auto mb; default is now h256x2):
 
 | envs | train SPS | standalone `run` SPS |
 |---:|---:|---:|

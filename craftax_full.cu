@@ -9640,7 +9640,7 @@ __global__ void k_mega(
 #include <cublas_v2.h>
 
 #define CF_NN_HIDDEN 256
-#define CF_NN_LAYERS 3
+#define CF_NN_LAYERS 2
 #define CF_NN_GRU (3 * CF_NN_HIDDEN)  // [zh|zg|zp] rows per layer
 #define CF_NN_OBS ((int)CRAFTAX_WG_PACKED_OBS_SIZE)  // 843
 #define CF_NN_OBS_PAD 848  // bf16 xobs ld: 16B-aligned columns for GemmEx
