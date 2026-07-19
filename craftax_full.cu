@@ -9869,6 +9869,14 @@ static __device__ __forceinline__ float cf_ldcs(const float* p) {
 static __device__ __forceinline__ void cf_stcs(float* p, float v) {
     asm volatile("st.global.cs.f32 [%0], %1;" ::"l"(p), "f"(v));
 }
+// bf16 evict-first load (u16 bits).
+static __device__ __forceinline__ float cf_ldcs_bf(const __nv_bfloat16* p) {
+    unsigned short bits;
+    asm volatile("ld.global.cs.u16 %0, [%1];" : "=h"(bits) : "l"(p));
+    __nv_bfloat16_raw r;
+    r.x = bits;
+    return __bfloat162float((__nv_bfloat16)r);
+}
 
 // ============================================================
 // MinGRU layer epilogue (elementwise, one thread per (unit, col)).
@@ -10013,7 +10021,7 @@ __global__ void k_mingru_epi_replay_win(
         ((size_t)t * CF_NN_LAYERS + layer) * (size_t)CF_NN_HIDDEN * n
         + (size_t)(env_start + el) * CF_NN_HIDDEN + k;
     float st = r_state_bf16
-        ? __bfloat162float(((const __nv_bfloat16*)r_state)[rst_off])
+        ? cf_ldcs_bf(&((const __nv_bfloat16*)r_state)[rst_off])
         : r_state[rst_off];
 
     float zh, zg, zp;
@@ -10050,7 +10058,10 @@ __global__ void k_mingru_window_bwd(
     int t0, int Tw, int mb, int n, int env_start, int layer,
     int T_all, int seg_len,
     __nv_bfloat16* __restrict__ preb_bf = nullptr,  // bf16 pre in / dpre out
-    int r_state_bf16 = 0
+    int r_state_bf16 = 0,
+    const __nv_bfloat16* __restrict__ x_bf = nullptr,  // bf16 x (gradient use)
+    int dhx_bf16 = 0,  // dhExtra/dhExtraOut carried in bf16
+    int dh_bf16 = 0  // dhGEMM carried in bf16
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= CF_NN_HIDDEN * mb) return;
@@ -10068,24 +10079,29 @@ __global__ void k_mingru_window_bwd(
 
         float zh, zg, zp;
         if (preb_bf) {
-            zh = __bfloat162float(preb_bf[o3]);
-            zg = __bfloat162float(preb_bf[o3 + CF_NN_HIDDEN]);
-            zp = __bfloat162float(preb_bf[o3 + 2 * CF_NN_HIDDEN]);
+            zh = cf_ldcs_bf(&preb_bf[o3]);
+            zg = cf_ldcs_bf(&preb_bf[o3 + CF_NN_HIDDEN]);
+            zp = cf_ldcs_bf(&preb_bf[o3 + 2 * CF_NN_HIDDEN]);
         } else {
             zh = pre[o3];
             zg = pre[o3 + CF_NN_HIDDEN];
             zp = pre[o3 + 2 * CF_NN_HIDDEN];
         }
-        float dhout = dhGEMM[o];
-        if (dhExtra) dhout += dhExtra[o];
+        float dhout = dh_bf16
+            ? __bfloat162float(((const __nv_bfloat16*)dhGEMM)[o])
+            : dhGEMM[o];
+        if (dhExtra)
+            dhout += dhx_bf16
+                ? __bfloat162float(((const __nv_bfloat16*)dhExtra)[o])
+                : dhExtra[o];
 
         size_t rst_off =
             ((size_t)t * CF_NN_LAYERS + layer) * (size_t)CF_NN_HIDDEN * n
             + (size_t)(env_start + el) * CF_NN_HIDDEN + k;
         float s_in = r_state_bf16
-            ? __bfloat162float(((const __nv_bfloat16*)r_state)[rst_off])
+            ? cf_ldcs_bf(&((const __nv_bfloat16*)r_state)[rst_off])
             : r_state[rst_off];
-        float xv = x[o];
+        float xv = x_bf ? cf_ldcs_bf(&x_bf[o]) : x[o];
         bool done_t = r_done[(size_t)t * n + env_start + el] != 0;
 
         float sg = cf_nn_sigmoid(zg);
@@ -10095,7 +10111,13 @@ __global__ void k_mingru_window_bwd(
         float dout = dhout * p + (done_t ? 0.0f : dc);
         float dp_ = dhout * (out_k - xv);
         float dzp = dp_ * p * (1.0f - p);
-        if (dhExtraOut) dhExtraOut[o] = dhout * (1.0f - p);
+        if (dhExtraOut) {
+            float dhx = dhout * (1.0f - p);
+            if (dhx_bf16)
+                ((__nv_bfloat16*)dhExtraOut)[o] = __float2bfloat16(dhx);
+            else
+                dhExtraOut[o] = dhx;
+        }
         dc = dout * (1.0f - sg);
         float dsg = dout * (gh - s_in);
         float dzg = dsg * sg * (1.0f - sg);
@@ -10534,6 +10556,18 @@ __global__ void k_vadd(
     if (a_bf) a_bf[idx] = __float2bfloat16(av);
 }
 
+// out = a + b, all bf16 (dh_enc = dhGEMM + highway in the pipelined
+// bf16 backward; no fp32 stream).
+__global__ void k_vadd_bf3(
+    const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
+    size_t count, __nv_bfloat16* __restrict__ out
+) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    out[idx] = __float2bfloat16(__bfloat162float(a[idx])
+                                + __bfloat162float(b[idx]));
+}
+
 // fp32 -> bf16 mirror (weight mirror refresh after adam / init).
 __global__ void k_to_bf16(
     const float* __restrict__ src, __nv_bfloat16* __restrict__ dst,
@@ -10670,13 +10704,20 @@ __global__ void k_add_dv_wv(
     float* __restrict__ dh,            // [HIDDEN][T*mb]
     const float* __restrict__ dv,      // [T*mb]
     const float* __restrict__ W_v,
-    int cols
+    int cols,
+    int dh_bf16 = 0  // dh carried in bf16 (pipelined bf16 backward)
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= CF_NN_HIDDEN * cols) return;
     int k = idx & (CF_NN_HIDDEN - 1);
     int col = idx / CF_NN_HIDDEN;
-    dh[idx] += dv[col] * W_v[k];
+    if (dh_bf16) {
+        __nv_bfloat16* dhb = (__nv_bfloat16*)dh;
+        dhb[idx] = __float2bfloat16(
+            __bfloat162float(dhb[idx]) + dv[col] * W_v[k]);
+    } else {
+        dh[idx] += dv[col] * W_v[k];
+    }
 }
 
 // Backward sweep for one MinGRU layer over one minibatch. Thread per
@@ -10901,13 +10942,21 @@ __global__ void k_colsum(
 // row t; every warp load is contiguous. k_colsum read the same matrix
 // at a 1KB stride (~280 GB/s); this runs at DRAM peak.
 __global__ void k_colsum256(
-    const float* __restrict__ M, float* __restrict__ out, int cols
+    const float* __restrict__ M, float* __restrict__ out, int cols,
+    int m_bf16 = 0  // M carried in bf16 (pipelined bf16 backward)
 ) {
     size_t total = (size_t)cols * 256;
     float acc = 0.0f;
-    for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < total;
-         i += (size_t)gridDim.x * 256)
-        acc += M[i];
+    if (m_bf16) {
+        const __nv_bfloat16* Mb = (const __nv_bfloat16*)M;
+        for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < total;
+             i += (size_t)gridDim.x * 256)
+            acc += __bfloat162float(Mb[i]);
+    } else {
+        for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < total;
+             i += (size_t)gridDim.x * 256)
+            acc += M[i];
+    }
     atomicAdd(&out[threadIdx.x], acc);
 }
 
@@ -12118,6 +12167,23 @@ static void cu_gemm_nn_bf(int k, int cols, const __nv_bfloat16* A,
                    A, CF_NN_HIDDEN, B, ldb, &g_zero, y, CF_NN_HIDDEN, s, h);
 }
 
+// Same as cu_gemm_nn_bf, but C stored bf16 (dh chain in the pipelined
+// backward: the consumers re-expand to fp32; halves the dh round trip).
+static void cu_gemm_nn_bfc(int k, int cols, const __nv_bfloat16* A,
+                           const __nv_bfloat16* B, int ldb,
+                           __nv_bfloat16* y, cudaStream_t s,
+                           cublasHandle_t h = NULL) {
+    cu_ensure_blas();
+    if (!h) h = g_blas;
+    CUBLAS_CHECK(cublasSetStream(h, s));
+    CUBLAS_CHECK(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                              CF_NN_HIDDEN, cols, k, &g_one,
+                              A, CUDA_R_16BF, CF_NN_HIDDEN,
+                              B, CUDA_R_16BF, ldb,
+                              &g_zero, y, CUDA_R_16BF, CF_NN_HIDDEN,
+                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+
 // dW[HIDDEN][rows] += x dpre^T  (beta=1 window accumulate).
 // ldb may exceed rows (padded xobs).
 static void cu_gemm_dw_bf(int rows, int cols, const __nv_bfloat16* x,
@@ -12851,11 +12917,26 @@ static CuPPOConfig cu_ppo_defaults(void) {
 #define CF_MB_BYTES_PER_ENV 28672
 #define CF_BWD_WIN_DEFAULT 16
 
-static int cu_bwd_win(void) {
-    static int w = -1;
-    if (w < 0) {
-        const char* e = getenv("CF_BWD_WIN");
-        w = (e && atoi(e) > 0) ? atoi(e) : CF_BWD_WIN_DEFAULT;
+// Explicit CF_BWD_WIN always wins. Otherwise, on the bf16 pipe with a
+// large L2 (measured on sm_120 / 128 MB), shrink W so a window's bf16
+// pre slab (GRU*W*mb*2B per parity) stays L2-resident across the
+// recompute-write -> reverse-read round trip: target ~16K window
+// columns (W*mb), the measured sweet spot at 4096 (W=4) and 8192
+// (W=2-3) envs. fp32 path and small-L2 parts keep the default 16.
+static int cu_bwd_win(int mb) {
+    const char* e = getenv("CF_BWD_WIN");
+    if (e && atoi(e) > 0) return atoi(e);
+    int w = CF_BWD_WIN_DEFAULT;
+    if (g_gemm_bf16 && mb > 0) {
+        int dev, l2 = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev)
+                == cudaSuccess &&
+            l2 >= (64 << 20)) {
+            w = 16384 / mb;
+            if (w < 2) w = 2;
+            if (w > CF_BWD_WIN_DEFAULT) w = CF_BWD_WIN_DEFAULT;
+        }
     }
     return w;
 }
@@ -12965,7 +13046,7 @@ static void cu_train_init(
                 T, cfg.bptt_split);
         exit(1);
     }
-    tr->bwd_win = cu_bwd_win();
+    tr->bwd_win = cu_bwd_win(tr->mb);
     if (tr->bwd_win > T) tr->bwd_win = T;
     size_t nt = (size_t)tr->n * T;
     size_t mb = (size_t)tr->mb;
@@ -13267,16 +13348,19 @@ static void cu_train_backward_bf_pipe(
         cu_gemm_fwd_bf(CRAFTAX_NUM_ACTIONS, cols, CF_NN_HIDDEN,
                        p->params_bf + CF_NN_W_A, xb_[s][3], tr->logitsb,
                        stf);
-        k_head_bwd_win<<<(cols + 255) / 256, 256, 0, stf>>>(
+        // 64-thread blocks: small W windows have few columns; keep
+        // enough blocks to fill the SMs (per-thread work is heavy).
+        k_head_bwd_win<<<(cols + 63) / 64, 64, 0, stf>>>(
             tr->logitsb, x_[s][3], p->w.b_a, p->w.W_v, p->w.b_v,
             tr->r_act + env_start, tr->r_logprob + env_start,
             tr->adv + env_start, tr->ret + env_start, tr->stats,
             tr->dlogits, tr->dvalue, tr->loss_acc, t0, Tw, mb, n, n, T,
             tr->cfg.clip, tr->cfg.vf, tr->d_ent, tr->dlogitsb, xb_[s][3]);
-        cu_gemm_nn_bf(CRAFTAX_NUM_ACTIONS, cols, p->params_bf + CF_NN_W_A,
-                      tr->dlogitsb, CRAFTAX_NUM_ACTIONS, dh3b_[s], stf);
+        cu_gemm_nn_bfc(CRAFTAX_NUM_ACTIONS, cols, p->params_bf + CF_NN_W_A,
+                       tr->dlogitsb, CRAFTAX_NUM_ACTIONS,
+                       (__nv_bfloat16*)dh3b_[s], stf);
         k_add_dv_wv<<<hgrid, 256, 0, stf>>>(dh3b_[s], tr->dvalue, p->w.W_v,
-                                            cols);
+                                            cols, 1);
         cu_gemm_dw_bf(CRAFTAX_NUM_ACTIONS, cols, xb_[s][3], tr->dlogitsb,
                       CRAFTAX_NUM_ACTIONS, tr->grads + CF_NN_W_A, stf);
         cu_gemv_dwv(x_[s][3], tr->dvalue, tr->grads + CF_NN_W_V, cols, stf);
@@ -13295,23 +13379,23 @@ static void cu_train_backward_bf_pipe(
             k_mingru_window_bwd<<<egrid, 256, 0, st>>>(
                 tr->preb[l], x_[s][l], dh_gemm, dh_extra, tr->r_state,
                 tr->r_done, dhX_[s], tr->dcarry[l], t0, Tw, mb, n,
-                env_start, l, T, seg, prebb_[s][l], 1);
+                env_start, l, T, seg, prebb_[s][l], 1, xb_[s][l], 1, 1);
             CU_CHECK(cudaEventRecord(tr->ev_wb[l], st));
             CU_CHECK(cudaStreamWaitEvent(stw, tr->ev_wb[l], 0));
             cu_gemm_dw_bf2(CF_NN_GRU, cols, xb_[s][l], prebb_[s][l],
                            CF_NN_GRU, tr->grads + CF_NN_W_GRU
                                + (size_t)l * CF_NN_GRU * CF_NN_HIDDEN,
                            stw);
-            cu_gemm_nn_bf(CF_NN_GRU, cols, Wbf[l], prebb_[s][l], CF_NN_GRU,
-                          dhG_[s], st, g_blas2);
+            cu_gemm_nn_bfc(CF_NN_GRU, cols, Wbf[l], prebb_[s][l], CF_NN_GRU,
+                           (__nv_bfloat16*)dhG_[s], st, g_blas2);
             dh_gemm = dhG_[s];
             dh_extra = dhX_[s];
         }
-        k_vadd<<<hgrid, 256, 0, st>>>(dhG_[s], dhX_[s],
-                                      (size_t)CF_NN_HIDDEN * cols,
-                                      dhGb_[s]);
+        k_vadd_bf3<<<hgrid, 256, 0, st>>>(
+            (const __nv_bfloat16*)dhG_[s], (const __nv_bfloat16*)dhX_[s],
+            (size_t)CF_NN_HIDDEN * cols, dhGb_[s]);
         k_colsum256<<<256, 256, 0, st>>>(
-            dhG_[s], tr->grads + CF_NN_B_ENC, cols);
+            (const float*)dhGb_[s], tr->grads + CF_NN_B_ENC, cols, 1);
         CU_CHECK(cudaEventRecord(tr->ev_enc_in, st));
         CU_CHECK(cudaStreamWaitEvent(stw, tr->ev_enc_in, 0));
         cu_gemm_dw_bf2(CF_NN_OBS, cols, dhGb_[s], xobsb_[s],
@@ -13702,12 +13786,14 @@ static int cu_run_train(
     {
         cu_ensure_blas();
         cu_bf16_autogate(num_envs);
-        size_t bpe = (size_t)(CF_MB_BYTES_PER_ENV + (g_gemm_bf16 ? 25600 : 0))
-                     * (size_t)cu_bwd_win();
-        size_t max_mb = ((size_t)8 << 30) / bpe;
-        while (cfg.minibatches < num_envs / 32 &&
-               (size_t)(num_envs / cfg.minibatches) > max_mb)
+        size_t bpe = (size_t)(CF_MB_BYTES_PER_ENV
+                              + (g_gemm_bf16 ? 25600 : 0));
+        while (cfg.minibatches < num_envs / 32) {
+            size_t mbn = (size_t)num_envs / cfg.minibatches;
+            if (bpe * (size_t)cu_bwd_win((int)mbn) * mbn <= ((size_t)8 << 30))
+                break;
             cfg.minibatches *= 2;
+        }
     }
     CuVec v;
     cu_vec_init(&v, num_envs, seed);
