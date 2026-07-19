@@ -13411,24 +13411,24 @@ static void cu_train_backward_bf_pipe(
                 mb, n, env_start, l, xb_[s][l + 1], prebb_[s][l], 1);
         }
         cu_gemm_fwd_bf(CRAFTAX_NUM_ACTIONS, cols, CF_NN_HIDDEN,
-                       p->params_bf + CF_NN_W_A, xb_[s][3], tr->logitsb,
+                       p->params_bf + CF_NN_W_A, xb_[s][CF_NN_LAYERS], tr->logitsb,
                        stf);
         // 64-thread blocks: small W windows have few columns; keep
         // enough blocks to fill the SMs (per-thread work is heavy).
         k_head_bwd_win<<<(cols + 63) / 64, 64, 0, stf>>>(
-            tr->logitsb, x_[s][3], p->w.b_a, p->w.W_v, p->w.b_v,
+            tr->logitsb, x_[s][CF_NN_LAYERS], p->w.b_a, p->w.W_v, p->w.b_v,
             tr->r_act + env_start, tr->r_logprob + env_start,
             tr->adv + env_start, tr->ret + env_start, tr->stats,
             tr->dlogits, tr->dvalue, tr->loss_acc, t0, Tw, mb, n, n, T,
-            tr->cfg.clip, tr->cfg.vf, tr->d_ent, tr->dlogitsb, xb_[s][3]);
+            tr->cfg.clip, tr->cfg.vf, tr->d_ent, tr->dlogitsb, xb_[s][CF_NN_LAYERS]);
         cu_gemm_nn_bfc(CRAFTAX_NUM_ACTIONS, cols, p->params_bf + CF_NN_W_A,
                        tr->dlogitsb, CRAFTAX_NUM_ACTIONS,
                        (__nv_bfloat16*)dh3b_[s], stf);
         k_add_dv_wv<<<hgrid, 256, 0, stf>>>(dh3b_[s], tr->dvalue, p->w.W_v,
                                             cols, 1);
-        cu_gemm_dw_bf(CRAFTAX_NUM_ACTIONS, cols, xb_[s][3], tr->dlogitsb,
+        cu_gemm_dw_bf(CRAFTAX_NUM_ACTIONS, cols, xb_[s][CF_NN_LAYERS], tr->dlogitsb,
                       CRAFTAX_NUM_ACTIONS, tr->grads + CF_NN_W_A, stf);
-        cu_gemv_dwv(x_[s][3], tr->dvalue, tr->grads + CF_NN_W_V, cols, stf);
+        cu_gemv_dwv(x_[s][CF_NN_LAYERS], tr->dvalue, tr->grads + CF_NN_W_V, cols, stf);
         k_colsum_small<<<256, 256, CRAFTAX_NUM_ACTIONS * sizeof(float),
                          stf>>>(
             tr->dlogits, tr->grads + CF_NN_B_A, CRAFTAX_NUM_ACTIONS, cols);
@@ -13559,20 +13559,20 @@ static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
         }
         if (bf)
             cu_gemm_fwd_bf(CRAFTAX_NUM_ACTIONS, cols, CF_NN_HIDDEN,
-                           p->params_bf + CF_NN_W_A, tr->xb[3], tr->logitsb,
+                           p->params_bf + CF_NN_W_A, tr->xb[CF_NN_LAYERS], tr->logitsb,
                            st);
         else
             cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, cols, CF_NN_HIDDEN, p->w.W_a,
-                        tr->x[3], tr->logitsb, st);
+                        tr->x[CF_NN_LAYERS], tr->logitsb, st);
 
         // ---- head grads over the whole window (one launch) ----
         k_head_bwd_win<<<(cols + 255) / 256, 256, 0, st>>>(
-            tr->logitsb, tr->x[3], p->w.b_a, p->w.W_v, p->w.b_v,
+            tr->logitsb, tr->x[CF_NN_LAYERS], p->w.b_a, p->w.W_v, p->w.b_v,
             tr->r_act + env_start, tr->r_logprob + env_start,
             tr->adv + env_start, tr->ret + env_start, tr->stats,
             tr->dlogits, tr->dvalue, tr->loss_acc, t0, Tw, mb, n, n, T,
             tr->cfg.clip, tr->cfg.vf, tr->d_ent, tr->dlogitsb,
-            bf ? tr->xb[3] : NULL);
+            bf ? tr->xb[CF_NN_LAYERS] : NULL);
 
         // ---- actor dh / dW over the whole window ----
         if (bf) {
@@ -13586,13 +13586,13 @@ static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
         k_add_dv_wv<<<hgrid, 256, 0, st>>>(tr->dh3b, tr->dvalue, p->w.W_v,
                                            cols);
         if (bf)
-            cu_gemm_dw_bf(CRAFTAX_NUM_ACTIONS, cols, tr->xb[3],
+            cu_gemm_dw_bf(CRAFTAX_NUM_ACTIONS, cols, tr->xb[CF_NN_LAYERS],
                           tr->dlogitsb, CRAFTAX_NUM_ACTIONS,
                           tr->grads + CF_NN_W_A, st);
         else
-            cu_gemm_dw(CRAFTAX_NUM_ACTIONS, cols, tr->x[3], tr->dlogits,
+            cu_gemm_dw(CRAFTAX_NUM_ACTIONS, cols, tr->x[CF_NN_LAYERS], tr->dlogits,
                        tr->grads + CF_NN_W_A, st);
-        cu_gemv_dwv(tr->x[3], tr->dvalue, tr->grads + CF_NN_W_V, cols, st);
+        cu_gemv_dwv(tr->x[CF_NN_LAYERS], tr->dvalue, tr->grads + CF_NN_W_V, cols, st);
         k_colsum_small<<<256, 256, CRAFTAX_NUM_ACTIONS * sizeof(float),
                          st>>>(
             tr->dlogits, tr->grads + CF_NN_B_A, CRAFTAX_NUM_ACTIONS, cols);
@@ -13781,13 +13781,13 @@ static double cu_train_loss(CuTrain* tr) {
             }
             if (g_gemm_bf16)
                 cu_gemm_fwd_bf(CRAFTAX_NUM_ACTIONS, cn, CF_NN_HIDDEN,
-                               p->params_bf + CF_NN_W_A, tr->xb[3],
+                               p->params_bf + CF_NN_W_A, tr->xb[CF_NN_LAYERS],
                                tr->logitsb, st);
             else
                 cu_gemm_fwd(CRAFTAX_NUM_ACTIONS, cn, CF_NN_HIDDEN, p->w.W_a,
-                            tr->x[3], tr->logitsb, st);
+                            tr->x[CF_NN_LAYERS], tr->logitsb, st);
             k_loss_accum<<<(cn + 255) / 256, 256, 0, st>>>(
-                tr->logitsb, tr->x[3], p->w.b_a, p->w.W_v, p->w.b_v,
+                tr->logitsb, tr->x[CF_NN_LAYERS], p->w.b_a, p->w.W_v, p->w.b_v,
                 tr->r_act + e0, tr->r_logprob + e0, tr->adv + e0,
                 tr->ret + e0, tr->stats, tr->loss_acc, t, cn, n, T,
                 tr->cfg.clip);
@@ -14053,7 +14053,7 @@ static int cu_run_gradcheck(uint64_t seed) {
                     tr.live_st[l], prev, NULL, tr.x[l + 1], n);
             }
             cu_gemm_fwd(CF_NN_AV, n, CF_NN_HIDDEN, p.W_av,
-                        tr.x[3], tr.logitsb, p.stream);
+                        tr.x[CF_NN_LAYERS], tr.logitsb, p.stream);
             k_replay_cmp<<<(n + 255) / 256, 256, 0, p.stream>>>(
                 tr.logitsb, p.w.b_a, p.w.b_v,
                 tr.r_act + (size_t)t * n, tr.r_logprob + (size_t)t * n,
