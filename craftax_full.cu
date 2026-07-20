@@ -11022,16 +11022,18 @@ __global__ void k_colsum256(
     const float* __restrict__ M, float* __restrict__ out, int cols,
     int m_bf16 = 0  // M carried in bf16 (pipelined bf16 backward)
 ) {
-    size_t total = (size_t)cols * 256;
+    // One thread per hidden row (launched with CF_NN_HIDDEN threads);
+    // strided accumulation keeps each thread on its own row residue.
+    size_t total = (size_t)cols * CF_NN_HIDDEN;
     float acc = 0.0f;
     if (m_bf16) {
         const __nv_bfloat16* Mb = (const __nv_bfloat16*)M;
-        for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < total;
-             i += (size_t)gridDim.x * 256)
+        for (size_t i = (size_t)blockIdx.x * CF_NN_HIDDEN + threadIdx.x;
+             i < total; i += (size_t)gridDim.x * CF_NN_HIDDEN)
             acc += __bfloat162float(Mb[i]);
     } else {
-        for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; i < total;
-             i += (size_t)gridDim.x * 256)
+        for (size_t i = (size_t)blockIdx.x * CF_NN_HIDDEN + threadIdx.x;
+             i < total; i += (size_t)gridDim.x * CF_NN_HIDDEN)
             acc += M[i];
     }
     atomicAdd(&out[threadIdx.x], acc);
@@ -13459,7 +13461,7 @@ static void cu_train_backward_bf_pipe(
         k_vadd_bf3<<<hgrid, 256, 0, st>>>(
             (const __nv_bfloat16*)dhG_[s], (const __nv_bfloat16*)dhX_[s],
             (size_t)CF_NN_HIDDEN * cols, dhGb_[s]);
-        k_colsum256<<<256, 256, 0, st>>>(
+        k_colsum256<<<256, CF_NN_HIDDEN, 0, st>>>(
             (const float*)dhGb_[s], tr->grads + CF_NN_B_ENC, cols, 1);
         CU_CHECK(cudaEventRecord(tr->ev_enc_in, st));
         CU_CHECK(cudaStreamWaitEvent(stw, tr->ev_enc_in, 0));
@@ -13633,7 +13635,7 @@ static void cu_train_backward(CuTrain* tr, int env_start, int env_count) {
         // Encoder: dh = W0^T@dpre0 + highway0 over the window
         k_vadd<<<hgrid, 256, 0, st>>>(tr->dhG, tr->dhX,
                                       (size_t)CF_NN_HIDDEN * cols, tr->dhGb);
-        k_colsum256<<<256, 256, 0, st>>>(
+        k_colsum256<<<256, CF_NN_HIDDEN, 0, st>>>(
             tr->dhG, tr->grads + CF_NN_B_ENC, cols);
         if (bf) {
             CU_CHECK(cudaEventRecord(tr->ev_enc_in, st));
