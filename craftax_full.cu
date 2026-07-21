@@ -3673,6 +3673,7 @@ typedef struct Client {
 typedef struct Craftax {
     Client* client;
     Log log;
+    Log curr_log;  // curriculum-start episodes only (canonical stats stay in log)
 
     CraftaxObs* observations;
     float* actions;
@@ -3692,6 +3693,7 @@ typedef struct Craftax {
     float achievements[CRAFTAX_NUM_ACHIEVEMENTS];
     float episode_return_accum;
     int32_t episode_length_accum;
+    int32_t curriculum_episode;  // 1: started pre-equipped on floor>0; excluded from add_log
 } Craftax;
 
 #ifdef CRAFTAX_ENABLE_ENV_IMPL
@@ -3730,6 +3732,23 @@ static __device__ inline void craftax_copy_world_state_to_state(
 // resets generate only floor 0 and defer floors 1..8 to first visit. Maps are
 // bit-identical to eager generation; only the time of generation changes.
 static __device__ int g_craftax_lazy_floors = 0;
+
+// Descend-shaped reward: multiplier on the eight enter-floor achievement
+// rewards (CRAFTAX_ACH_ENTER_GNOMISH_MINES..CRAFTAX_ACH_ENTER_GRAVEYARD).
+// 1.0 = canonical rewards (hash anchors unchanged).
+static __device__ float g_craftax_descend_bonus = 1.0f;
+
+// Curriculum resets (CRAFTAX_CU_CURR_P / CRAFTAX_CU_CURR_MAXF): with
+// probability p an episode starts on a uniform floor 1..maxf, shallower
+// floors pre-cleared and randomized gear granted, so deep-floor skills get
+// dense experience. Applied at the first step of an episode (timestep==0),
+// which covers every reset path; the one obs the policy saw at reset is the
+// pre-teleport floor-0 obs (1-step glitch, accepted). Curriculum episodes
+// train normally but are excluded from add_log so reported metrics stay
+// canonical (floor-0 starts only). p=0 (default) is behavior-identical.
+static __device__ float g_craftax_curr_p = 0.0f;
+static __device__ int g_craftax_curr_maxf = 2;
+static __device__ void craftax_apply_curriculum(Craftax* env);
 
 static __device__ inline void craftax_set_lazy_floors(int enabled) {
     g_craftax_lazy_floors = enabled;
@@ -4477,18 +4496,19 @@ static __device__ inline void craftax_copy_achievements_to_env(
 }
 
 static __device__ void add_log(Craftax* env) {
+    Log* log = env->curriculum_episode ? &env->curr_log : &env->log;
     int unlocked = 0;
     for (int i = 0; i < CRAFTAX_NUM_ACHIEVEMENTS; i++) {
         if (env->achievements[i] > 0.5f) {
             unlocked++;
-            env->log.achievements[i] += 1.0f;
+            log->achievements[i] += 1.0f;
         }
     }
-    env->log.perf += (float)unlocked / (float)CRAFTAX_NUM_ACHIEVEMENTS;
-    env->log.score += env->episode_return_accum;
-    env->log.episode_return += env->episode_return_accum;
-    env->log.episode_length += (float)env->episode_length_accum;
-    env->log.n += 1.0f;
+    log->perf += (float)unlocked / (float)CRAFTAX_NUM_ACHIEVEMENTS;
+    log->score += env->episode_return_accum;
+    log->episode_return += env->episode_return_accum;
+    log->episode_length += (float)env->episode_length_accum;
+    log->n += 1.0f;
 }
 
 static __device__ float craftax_gameplay_step_native(
@@ -4561,7 +4581,12 @@ static __device__ float craftax_gameplay_step_native(
     for (int i = 0; i < CRAFTAX_NUM_ACHIEVEMENTS; i++) {
         int32_t delta = (int32_t)CF2(achievements, i, state)
             - (int32_t)init_achievements[i];
-        reward += (float)delta * CRAFTAX_ACHIEVEMENT_REWARD_MAP[i];
+        float w = CRAFTAX_ACHIEVEMENT_REWARD_MAP[i];
+        if (i >= CRAFTAX_ACH_ENTER_GNOMISH_MINES
+            && i <= CRAFTAX_ACH_ENTER_GRAVEYARD) {
+            w *= g_craftax_descend_bonus;
+        }
+        reward += (float)delta * w;
     }
     reward += (CF(player_health, state) - init_health) * 0.1f;
 
@@ -4628,6 +4653,9 @@ static __device__ void c_step_native(Craftax* env) {
     craftax_threefry_split(step_key, &step_rng, &reset_key);
     CRAFTAX_PROFILE_END(12);
 
+    if (g_craftax_curr_p > 0.0f && CF(timestep, env->state) == 0) {
+        craftax_apply_curriculum(env);
+    }
     float reward = craftax_gameplay_step_native(env->state, action, step_rng);
 
     CRAFTAX_PROFILE_ZONE(13);
@@ -4698,6 +4726,9 @@ static __device__ bool c_step_gameplay_core(
     CraftaxThreefryKey reset_key;
     craftax_threefry_split(step_key, &step_rng, &reset_key);
 
+    if (g_craftax_curr_p > 0.0f && CF(timestep, env->state) == 0) {
+        craftax_apply_curriculum(env);
+    }
     float reward = craftax_gameplay_step_native(env->state, action, step_rng);
     bool done = craftax_is_game_over_native(env->state);
     craftax_copy_achievements_to_env(env, env->state);
@@ -6014,6 +6045,55 @@ static __device__ inline int32_t craftax_medium_level_achievement(int32_t level)
     default:
         return CRAFTAX_ACH_COLLECT_WOOD;
     }
+}
+
+// See the declaration comment next to g_craftax_curr_p. Runs in the scalar
+// step-kernel context at the first step of an episode; draws come from the
+// state_rng chain (written back), so canonical envs (p=0) never touch it.
+static __device__ void craftax_apply_curriculum(Craftax* env) {
+    CraftaxState* state = env->state;
+    CraftaxThreefryKey chain;
+    chain.word[0] = CF2(state_rng, 0, state);
+    chain.word[1] = CF2(state_rng, 1, state);
+
+    CraftaxThreefryKey draw = craftax_medium_next_random_key(&chain);
+    int32_t is_curr = craftax_threefry_uniform_f32(draw) < g_craftax_curr_p;
+    env->curriculum_episode = is_curr;
+    if (is_curr) {
+        draw = craftax_medium_next_random_key(&chain);
+        int32_t f = craftax_medium_randint(draw, 1, g_craftax_curr_maxf + 1);
+        for (int32_t l = 1; l <= f; l++) {
+            craftax_ensure_floor_generated(state, l);
+            CF2(achievements, craftax_medium_level_achievement(l), state) = true;
+            CF2(monsters_killed, l - 1, state) =
+                CRAFTAX_MONSTERS_KILLED_TO_CLEAR_LEVEL;
+        }
+        CF(player_level, state) = f;
+        CF2(player_position, 0, state) = state->up_ladders[f][0];
+        CF2(player_position, 1, state) = state->up_ladders[f][1];
+
+        draw = craftax_medium_next_random_key(&chain);
+        CF(inv_pickaxe, state) = craftax_medium_randint(draw, 0, 5);
+        draw = craftax_medium_next_random_key(&chain);
+        CF(inv_sword, state) = craftax_medium_randint(draw, 0, 5);
+        draw = craftax_medium_next_random_key(&chain);
+        CF(inv_torches, state) = craftax_medium_randint(draw, 0, 21);
+        draw = craftax_medium_next_random_key(&chain);
+        if (craftax_threefry_uniform_f32(draw) < 0.5f) {
+            CF(inv_bow, state) = 1;
+            draw = craftax_medium_next_random_key(&chain);
+            CF(inv_arrows, state) = craftax_medium_randint(draw, 1, 21);
+        }
+        for (int32_t a = 0; a < 4; a++) {
+            draw = craftax_medium_next_random_key(&chain);
+            CF2(inv_armour, a, state) = craftax_medium_randint(draw, 0, 3);
+        }
+        // Pre-mark the achievements the granted gear implies, so the first
+        // step's achievement-delta reward doesn't hand out a free burst.
+        craftax_calculate_inventory_achievements_native(state);
+    }
+    CF2(state_rng, 0, state) = chain.word[0];
+    CF2(state_rng, 1, state) = chain.word[1];
 }
 
 static __device__ inline void craftax_shoot_projectile_native(
@@ -11260,6 +11340,7 @@ typedef struct {
     int num_soa;
     int lazy;
     int mega;
+    float curr_p;
     CraftaxWarpScratch* d_warp_scratch;
     CraftaxObs* h_obs;
     float* h_rewards;
@@ -11351,6 +11432,30 @@ static void cu_vec_init(CuVec* v, int num_envs, uint64_t seed) {
     int lazy = lazy_env == NULL ? 1 : atoi(lazy_env);
     CU_CHECK(cudaMemcpyToSymbol(g_craftax_lazy_floors, &lazy, sizeof(int)));
     v->lazy = lazy;
+    // Descend-shaped reward probe: CRAFTAX_CU_DESCEND_BONUS=<mult> scales the
+    // enter-floor achievement rewards. Default 1.0 keeps canonical rewards.
+    const char* db_env = getenv("CRAFTAX_CU_DESCEND_BONUS");
+    float descend_bonus = db_env == NULL ? 1.0f : (float)atof(db_env);
+    CU_CHECK(cudaMemcpyToSymbol(g_craftax_descend_bonus, &descend_bonus,
+                                sizeof(float)));
+    if (descend_bonus != 1.0f) {
+        printf("descend_bonus=%.2f (enter-floor rewards scaled)\n", descend_bonus);
+    }
+    // Curriculum resets: CRAFTAX_CU_CURR_P=<frac> [CRAFTAX_CU_CURR_MAXF=<1..8>].
+    // Default 0 = off (canonical behavior, hash anchors unchanged).
+    const char* cp_env = getenv("CRAFTAX_CU_CURR_P");
+    float curr_p = cp_env == NULL ? 0.0f : (float)atof(cp_env);
+    const char* cmf_env = getenv("CRAFTAX_CU_CURR_MAXF");
+    int curr_maxf = cmf_env == NULL ? 2 : atoi(cmf_env);
+    if (curr_maxf < 1) curr_maxf = 1;
+    if (curr_maxf > 8) curr_maxf = 8;
+    CU_CHECK(cudaMemcpyToSymbol(g_craftax_curr_p, &curr_p, sizeof(float)));
+    CU_CHECK(cudaMemcpyToSymbol(g_craftax_curr_maxf, &curr_maxf, sizeof(int)));
+    v->curr_p = curr_p;
+    if (curr_p > 0.0f) {
+        printf("curriculum p=%.2f maxf=%d (curriculum episodes excluded from stats)\n",
+               curr_p, curr_maxf);
+    }
     // Megakernel path (fused step+reset+encode, multi-step launches in
     // bench mode), CRAFTAX_CU_MEGA=1. Verified bitwise identical to the
     // split kernels (statehash mode), but measured SLOWER on sm_120 (64.0M
@@ -13844,6 +13949,24 @@ static void cu_sum_logs(
     }
 }
 
+// Same as cu_sum_logs but over the curriculum-episode channel (curr_log).
+// Reuses the h_envs copy already fetched by a preceding cu_sum_logs call.
+static void cu_sum_curr_logs(
+    CuVec* v, const Craftax* h_envs, double* episodes, double* ep_len,
+    double* ep_ret, double* ach
+) {
+    *episodes = 0.0; *ep_len = 0.0; *ep_ret = 0.0;
+    for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++) ach[a] = 0.0;
+    for (int i = 0; i < v->num_envs; i++) {
+        const Log* log = &h_envs[i].curr_log;
+        *episodes += (double)log->n;
+        *ep_len += (double)log->episode_length;
+        *ep_ret += (double)log->score;
+        for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++)
+            ach[a] += (double)log->achievements[a];
+    }
+}
+
 static int cu_run_train(
     int num_envs, int T, int iters, uint64_t seed, CuPPOConfig cfg
 ) {
@@ -13894,6 +14017,8 @@ static int cu_run_train(
     double fw_ach0[CRAFTAX_NUM_ACHIEVEMENTS];
     memcpy(fw_ach0, ach0, sizeof(fw_ach0));
     int fw_taken = 0;
+    double cfw_ep0 = 0, cfw_len0 = 0, cfw_ret0 = 0;
+    double cfw_ach0[CRAFTAX_NUM_ACHIEVEMENTS] = {0};
 
     double* rew_stats;
     CU_CHECK(cudaMalloc(&rew_stats, 2 * sizeof(double)));
@@ -13916,6 +14041,9 @@ static int cu_run_train(
         steps_done += (size_t)num_envs * T;
         if (!fw_taken && it >= fw_start) {
             cu_sum_logs(&v, h_envs, &fw_ep0, &fw_len0, &fw_ret0, fw_ach0);
+            if (v.curr_p > 0.0f)
+                cu_sum_curr_logs(&v, h_envs, &cfw_ep0, &cfw_len0, &cfw_ret0,
+                                 cfw_ach0);
             fw_taken = 1;
         }
         if (it == 1 || it % 10 == 0 || it == iters) {
@@ -13976,6 +14104,31 @@ static int cu_run_train(
         for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++) {
             double r = (ach1[a] - fw_ach0[a]) / fw_eps;
             if (r > 0.0) printf("  %-24s %8.4f\n", CU_ACH_NAMES[a], r);
+        }
+    }
+    if (v.curr_p > 0.0f) {
+        double cep, clen, cret, cach[CRAFTAX_NUM_ACHIEVEMENTS];
+        cu_sum_curr_logs(&v, h_envs, &cep, &clen, &cret, cach);
+        if (cep > 0.0) {
+            printf("curriculum episodes (deep starts, excluded above): "
+                   "%.0f episodes  ret/ep %+.3f  eplen %.0f\n",
+                   cep, cret / cep, clen / cep);
+            printf("curriculum achievement rates (nonzero only):\n");
+            for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++) {
+                double r = cach[a] / cep;
+                if (r > 0.0) printf("  %-24s %8.4f\n", CU_ACH_NAMES[a], r);
+            }
+        }
+        double cfw_eps = cep - cfw_ep0;
+        if (fw_taken && cfw_eps > 0.0) {
+            printf("curriculum final window: %.0f episodes  ret/ep %+.3f  "
+                   "eplen %.0f\n", cfw_eps, (cret - cfw_ret0) / cfw_eps,
+                   (clen - cfw_len0) / cfw_eps);
+            printf("curriculum final-window achievement rates (nonzero only):\n");
+            for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++) {
+                double r = (cach[a] - cfw_ach0[a]) / cfw_eps;
+                if (r > 0.0) printf("  %-24s %8.4f\n", CU_ACH_NAMES[a], r);
+            }
         }
     }
     cudaFree(rew_stats);
