@@ -38,8 +38,6 @@ static __device__ inline int32_t craftax_cu_ctzll(unsigned long long x) {
     return __ffsll((long long)x) - 1;
 }
 #define __builtin_ctzll(x) craftax_cu_ctzll(x)
-// never take the AVX-512 host paths
-#define CRAFTAX_NO_SIMD_NOISE 1
 
 // ============================================================
 // ===== device game logic, transformed from craftax_full.c =====
@@ -346,128 +344,6 @@ static __device__ inline void craftax_generate_perlin_noise_2d_scalar(
     }
 }
 
-#if defined(__AVX512F__) && !defined(CRAFTAX_NO_SIMD_NOISE)
-#include <immintrin.h>
-
-static __device__ inline __m512 craftax_noise_interpolant_v(__m512 t) {
-    // t*t*t*(t*(t*6 - 15) + 10), plain mul/add to track the scalar formula.
-    __m512 a = _mm512_add_ps(
-        _mm512_mul_ps(t, _mm512_set1_ps(6.0f)), _mm512_set1_ps(-15.0f));
-    a = _mm512_add_ps(_mm512_mul_ps(t, a), _mm512_set1_ps(10.0f));
-    __m512 t3 = _mm512_mul_ps(_mm512_mul_ps(t, t), t);
-    return _mm512_mul_ps(t3, a);
-}
-
-// AVX-512 inner loop, 16 output cells at a time. Requires cols % 16 == 0,
-// power-of-two cell_cols, and a precomputed gradient table (all true for
-// every worldgen call: 48-wide maps, cell_cols in {2,4,16}). May differ from
-// the scalar path by ~1 ULP where the compiler contracted scalar mul+add
-// into FMA; worlds are distributionally identical, not bit-identical.
-static __device__ inline bool craftax_generate_perlin_noise_2d_avx512(
-    CraftaxThreefryKey rng,
-    int rows,
-    int cols,
-    int res_rows,
-    int res_cols,
-    const float* override_angles,
-    float* out
-) {
-    int cell_rows = rows / res_rows;
-    int cell_cols = cols / res_cols;
-    int grad_w = res_cols + 1;
-    int grad_h = res_rows + 1;
-    if (cols % 16 != 0) return false;
-    if (cell_cols <= 0 || (cell_cols & (cell_cols - 1)) != 0) return false;
-    if (grad_w * grad_h > CRAFTAX_NOISE_MAX_GRAD) return false;
-
-    CraftaxThreefryKey unused;
-    CraftaxThreefryKey angle_key;
-    craftax_threefry_split(rng, &unused, &angle_key);
-
-    float grad_x[CRAFTAX_NOISE_MAX_GRAD];
-    float grad_y[CRAFTAX_NOISE_MAX_GRAD];
-    for (int r = 0; r < grad_h; r++) {
-        for (int c = 0; c < grad_w; c++) {
-            float angle = craftax_noise_gradient_angle(
-                angle_key, res_cols, r, c, override_angles);
-            grad_x[r * grad_w + c] = cosf(angle);
-            grad_y[r * grad_w + c] = sinf(angle);
-        }
-    }
-
-    uint32_t col_shift = (uint32_t)__builtin_ctz((unsigned)cell_cols);
-    __m512i shift_v = _mm512_set1_epi32((int)col_shift);
-    __m512i col_mask = _mm512_set1_epi32(cell_cols - 1);
-    __m512 inv_cell_cols = _mm512_set1_ps(1.0f / (float)cell_cols);
-    __m512i grad_w_v = _mm512_set1_epi32(grad_w);
-    __m512i lane = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
-    __m512 one = _mm512_set1_ps(1.0f);
-    __m512 sqrt2 = _mm512_set1_ps(CRAFTAX_NOISE_SQRT2);
-
-    for (int row = 0; row < rows; row++) {
-        int grad_row = row / cell_rows;
-        float local_row_s =
-            (float)(row - grad_row * cell_rows) / (float)cell_rows;
-        float interp_row_s = craftax_noise_interpolant(local_row_s);
-        __m512 local_row = _mm512_set1_ps(local_row_s);
-        __m512 local_row_m1 = _mm512_set1_ps(local_row_s - 1.0f);
-        __m512 interp_row = _mm512_set1_ps(interp_row_s);
-        __m512 one_m_interp_row = _mm512_set1_ps(1.0f - interp_row_s);
-        __m512i row_base = _mm512_set1_epi32(grad_row * grad_w);
-
-        for (int col = 0; col < cols; col += 16) {
-            __m512i col_v = _mm512_add_epi32(_mm512_set1_epi32(col), lane);
-            __m512i grad_col = _mm512_srlv_epi32(col_v, shift_v);
-            __m512 local_col = _mm512_mul_ps(
-                _mm512_cvtepi32_ps(_mm512_and_si512(col_v, col_mask)),
-                inv_cell_cols);
-            __m512 interp_col = craftax_noise_interpolant_v(local_col);
-
-            __m512i i00 = _mm512_add_epi32(row_base, grad_col);
-            __m512i i10 = _mm512_add_epi32(i00, grad_w_v);
-            __m512i i01 = _mm512_add_epi32(i00, _mm512_set1_epi32(1));
-            __m512i i11 = _mm512_add_epi32(i10, _mm512_set1_epi32(1));
-
-            __m512 g00x = _mm512_i32gather_ps(i00, grad_x, 4);
-            __m512 g00y = _mm512_i32gather_ps(i00, grad_y, 4);
-            __m512 g10x = _mm512_i32gather_ps(i10, grad_x, 4);
-            __m512 g10y = _mm512_i32gather_ps(i10, grad_y, 4);
-            __m512 g01x = _mm512_i32gather_ps(i01, grad_x, 4);
-            __m512 g01y = _mm512_i32gather_ps(i01, grad_y, 4);
-            __m512 g11x = _mm512_i32gather_ps(i11, grad_x, 4);
-            __m512 g11y = _mm512_i32gather_ps(i11, grad_y, 4);
-
-            __m512 local_col_m1 = _mm512_sub_ps(local_col, one);
-            __m512 n00 = _mm512_add_ps(
-                _mm512_mul_ps(local_row, g00x),
-                _mm512_mul_ps(local_col, g00y));
-            __m512 n10 = _mm512_add_ps(
-                _mm512_mul_ps(local_row_m1, g10x),
-                _mm512_mul_ps(local_col, g10y));
-            __m512 n01 = _mm512_add_ps(
-                _mm512_mul_ps(local_row, g01x),
-                _mm512_mul_ps(local_col_m1, g01y));
-            __m512 n11 = _mm512_add_ps(
-                _mm512_mul_ps(local_row_m1, g11x),
-                _mm512_mul_ps(local_col_m1, g11y));
-
-            __m512 n0 = _mm512_add_ps(
-                _mm512_mul_ps(n00, one_m_interp_row),
-                _mm512_mul_ps(interp_row, n10));
-            __m512 n1 = _mm512_add_ps(
-                _mm512_mul_ps(n01, one_m_interp_row),
-                _mm512_mul_ps(interp_row, n11));
-            __m512 result = _mm512_mul_ps(sqrt2, _mm512_add_ps(
-                _mm512_mul_ps(_mm512_sub_ps(one, interp_col), n0),
-                _mm512_mul_ps(interp_col, n1)));
-            _mm512_storeu_ps(&out[(size_t)row * (size_t)cols + (size_t)col],
-                             result);
-        }
-    }
-    return true;
-}
-#endif  // __AVX512F__ && !CRAFTAX_NO_SIMD_NOISE
-
 static __device__ inline void craftax_generate_perlin_noise_2d(
     CraftaxThreefryKey rng,
     int rows,
@@ -477,12 +353,6 @@ static __device__ inline void craftax_generate_perlin_noise_2d(
     const float* override_angles,
     float* out
 ) {
-#if defined(__AVX512F__) && !defined(CRAFTAX_NO_SIMD_NOISE)
-    if (craftax_generate_perlin_noise_2d_avx512(
-            rng, rows, cols, res_rows, res_cols, override_angles, out)) {
-        return;
-    }
-#endif
     craftax_generate_perlin_noise_2d_scalar(
         rng, rows, cols, res_rows, res_cols, override_angles, out);
 }
@@ -1258,13 +1128,6 @@ static __device__ inline CraftaxThreefryKey craftax_worldgen_key_from_seed(uint3
     return world_key;
 }
 
-static __device__ inline CraftaxThreefryKey craftax_overworld_rng_from_seed(uint32_t seed) {
-    CraftaxThreefryKey world_key = craftax_worldgen_key_from_seed(seed);
-    CraftaxThreefryKey world_keys[7];
-    craftax_threefry_split_n(world_key, world_keys, 7);
-    return world_keys[1];
-}
-
 static __device__ inline uint32_t craftax_randint_u32_at(
     CraftaxThreefryKey key,
     uint64_t index,
@@ -1427,14 +1290,6 @@ static __device__ inline int craftax_dungeon_config_index_for_floor(int floor_id
 }
 
 // ============================================================
-// Smoothworld tile passes: scalar reference implementations plus AVX-512
-// twins. The SIMD versions use only IEEE-exact per-lane operations in the
-// same order as the scalar code (no FMA, no reassociation), so their output
-// is bit-identical; g_craftax_wg_force_scalar exists for testing that claim.
-// ============================================================
-static __device__ int g_craftax_wg_force_scalar = 0;
-
-// ============================================================
 // [cuda port] Per-thread worldgen scratch arena. The scalar generators used
 // to keep their noise fields / padded maps in ~60KB of thread-local stack,
 // which forces a huge cudaLimitStackSize and throttles k_step residency.
@@ -1590,222 +1445,6 @@ static __device__ inline void craftax_smoothworld_lava_scalar(
     }
 }
 
-#if defined(__AVX512F__) && defined(__AVX512DQ__) && !defined(CRAFTAX_NO_SIMD_NOISE)
-#define CRAFTAX_WG_SIMD 1
-#include <immintrin.h>
-
-static __device__ inline __m512i craftax_wg_mix64_v(__m512i x) {
-    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 33));
-    x = _mm512_mullo_epi64(x, _mm512_set1_epi64((long long)0xff51afd7ed558ccdULL));
-    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 33));
-    x = _mm512_mullo_epi64(x, _mm512_set1_epi64((long long)0xc4ceb9fe1a85ec53ULL));
-    x = _mm512_xor_si512(x, _mm512_srli_epi64(x, 33));
-    return x;
-}
-
-// craftax_threefry_uniform_f32_at for 16 consecutive counters [base, base+16).
-static __device__ inline __m512 craftax_wg_uniform_f32x16(uint64_t key, uint64_t base) {
-    __m512i lane8 = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
-    __m512i k = _mm512_set1_epi64((long long)key);
-    __m512i idx_lo = _mm512_add_epi64(_mm512_set1_epi64((long long)base), lane8);
-    __m512i idx_hi = _mm512_add_epi64(_mm512_set1_epi64((long long)(base + 8)), lane8);
-    __m512i h_lo = craftax_wg_mix64_v(_mm512_xor_si512(k, idx_lo));
-    __m512i h_hi = craftax_wg_mix64_v(_mm512_xor_si512(k, idx_hi));
-    // u32 = (uint32_t)h ^ (uint32_t)(h >> 32), then keep low 32 of each lane
-    h_lo = _mm512_xor_si512(h_lo, _mm512_srli_epi64(h_lo, 32));
-    h_hi = _mm512_xor_si512(h_hi, _mm512_srli_epi64(h_hi, 32));
-    __m256i lo32 = _mm512_cvtepi64_epi32(h_lo);
-    __m256i hi32 = _mm512_cvtepi64_epi32(h_hi);
-    __m512i bits = _mm512_inserti64x4(_mm512_castsi256_si512(lo32), hi32, 1);
-    // float in [0,1): ((bits >> 9) | 0x3F800000) - 1.0f
-    bits = _mm512_or_si512(_mm512_srli_epi32(bits, 9),
-                           _mm512_set1_epi32(0x3F800000));
-    return _mm512_sub_ps(_mm512_castsi512_ps(bits), _mm512_set1_ps(1.0f));
-}
-
-static __device__ inline void craftax_smoothworld_classify_avx512(
-    const CraftaxSmoothGenConfig* config,
-    CraftaxThreefryKey tree_uniform_key,
-    float* water,
-    float* mountain,
-    const float* path_x,
-    const float* tree_noise,
-    uint8_t map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
-    uint8_t item_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
-    uint8_t light_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE]
-) {
-    const int size = CRAFTAX_WG_MAP_SIZE;
-    const int player_col = CRAFTAX_WG_MAP_SIZE / 2;
-    uint64_t tree_key = craftax_key_to_u64(tree_uniform_key);
-
-    __m512i lane = _mm512_setr_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
-    __m512 zero = _mm512_setzero_ps();
-    __m512 one = _mm512_set1_ps(1.0f);
-    __m512 inv_w_strength =
-        _mm512_set1_ps(config->player_proximity_map_water_strength);
-    __m512 inv_m_strength =
-        _mm512_set1_ps(config->player_proximity_map_mountain_strength);
-    __m512 w_max = _mm512_set1_ps(config->player_proximity_map_water_max);
-    __m512 m_max = _mm512_set1_ps(config->player_proximity_map_mountain_max);
-    __m512 water_thresh = _mm512_set1_ps(config->water_threshold);
-    __m512 sand_thresh = _mm512_set1_ps(config->sand_threshold);
-    __m512 c07 = _mm512_set1_ps(0.7f);
-    __m512 c08 = _mm512_set1_ps(0.8f);
-    __m512 c085 = _mm512_set1_ps(0.85f);
-    __m512 c04 = _mm512_set1_ps(0.4f);
-    __m512 c005 = _mm512_set1_ps(0.05f);
-    __m512 tree_perlin = _mm512_set1_ps(config->tree_threshold_perlin);
-    __m512 tree_uniform = _mm512_set1_ps(config->tree_threshold_uniform);
-    __m512i default_b = _mm512_set1_epi32(config->default_block);
-    __m512i sea_b = _mm512_set1_epi32(config->sea_block);
-    __m512i coast_b = _mm512_set1_epi32(config->coast_block);
-    __m512i mountain_b = _mm512_set1_epi32(config->mountain_block);
-    __m512i path_b = _mm512_set1_epi32(config->path_block);
-    __m512i inner_b = _mm512_set1_epi32(config->inner_mountain_block);
-    __m512i tree_req_b = _mm512_set1_epi32(config->tree_requirement_block);
-    __m512i tree_b = _mm512_set1_epi32(config->tree);
-    __m128i item_zero = _mm_setzero_si128();
-    __m128i light_fill =
-        _mm_set1_epi8((char)(uint8_t)(config->default_light * 255.0f));
-
-    for (int row = 0; row < size; row++) {
-        int player_row = CRAFTAX_WG_MAP_SIZE / 2;
-        int dr = row > player_row ? row - player_row : player_row - row;
-        __m512i dr2 = _mm512_set1_epi32(dr * dr);
-
-        for (int col = 0; col < size; col += 16) {
-            __m512i c = _mm512_add_epi32(_mm512_set1_epi32(col), lane);
-            __m512i dc = _mm512_abs_epi32(
-                _mm512_sub_epi32(c, _mm512_set1_epi32(player_col)));
-            __m512 distance = _mm512_sqrt_ps(_mm512_cvtepi32_ps(
-                _mm512_add_epi32(dr2, _mm512_mullo_epi32(dc, dc))));
-
-            // clampf(distance / strength, 0, max) == min(max(v, 0), max)
-            __m512 prox_w = _mm512_min_ps(
-                _mm512_max_ps(_mm512_div_ps(distance, inv_w_strength), zero),
-                w_max);
-            __m512 prox_m = _mm512_min_ps(
-                _mm512_max_ps(_mm512_div_ps(distance, inv_m_strength), zero),
-                m_max);
-
-            size_t idx = (size_t)row * (size_t)size + (size_t)col;
-            __m512 w = _mm512_loadu_ps(&water[idx]);
-            w = _mm512_sub_ps(_mm512_add_ps(w, prox_w), one);
-            _mm512_storeu_ps(&water[idx], w);
-
-            __mmask16 sea = _mm512_cmp_ps_mask(w, water_thresh, _CMP_GT_OQ);
-            __m512i block = _mm512_mask_blend_epi32(sea, default_b, sea_b);
-            // Scalar condition is `block != sea_block`, which differs from
-            // `!sea` when default_block == sea_block (configs 1 and 4).
-            __mmask16 sand = _mm512_kand(
-                _mm512_cmpneq_epi32_mask(block, sea_b),
-                _mm512_cmp_ps_mask(w, sand_thresh, _CMP_GT_OQ));
-            block = _mm512_mask_blend_epi32(sand, block, coast_b);
-
-            __m512 m = _mm512_loadu_ps(&mountain[idx]);
-            m = _mm512_sub_ps(
-                _mm512_add_ps(_mm512_add_ps(m, c005), prox_m), one);
-            _mm512_storeu_ps(&mountain[idx], m);
-
-            __mmask16 mnt = _mm512_cmp_ps_mask(m, c07, _CMP_GT_OQ);
-            block = _mm512_mask_blend_epi32(mnt, block, mountain_b);
-
-            __m512 px = _mm512_loadu_ps(&path_x[idx]);
-            __mmask16 path = _mm512_kand(
-                mnt, _mm512_cmp_ps_mask(px, c08, _CMP_GT_OQ));
-            block = _mm512_mask_blend_epi32(path, block, path_b);
-
-            // path_x transposed: path_x[col * size + row]
-            __m512i t_idx = _mm512_add_epi32(
-                _mm512_mullo_epi32(c, _mm512_set1_epi32(size)),
-                _mm512_set1_epi32(row));
-            __m512 py = _mm512_i32gather_ps(t_idx, path_x, 4);
-            path = _mm512_kand(mnt, _mm512_cmp_ps_mask(py, c08, _CMP_GT_OQ));
-            block = _mm512_mask_blend_epi32(path, block, path_b);
-
-            __mmask16 cave = _mm512_kand(
-                _mm512_cmp_ps_mask(m, c085, _CMP_GT_OQ),
-                _mm512_cmp_ps_mask(w, c04, _CMP_GT_OQ));
-            block = _mm512_mask_blend_epi32(cave, block, inner_b);
-
-            __m512 draw = craftax_wg_uniform_f32x16(tree_key, (uint64_t)idx);
-            __m512 tn = _mm512_loadu_ps(&tree_noise[idx]);
-            __mmask16 tree = _mm512_kand(
-                _mm512_cmp_ps_mask(tn, tree_perlin, _CMP_GT_OQ),
-                _mm512_cmp_ps_mask(draw, tree_uniform, _CMP_GT_OQ));
-            tree = _mm512_kand(
-                tree, _mm512_cmpeq_epi32_mask(block, tree_req_b));
-            block = _mm512_mask_blend_epi32(tree, block, tree_b);
-
-            _mm_storeu_si128((__m128i*)&map[row][col],
-                             _mm512_cvtepi32_epi8(block));
-            _mm_storeu_si128((__m128i*)&item_map[row][col], item_zero);
-            _mm_storeu_si128((__m128i*)&light_map[row][col], light_fill);
-        }
-    }
-}
-
-static __device__ inline void craftax_smoothworld_ore_avx512(
-    const CraftaxSmoothGenConfig* config,
-    int ore_index,
-    CraftaxThreefryKey ore_key,
-    uint8_t map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE]
-) {
-    const int size = CRAFTAX_WG_MAP_SIZE;
-    uint64_t key = craftax_key_to_u64(ore_key);
-    __m512i req = _mm512_set1_epi32(config->ore_requirement_blocks[ore_index]);
-    __m512i ore = _mm512_set1_epi32(config->ores[ore_index]);
-    __m512 chance = _mm512_set1_ps(config->ore_chances[ore_index]);
-    for (int row = 0; row < size; row++) {
-        for (int col = 0; col < size; col += 16) {
-            size_t idx = (size_t)row * (size_t)size + (size_t)col;
-            __m512i blocks = _mm512_cvtepu8_epi32(
-                _mm_loadu_si128((const __m128i*)&map[row][col]));
-            __mmask16 is_req = _mm512_cmpeq_epi32_mask(blocks, req);
-            if (!is_req) continue;
-            __m512 draw = craftax_wg_uniform_f32x16(key, (uint64_t)idx);
-            __mmask16 is_ore = _mm512_kand(
-                is_req, _mm512_cmp_ps_mask(draw, chance, _CMP_LT_OQ));
-            blocks = _mm512_mask_blend_epi32(is_ore, blocks, ore);
-            _mm_storeu_si128((__m128i*)&map[row][col],
-                             _mm512_cvtepi32_epi8(blocks));
-        }
-    }
-}
-
-static __device__ inline void craftax_smoothworld_lava_avx512(
-    const CraftaxSmoothGenConfig* config,
-    const float* mountain,
-    const float* tree_noise,
-    uint8_t map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
-    bool lava_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE]
-) {
-    const int size = CRAFTAX_WG_MAP_SIZE;
-    __m512 c085 = _mm512_set1_ps(0.85f);
-    __m512 c07 = _mm512_set1_ps(0.7f);
-    __m512i lava_b = _mm512_set1_epi32(config->lava);
-    __m512i one32 = _mm512_set1_epi32(1);
-    for (int row = 0; row < size; row++) {
-        for (int col = 0; col < size; col += 16) {
-            size_t idx = (size_t)row * (size_t)size + (size_t)col;
-            __mmask16 lava = _mm512_kand(
-                _mm512_cmp_ps_mask(
-                    _mm512_loadu_ps(&mountain[idx]), c085, _CMP_GT_OQ),
-                _mm512_cmp_ps_mask(
-                    _mm512_loadu_ps(&tree_noise[idx]), c07, _CMP_GT_OQ));
-            _mm_storeu_si128((__m128i*)&lava_map[row][col],
-                             _mm512_cvtepi32_epi8(
-                                 _mm512_maskz_mov_epi32(lava, one32)));
-            __m512i blocks = _mm512_cvtepu8_epi32(
-                _mm_loadu_si128((const __m128i*)&map[row][col]));
-            blocks = _mm512_mask_blend_epi32(lava, blocks, lava_b);
-            _mm_storeu_si128((__m128i*)&map[row][col],
-                             _mm512_cvtepi32_epi8(blocks));
-        }
-    }
-}
-#endif  // CRAFTAX_WG_SIMD
-
 static __device__ inline void craftax_generate_smoothworld_config(
     CraftaxThreefryKey rng,
     int config_idx,
@@ -1848,25 +1487,9 @@ static __device__ inline void craftax_generate_smoothworld_config(
     CraftaxThreefryKey tree_uniform_key = rng;
     craftax_generate_fractal_noise_2d(subkey, size, size, 12, 12, 1, 0.5f, 2, NULL, tree_noise);
 
-#ifdef CRAFTAX_WG_SIMD
-    bool use_simd = !g_craftax_wg_force_scalar;
-#else
-    bool use_simd = false;
-#endif
-    (void)use_simd;
-
-#ifdef CRAFTAX_WG_SIMD
-    if (use_simd) {
-        craftax_smoothworld_classify_avx512(
-            config, tree_uniform_key, water, mountain, path_x, tree_noise,
-            map, item_map, light_map);
-    } else
-#endif
-    {
-        craftax_smoothworld_classify_scalar(
-            config, tree_uniform_key, water, mountain, path_x, tree_noise,
-            map, item_map, light_map);
-    }
+    craftax_smoothworld_classify_scalar(
+        config, tree_uniform_key, water, mountain, path_x, tree_noise,
+        map, item_map, light_map);
     (void)player_col;
 
     CraftaxThreefryKey ore_rng;
@@ -1874,23 +1497,10 @@ static __device__ inline void craftax_generate_smoothworld_config(
     for (int ore_index = 0; ore_index < 5; ore_index++) {
         CraftaxThreefryKey ore_key;
         craftax_threefry_split(ore_rng, &ore_rng, &ore_key);
-#ifdef CRAFTAX_WG_SIMD
-        if (use_simd) {
-            craftax_smoothworld_ore_avx512(config, ore_index, ore_key, map);
-            continue;
-        }
-#endif
         craftax_smoothworld_ore_scalar(config, ore_index, ore_key, map);
     }
 
-#ifdef CRAFTAX_WG_SIMD
-    if (use_simd) {
-        craftax_smoothworld_lava_avx512(config, mountain, tree_noise, map, lava_map);
-    } else
-#endif
-    {
-        craftax_smoothworld_lava_scalar(config, mountain, tree_noise, map, lava_map);
-    }
+    craftax_smoothworld_lava_scalar(config, mountain, tree_noise, map, lava_map);
 
     craftax_threefry_split(rng, &rng, &subkey);
     bool* valid_diamond = scratch->u.smooth.valid;
@@ -1930,37 +1540,6 @@ static __device__ inline void craftax_generate_smoothworld_config(
     if (config->ladder_up) {
         item_map[ladder_up[0]][ladder_up[1]] = CRAFTAX_WG_ITEM_LADDER_UP;
     }
-}
-
-static __device__ inline void craftax_generate_smoothworld_floor(
-    CraftaxThreefryKey seed_key,
-    int floor_idx,
-    uint8_t map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
-    uint8_t item_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
-    uint8_t light_map[CRAFTAX_WG_MAP_SIZE][CRAFTAX_WG_MAP_SIZE],
-    int32_t ladder_down[2],
-    int32_t ladder_up[2]
-) {
-    int config_idx = craftax_smooth_config_index_for_floor(floor_idx);
-    if (config_idx < 0) {
-        memset(map, 0, CRAFTAX_WG_MAP_CELLS * sizeof(uint8_t));
-        memset(item_map, 0, CRAFTAX_WG_MAP_CELLS * sizeof(uint8_t));
-        memset(light_map, 0, CRAFTAX_WG_MAP_CELLS * sizeof(uint8_t));
-        ladder_down[0] = 0;
-        ladder_down[1] = 0;
-        ladder_up[0] = 0;
-        ladder_up[1] = 0;
-        return;
-    }
-    craftax_generate_smoothworld_config(
-        seed_key,
-        config_idx,
-        map,
-        item_map,
-        light_map,
-        ladder_down,
-        ladder_up
-    );
 }
 
 static __device__ inline void craftax_generate_dungeon_config(
@@ -2379,42 +1958,6 @@ static __device__ inline void craftax_generate_world_from_key_lazy(
     CF(player_intelligence, out) = 1;
     CF(boss_timesteps_to_spawn_this_round, out) = CRAFTAX_WG_BOSS_FIGHT_SPAWN_TURNS;
     CF(light_level, out) = craftax_calculate_initial_light_level();
-}
-
-static __device__ inline void craftax_generate_world_from_key(
-    CraftaxThreefryKey rng,
-    CraftaxWorldState* out
-) {
-    craftax_generate_world_from_key_lazy(rng, out, false);
-}
-
-static __device__ inline void craftax_generate_world_from_seed(
-    uint32_t seed,
-    CraftaxWorldState* out
-) {
-    craftax_generate_world_from_key(craftax_worldgen_key_from_seed(seed), out);
-}
-
-static __device__ inline void craftax_generate_overworld_from_rng(
-    CraftaxThreefryKey rng,
-    CraftaxOverworldFloor* out
-) {
-    craftax_generate_smoothworld_config(
-        rng,
-        0,
-        out->map,
-        out->item_map,
-        out->light_map,
-        out->ladder_down,
-        out->ladder_up
-    );
-}
-
-static __device__ inline void craftax_generate_overworld_from_seed(
-    uint32_t seed,
-    CraftaxOverworldFloor* out
-) {
-    craftax_generate_overworld_from_rng(craftax_overworld_rng_from_seed(seed), out);
 }
 
 static __device__ inline int craftax_wg_jax_index(int32_t index, int32_t size) {
@@ -3721,13 +3264,6 @@ static __device__ inline CraftaxThreefryKey craftax_step_native_next_key(
     return subkey;
 }
 
-static __device__ inline void craftax_copy_world_state_to_state(
-    CraftaxState* dst,
-    const CraftaxWorldState* src
-) {
-    memcpy(dst, src, sizeof(*dst));
-}
-
 // Lazy floor generation toggle (process-wide, like the reset pool). When on,
 // resets generate only floor 0 and defer floors 1..8 to first visit. Maps are
 // bit-identical to eager generation; only the time of generation changes.
@@ -4775,170 +4311,6 @@ static __device__ void c_close(Craftax* env) {
     env->owns_state_storage = false;
 }
 
-#if 0  // rendering stripped: raylib not used in this standalone port
-// ------------------------------------------------------------
-// Tile-based renderer using upstream Craftax 16x16 PNG assets
-// ------------------------------------------------------------
-// Packed layout (see ocean/craftax/pack_textures.py):
-//   [0..36] block textures (indexed by CraftaxBlockType)
-//   [37..41] player: down, up, left, right, sleep
-//   [42..46] items: none, torch, ladder_down, ladder_up, ladder_down_blocked
-
-#define CRAFTAX_TEX_TILE_PX 16
-#define CRAFTAX_TEX_SCALE 4   // on-screen px = 64
-#define CRAFTAX_TEX_DRAW_PX (CRAFTAX_TEX_TILE_PX * CRAFTAX_TEX_SCALE)
-#define CRAFTAX_TEX_NUM (37 + 5 + 5 + 3 + 4)
-
-// Render viewport (independent of agent obs window)
-#define CRAFTAX_RENDER_ROWS 16
-#define CRAFTAX_RENDER_COLS 16
-
-#define CRAFTAX_TEX_PLAYER_DOWN 37
-#define CRAFTAX_TEX_PLAYER_UP 38
-#define CRAFTAX_TEX_PLAYER_LEFT 39
-#define CRAFTAX_TEX_PLAYER_RIGHT 40
-#define CRAFTAX_TEX_PLAYER_SLEEP 41
-#define CRAFTAX_TEX_ITEM_BASE 42
-
-static __device__ Texture2D craftax_textures[CRAFTAX_TEX_NUM];
-static __device__ bool craftax_textures_loaded = false;
-
-static __device__ void craftax_load_textures(void) {
-    if (craftax_textures_loaded) return;
-    const char* candidates[] = {
-        "resources/craftax/textures.bin",
-        "../resources/craftax/textures.bin",
-        "../../resources/craftax/textures.bin",
-    };
-    FILE* f = NULL;
-    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
-        f = fopen(candidates[i], "rb");
-        if (f) break;
-    }
-    if (!f) {
-        fprintf(stderr, "craftax: textures.bin not found in resources/craftax -- run ocean/craftax/pack_textures.py\n");
-        exit(1);
-    }
-    const size_t tile_bytes = CRAFTAX_TEX_TILE_PX * CRAFTAX_TEX_TILE_PX * 4;
-    uint8_t* buf = (uint8_t*)malloc(tile_bytes);
-    for (int i = 0; i < CRAFTAX_TEX_NUM; i++) {
-        if (fread(buf, 1, tile_bytes, f) != tile_bytes) {
-            fprintf(stderr, "craftax: short read on textures.bin at tile %d\n", i);
-            exit(1);
-        }
-        Image img = {
-            .data = buf,
-            .width = CRAFTAX_TEX_TILE_PX,
-            .height = CRAFTAX_TEX_TILE_PX,
-            .mipmaps = 1,
-            .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-        };
-        craftax_textures[i] = LoadTextureFromImage(img);
-        SetTextureFilter(craftax_textures[i], TEXTURE_FILTER_POINT);
-    }
-    free(buf);
-    fclose(f);
-    craftax_textures_loaded = true;
-}
-
-static __device__ int craftax_player_tex_id(int32_t direction, bool sleeping) {
-    if (sleeping) return CRAFTAX_TEX_PLAYER_SLEEP;
-    switch (direction) {
-        case 1: return CRAFTAX_TEX_PLAYER_LEFT;
-        case 2: return CRAFTAX_TEX_PLAYER_RIGHT;
-        case 3: return CRAFTAX_TEX_PLAYER_UP;
-        case 4: return CRAFTAX_TEX_PLAYER_DOWN;
-        default: return CRAFTAX_TEX_PLAYER_DOWN;
-    }
-}
-
-static __device__ void craftax_draw_tile(int tex_id, int dst_x, int dst_y, float tint_alpha) {
-    if (tex_id < 0 || tex_id >= CRAFTAX_TEX_NUM) return;
-    Rectangle src = {0, 0, CRAFTAX_TEX_TILE_PX, CRAFTAX_TEX_TILE_PX};
-    Rectangle dst = {(float)dst_x, (float)dst_y, CRAFTAX_TEX_DRAW_PX, CRAFTAX_TEX_DRAW_PX};
-    Color tint = {255, 255, 255, (unsigned char)(tint_alpha * 255.0f)};
-    DrawTexturePro(craftax_textures[tex_id], src, dst, (Vector2){0, 0}, 0.0f, tint);
-}
-
-static __device__ void c_render(Craftax* env) {
-    const int view_w = CRAFTAX_RENDER_COLS * CRAFTAX_TEX_DRAW_PX;
-    const int view_h = CRAFTAX_RENDER_ROWS * CRAFTAX_TEX_DRAW_PX;
-    const int hud_h = 80;
-
-    if (!IsWindowReady()) {
-        InitWindow(view_w, view_h + hud_h, "PufferLib Craftax");
-        SetTargetFPS(30);
-    }
-    if (!craftax_textures_loaded) craftax_load_textures();
-    if (IsKeyDown(KEY_ESCAPE)) exit(0);
-
-    CraftaxState* s = env->state;
-    int lvl = CF(player_level, s);
-    int pr = CF2(player_position, 0, s);
-    int pc = CF2(player_position, 1, s);
-    int half_r = CRAFTAX_RENDER_ROWS / 2;
-    int half_c = CRAFTAX_RENDER_COLS / 2;
-
-    BeginDrawing();
-    ClearBackground(BLACK);
-
-    for (int vr = 0; vr < CRAFTAX_RENDER_ROWS; vr++) {
-        for (int vc = 0; vc < CRAFTAX_RENDER_COLS; vc++) {
-            int wr = pr - half_r + vr;
-            int wc = pc - half_c + vc;
-            int dst_x = vc * CRAFTAX_TEX_DRAW_PX;
-            int dst_y = vr * CRAFTAX_TEX_DRAW_PX;
-
-            int blk = CRAFTAX_BLOCK_OUT_OF_BOUNDS;
-            if (wr >= 0 && wr < CRAFTAX_MAP_SIZE && wc >= 0 && wc < CRAFTAX_MAP_SIZE) {
-                blk = s->map[lvl][wr][wc];
-                if (s->light_map[lvl][wr][wc] <= 12) blk = CRAFTAX_BLOCK_DARKNESS;
-            }
-            if (blk < 0 || blk >= CRAFTAX_NUM_BLOCK_TYPES) blk = 0;
-            craftax_draw_tile(blk, dst_x, dst_y, 1.0f);
-
-            // item overlay
-            if (wr >= 0 && wr < CRAFTAX_MAP_SIZE && wc >= 0 && wc < CRAFTAX_MAP_SIZE) {
-                int it = s->item_map[lvl][wr][wc];
-                if (it > 0 && it < 5) {
-                    craftax_draw_tile(CRAFTAX_TEX_ITEM_BASE + it, dst_x, dst_y, 1.0f);
-                }
-            }
-        }
-    }
-
-    // player in center
-    int pid = craftax_player_tex_id(CF(player_direction, s), CF(is_sleeping, s));
-    craftax_draw_tile(pid, half_c * CRAFTAX_TEX_DRAW_PX, half_r * CRAFTAX_TEX_DRAW_PX, 1.0f);
-
-    // night dim overlay
-    if (CF(light_level, s) < 1.0f) {
-        unsigned char a = (unsigned char)((1.0f - CF(light_level, s)) * 140.0f);
-        DrawRectangle(0, 0, view_w, view_h, (Color){0, 0, 40, a});
-    }
-
-    // HUD
-    int hud_y = view_h;
-    DrawRectangle(0, hud_y, view_w, hud_h, (Color){20, 20, 20, 255});
-    DrawText(TextFormat("HP:%.0f  F:%d  D:%d  E:%d  M:%d  L:%d  t:%d",
-             CF(player_health, s), CF(player_food, s), CF(player_drink, s),
-             CF(player_energy, s), CF(player_mana, s), CF(player_level, s), CF(timestep, s)),
-             4, hud_y + 4, 14, WHITE);
-    DrawText(TextFormat("XP:%d  DEX:%d  STR:%d  INT:%d  light:%.2f",
-             CF(player_xp, s), CF(player_dexterity, s), CF(player_strength, s),
-             CF(player_intelligence, s), CF(light_level, s)),
-             4, hud_y + 22, 14, (Color){200, 200, 200, 255});
-    int ach_count = 0;
-    for (int i = 0; i < CRAFTAX_NUM_ACHIEVEMENTS; i++) ach_count += CF2(achievements, i, s) ? 1 : 0;
-    DrawText(TextFormat("achievements: %d / %d", ach_count, CRAFTAX_NUM_ACHIEVEMENTS),
-             4, hud_y + 40, 14, (Color){180, 220, 180, 255});
-    DrawText(TextFormat("ret:%.2f len:%d", env->episode_return_accum, env->episode_length_accum),
-             4, hud_y + 58, 14, (Color){200, 200, 140, 255});
-
-    EndDrawing();
-}
-
-#endif  // rendering stripped
 #endif
 
 // ============================================================
@@ -6445,10 +5817,6 @@ static __device__ inline void craftax_add_items_from_chest_native(
 // ===== step_do_action.h =====
 // ============================================================
 // Standalone native port of Craftax do_action.
-//
-// This helper intentionally is not integrated into c_step yet. It mutates a
-// full CraftaxState in place so tests can compare the subsystem directly
-// against the installed JAX implementation.
 
 
 
@@ -7057,10 +6425,6 @@ static __device__ inline void craftax_do_action_native(
 // ===== step_update_mobs.h =====
 // ============================================================
 // Standalone native port of Craftax update_mobs.
-//
-// This helper intentionally is not integrated into c_step yet. It mutates a
-// full CraftaxState in place so tests can compare the subsystem directly
-// against the installed JAX implementation.
 
 
 
