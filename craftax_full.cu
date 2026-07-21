@@ -12308,10 +12308,13 @@ typedef struct CfFrame {
     int32_t ach_count;
 } CfFrame;
 
-__global__ void k_record_frame(
-    Craftax* envs, int e, const int32_t* act, const float* rewards,
-    const float* terminals, CfFrame* out
+// One block per recorded env: out[blockIdx.x] <- envs[e0 + blockIdx.x].
+__global__ void k_record_frames(
+    Craftax* envs, int e0, const int32_t* act, const float* rewards,
+    const float* terminals, CfFrame* outs
 ) {
+    int e = e0 + blockIdx.x;
+    CfFrame* out = &outs[blockIdx.x];
     const Craftax* env = &envs[e];
     const CraftaxState* s = env->state;
     int lvl = craftax_step_jax_index(CF(player_level, s), CRAFTAX_NUM_LEVELS);
@@ -12379,7 +12382,8 @@ __global__ void k_dump_levels(
 // run with the same seed is deterministic, so --record-env replays it.
 static int cu_run_play(
     int num_envs, int num_steps, uint64_t seed, const char* load_path,
-    int record_env, const char* frames_path, const char* levels_path
+    int record_env, int record_n, const char* frames_path,
+    const char* levels_path
 ) {
     if (!load_path) { fprintf(stderr, "play needs --load W.bin\n"); return 1; }
     CuVec v;
@@ -12388,13 +12392,23 @@ static int cu_run_play(
     cu_policy_init(&p, num_envs);
     if (cu_load_weights(&p, load_path)) return 1;
 
-    FILE* ff = frames_path ? fopen(frames_path, "wb") : NULL;
+    // --record-env E records env E alone; --record-envs N records 0..N-1.
+    int rec0 = 0, recn = 0;
+    if (record_n > 0) recn = record_n < num_envs ? record_n : num_envs;
+    else if (record_env >= 0 && record_env < num_envs) {
+        rec0 = record_env;
+        recn = 1;
+    }
+    FILE* ff = (frames_path && recn) ? fopen(frames_path, "wb") : NULL;
     FILE* lf = levels_path ? fopen(levels_path, "wb") : NULL;
     CfFrame* d_frame = NULL;
-    CfFrame* h_frame = (CfFrame*)malloc(sizeof(CfFrame));
+    CfFrame* h_frame = NULL;
     uint8_t* d_lv = NULL;
     uint8_t* h_lv = (uint8_t*)malloc((size_t)num_envs);
-    CU_CHECK(cudaMalloc(&d_frame, sizeof(CfFrame)));
+    if (recn) {
+        CU_CHECK(cudaMalloc(&d_frame, (size_t)recn * sizeof(CfFrame)));
+        h_frame = (CfFrame*)malloc((size_t)recn * sizeof(CfFrame));
+    }
     CU_CHECK(cudaMalloc(&d_lv, (size_t)num_envs));
 
     for (int step = 0; step < num_steps; step++) {
@@ -12405,16 +12419,17 @@ static int cu_run_play(
             CU_CHECK(cudaMemcpyAsync(h_lv, d_lv, (size_t)num_envs,
                                      cudaMemcpyDeviceToHost, p.stream));
         }
-        if (ff && record_env >= 0 && record_env < num_envs) {
-            k_record_frame<<<1, 256, 0, p.stream>>>(
-                v.d_envs, record_env, p.d_act, v.d_rewards, v.d_terminals,
+        if (ff) {
+            k_record_frames<<<recn, 256, 0, p.stream>>>(
+                v.d_envs, rec0, p.d_act, v.d_rewards, v.d_terminals,
                 d_frame);
-            CU_CHECK(cudaMemcpyAsync(h_frame, d_frame, sizeof(CfFrame),
+            CU_CHECK(cudaMemcpyAsync(h_frame, d_frame,
+                                     (size_t)recn * sizeof(CfFrame),
                                      cudaMemcpyDeviceToHost, p.stream));
         }
         CU_CHECK(cudaStreamSynchronize(p.stream));
         if (lf) fwrite(h_lv, 1, (size_t)num_envs, lf);
-        if (ff && record_env >= 0) fwrite(h_frame, sizeof(CfFrame), 1, ff);
+        if (ff) fwrite(h_frame, sizeof(CfFrame), (size_t)recn, ff);
     }
     if (ff) fclose(ff);
     if (lf) fclose(lf);
@@ -13921,6 +13936,7 @@ int main(int argc, char** argv) {
     const char* frames_path = NULL;
     const char* levels_path = NULL;
     int record_env = -1;
+    int record_envs = 0;
     int max_report = 40;
     int fused = 0;
     CuPPOConfig cfg = cu_ppo_defaults();
@@ -13954,6 +13970,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames_path = argv[++i];
         else if (!strcmp(argv[i], "--levels") && i + 1 < argc) levels_path = argv[++i];
         else if (!strcmp(argv[i], "--record-env") && i + 1 < argc) record_env = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--record-envs") && i + 1 < argc) record_envs = atoi(argv[++i]);
         else { cu_usage(argv[0]); return 1; }
     }
     if (envs <= 0 || iters <= 0 || steps <= 0 || horizon <= 0) { cu_usage(argv[0]); return 1; }
@@ -13976,7 +13993,7 @@ int main(int argc, char** argv) {
         return cu_run_train(envs, horizon, iters == 1000 ? 200 : iters, seed, cfg);
     if (!strcmp(mode, "play"))
         return cu_run_play(envs, steps, seed, load_path, record_env,
-                           frames_path, levels_path);
+                           record_envs, frames_path, levels_path);
     if (!strcmp(mode, "gradcheck"))
         return cu_run_gradcheck(seed);
     cu_usage(argv[0]);
