@@ -13582,6 +13582,9 @@ static int cu_run_train(
     double run_ep0 = ep0, run_len0 = len0, run_ret0 = ret0;
     double run_ach0[CRAFTAX_NUM_ACHIEVEMENTS];
     memcpy(run_ach0, ach0, sizeof(run_ach0));
+    // Wall-clock stamp of each achievement's first occurrence (10-iter
+    // resolution, printed as "first <name> ...").
+    int ach_seen[CRAFTAX_NUM_ACHIEVEMENTS] = {0};
 
     // Final-window achievement snapshot (last ~10% of the run).
     int fw_start = iters - iters / 10;
@@ -13629,6 +13632,14 @@ static int cu_run_train(
             CU_CHECK(cudaMemcpy(h_rew, rew_stats, 16,
                                 cudaMemcpyDeviceToHost));
             cu_sum_logs(&v, h_envs, &ep1, &len1, &ret1, ach1);
+            for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++) {
+                if (!ach_seen[a] && ach1[a] > run_ach0[a] + 0.5) {
+                    ach_seen[a] = 1;
+                    printf("first %-24s at %8.1f s  (%.2f B steps)\n",
+                           CU_ACH_NAMES[a], cf_now_s() - t0,
+                           (double)steps_done / 1e9);
+                }
+            }
             double eps_w = ep1 - ep0;
             double count = (double)num_envs * T;
             double sps = steps_done / (cf_now_s() - t0);
