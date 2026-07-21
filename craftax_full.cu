@@ -12238,6 +12238,197 @@ static int cu_run_rollout_hash(
     return 0;
 }
 
+// ============================================================
+// Weight checkpointing + replay recording (demo/video tooling).
+// ============================================================
+#define CF_CKPT_MAGIC 0x31574643u  // "CFW1"
+
+static const char* g_save_path = NULL;  // train: dump params here when set
+
+static void cu_save_weights(const CuPolicy* p, const char* path) {
+    float* h = (float*)malloc((size_t)CF_NN_PARAM_COUNT * sizeof(float));
+    CU_CHECK(cudaMemcpy(h, p->params,
+                        (size_t)CF_NN_PARAM_COUNT * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "cannot write %s\n", path); free(h); return; }
+    uint32_t hdr[4] = {CF_CKPT_MAGIC, CF_NN_HIDDEN, CF_NN_LAYERS,
+                       (uint32_t)CF_NN_PARAM_COUNT};
+    fwrite(hdr, sizeof(hdr), 1, f);
+    fwrite(h, sizeof(float), (size_t)CF_NN_PARAM_COUNT, f);
+    fclose(f);
+    free(h);
+    printf("weights saved: %s (%d floats)\n", path, (int)CF_NN_PARAM_COUNT);
+}
+
+static int cu_load_weights(CuPolicy* p, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot read %s\n", path); return 1; }
+    uint32_t hdr[4];
+    if (fread(hdr, sizeof(hdr), 1, f) != 1 || hdr[0] != CF_CKPT_MAGIC
+        || hdr[1] != CF_NN_HIDDEN || hdr[2] != CF_NN_LAYERS
+        || hdr[3] != (uint32_t)CF_NN_PARAM_COUNT) {
+        fprintf(stderr, "%s: bad header (want h%dx%d, %d params)\n", path,
+                CF_NN_HIDDEN, CF_NN_LAYERS, (int)CF_NN_PARAM_COUNT);
+        fclose(f);
+        return 1;
+    }
+    float* h = (float*)malloc((size_t)CF_NN_PARAM_COUNT * sizeof(float));
+    size_t got = fread(h, sizeof(float), (size_t)CF_NN_PARAM_COUNT, f);
+    fclose(f);
+    if (got != (size_t)CF_NN_PARAM_COUNT) {
+        fprintf(stderr, "%s: truncated\n", path);
+        free(h);
+        return 1;
+    }
+    CU_CHECK(cudaMemcpy(p->params, h,
+                        (size_t)CF_NN_PARAM_COUNT * sizeof(float),
+                        cudaMemcpyHostToDevice));
+    free(h);
+    cu_params_refresh_bf16(p, p->stream);
+    cu_pack_wav(p, p->stream);
+    CU_CHECK(cudaStreamSynchronize(p->stream));
+    printf("weights loaded: %s\n", path);
+    return 0;
+}
+
+// One recorded step of one env: everything the offline renderer needs.
+typedef struct CfFrame {
+    uint8_t map[CRAFTAX_MAP_SIZE][CRAFTAX_MAP_SIZE];
+    uint8_t item[CRAFTAX_MAP_SIZE][CRAFTAX_MAP_SIZE];
+    uint8_t light_q[CRAFTAX_MAP_SIZE][CRAFTAX_MAP_SIZE];  // light_map * 255
+    uint8_t mob[15][4];  // (mask, type, row, col) x 5 classes x 3 slots
+    int32_t level, posr, posc, dir, action, done;
+    float health, reward, light_level;
+    int32_t food, drink, energy, mana;
+    int32_t inv[14];      // wood stone coal iron diamond sapling pickaxe
+                          // sword bow arrows torches ruby sapphire books
+    int32_t armour[4];
+    int32_t potions[6];
+    int32_t ach_count;
+} CfFrame;
+
+__global__ void k_record_frame(
+    Craftax* envs, int e, const int32_t* act, const float* rewards,
+    const float* terminals, CfFrame* out
+) {
+    const Craftax* env = &envs[e];
+    const CraftaxState* s = env->state;
+    int lvl = craftax_step_jax_index(CF(player_level, s), CRAFTAX_NUM_LEVELS);
+    for (int i = threadIdx.x; i < CRAFTAX_MAP_SIZE * CRAFTAX_MAP_SIZE;
+         i += blockDim.x) {
+        int r = i / CRAFTAX_MAP_SIZE, c = i % CRAFTAX_MAP_SIZE;
+        out->map[r][c] = s->map[lvl][r][c];
+        out->item[r][c] = s->item_map[lvl][r][c];
+        float lt = s->light_map[lvl][r][c];
+        out->light_q[r][c] = (uint8_t)(fminf(fmaxf(lt, 0.0f), 1.0f) * 255.0f);
+    }
+    if (threadIdx.x == 0) {
+        for (int cl = 0; cl < 5; cl++) {
+            for (int sl = 0; sl < 3; sl++) {
+                uint8_t* m = out->mob[cl * 3 + sl];
+                m[0] = MOB_MASK(cl, lvl, sl, s) ? 1 : 0;
+                m[1] = (uint8_t)MOB_TYPE(cl, lvl, sl, s);
+                m[2] = (uint8_t)MOB_POS(cl, lvl, sl, 0, s);
+                m[3] = (uint8_t)MOB_POS(cl, lvl, sl, 1, s);
+            }
+        }
+        out->level = lvl;
+        out->posr = CF2(player_position, 0, s);
+        out->posc = CF2(player_position, 1, s);
+        out->dir = CF(player_direction, s);
+        out->action = act[e];
+        out->done = terminals[e] > 0.5f ? 1 : 0;
+        out->health = CF(player_health, s);
+        out->reward = rewards[e];
+        out->light_level = CF(light_level, s);
+        out->food = CF(player_food, s);
+        out->drink = CF(player_drink, s);
+        out->energy = CF(player_energy, s);
+        out->mana = CF(player_mana, s);
+        int32_t* inv = out->inv;
+        inv[0] = CF(inv_wood, s); inv[1] = CF(inv_stone, s);
+        inv[2] = CF(inv_coal, s); inv[3] = CF(inv_iron, s);
+        inv[4] = CF(inv_diamond, s); inv[5] = CF(inv_sapling, s);
+        inv[6] = CF(inv_pickaxe, s); inv[7] = CF(inv_sword, s);
+        inv[8] = CF(inv_bow, s); inv[9] = CF(inv_arrows, s);
+        inv[10] = CF(inv_torches, s); inv[11] = CF(inv_ruby, s);
+        inv[12] = CF(inv_sapphire, s); inv[13] = CF(inv_books, s);
+        for (int a = 0; a < 4; a++) out->armour[a] = CF2(inv_armour, a, s);
+        for (int q = 0; q < 6; q++) out->potions[q] = CF2(inv_potions, q, s);
+        int n = 0;
+        for (int a = 0; a < CRAFTAX_NUM_ACHIEVEMENTS; a++)
+            n += CF2(achievements, a, s) ? 1 : 0;
+        out->ach_count = n;
+    }
+}
+
+// Per-step selection record: one byte per env, level | (done << 7).
+__global__ void k_dump_levels(
+    Craftax* envs, const float* terminals, int n, uint8_t* out
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int lvl = craftax_step_jax_index(CF(player_level, envs[i].state),
+                                    CRAFTAX_NUM_LEVELS);
+    out[i] = (uint8_t)lvl | (terminals[i] > 0.5f ? 0x80 : 0);
+}
+
+// Replay a trained policy and record frames for offline rendering.
+// levels_path (all envs, 1B/env/step) is for choosing an episode; a second
+// run with the same seed is deterministic, so --record-env replays it.
+static int cu_run_play(
+    int num_envs, int num_steps, uint64_t seed, const char* load_path,
+    int record_env, const char* frames_path, const char* levels_path
+) {
+    if (!load_path) { fprintf(stderr, "play needs --load W.bin\n"); return 1; }
+    CuVec v;
+    cu_vec_init(&v, num_envs, seed);
+    CuPolicy p;
+    cu_policy_init(&p, num_envs);
+    if (cu_load_weights(&p, load_path)) return 1;
+
+    FILE* ff = frames_path ? fopen(frames_path, "wb") : NULL;
+    FILE* lf = levels_path ? fopen(levels_path, "wb") : NULL;
+    CfFrame* d_frame = NULL;
+    CfFrame* h_frame = (CfFrame*)malloc(sizeof(CfFrame));
+    uint8_t* d_lv = NULL;
+    uint8_t* h_lv = (uint8_t*)malloc((size_t)num_envs);
+    CU_CHECK(cudaMalloc(&d_frame, sizeof(CfFrame)));
+    CU_CHECK(cudaMalloc(&d_lv, (size_t)num_envs));
+
+    for (int step = 0; step < num_steps; step++) {
+        cu_rollout_step_plain(&v, &p, seed);
+        if (lf) {
+            k_dump_levels<<<(num_envs + 255) / 256, 256, 0, p.stream>>>(
+                v.d_envs, v.d_terminals, num_envs, d_lv);
+            CU_CHECK(cudaMemcpyAsync(h_lv, d_lv, (size_t)num_envs,
+                                     cudaMemcpyDeviceToHost, p.stream));
+        }
+        if (ff && record_env >= 0 && record_env < num_envs) {
+            k_record_frame<<<1, 256, 0, p.stream>>>(
+                v.d_envs, record_env, p.d_act, v.d_rewards, v.d_terminals,
+                d_frame);
+            CU_CHECK(cudaMemcpyAsync(h_frame, d_frame, sizeof(CfFrame),
+                                     cudaMemcpyDeviceToHost, p.stream));
+        }
+        CU_CHECK(cudaStreamSynchronize(p.stream));
+        if (lf) fwrite(h_lv, 1, (size_t)num_envs, lf);
+        if (ff && record_env >= 0) fwrite(h_frame, sizeof(CfFrame), 1, ff);
+    }
+    if (ff) fclose(ff);
+    if (lf) fclose(lf);
+    printf("play done: envs=%d steps=%d seed=%llu frame_bytes=%d\n",
+           num_envs, num_steps, (unsigned long long)seed,
+           (int)sizeof(CfFrame));
+    cu_print_logs(&v, false);
+    cudaFree(d_frame); cudaFree(d_lv);
+    free(h_frame); free(h_lv);
+    cu_policy_free(&p);
+    cu_vec_free(&v);
+    return 0;
+}
+
 // Quiet rollout hash over fresh env+policy state (runverify's
 // eager-vs-graph gate; CuVec owns device symbols, so the two runs
 // are sequential, each from an identical fresh init).
@@ -13495,6 +13686,7 @@ static int cu_run_train(
             }
         }
     }
+    if (g_save_path) cu_save_weights(&p, g_save_path);
     cudaFree(rew_stats);
     free(h_envs);
     cu_train_free(&tr);
@@ -13707,8 +13899,11 @@ static void cu_usage(const char* prog) {
             "                    [--lr F] [--gamma F] [--gae-lambda F] [--clip F]\n"
             "                    [--ent F] [--vf F] [--epochs N] [--minibatches M]\n"
             "                    [--bptt-split S] [--lr-anneal] [--ent-anneal F]\n"
+            "                    [--save W.bin]\n"
+            "       %s play      --load W.bin [--envs N] [--steps M] [--seed S]\n"
+            "                    [--record-env E --frames F.bin] [--levels L.bin]\n"
             "       %s gradcheck [--seed S]\n",
-            prog, prog, prog, prog, prog, prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char** argv) {
@@ -13722,6 +13917,10 @@ int main(int argc, char** argv) {
     int horizon = 128;
     uint64_t seed = 42;
     const char* dump = NULL;
+    const char* load_path = NULL;
+    const char* frames_path = NULL;
+    const char* levels_path = NULL;
+    int record_env = -1;
     int max_report = 40;
     int fused = 0;
     CuPPOConfig cfg = cu_ppo_defaults();
@@ -13750,6 +13949,11 @@ int main(int argc, char** argv) {
             cfg.ent_anneal = 1;
             cfg.ent_final = (float)atof(argv[++i]);
         }
+        else if (!strcmp(argv[i], "--save") && i + 1 < argc) g_save_path = argv[++i];
+        else if (!strcmp(argv[i], "--load") && i + 1 < argc) load_path = argv[++i];
+        else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames_path = argv[++i];
+        else if (!strcmp(argv[i], "--levels") && i + 1 < argc) levels_path = argv[++i];
+        else if (!strcmp(argv[i], "--record-env") && i + 1 < argc) record_env = atoi(argv[++i]);
         else { cu_usage(argv[0]); return 1; }
     }
     if (envs <= 0 || iters <= 0 || steps <= 0 || horizon <= 0) { cu_usage(argv[0]); return 1; }
@@ -13770,6 +13974,9 @@ int main(int argc, char** argv) {
         return cu_run_rollout_verify(envs, steps == 2000 ? 128 : steps, seed);
     if (!strcmp(mode, "train"))
         return cu_run_train(envs, horizon, iters == 1000 ? 200 : iters, seed, cfg);
+    if (!strcmp(mode, "play"))
+        return cu_run_play(envs, steps, seed, load_path, record_env,
+                           frames_path, levels_path);
     if (!strcmp(mode, "gradcheck"))
         return cu_run_gradcheck(seed);
     cu_usage(argv[0]);
