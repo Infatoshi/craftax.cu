@@ -13934,6 +13934,10 @@ static void cu_usage(const char* prog) {
             prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
+// Library mode: -DCRAFTAX_CU_LIB drops main() so this file can be #included
+// (or linked) as an env/trainer core inside another harness (e.g. the
+// PufferLib device-env binding).
+#ifndef CRAFTAX_CU_LIB
 int main(int argc, char** argv) {
     if (argc < 2) { cu_usage(argv[0]); return 1; }
     const char* mode = argv[1];
@@ -14015,3 +14019,4 @@ int main(int argc, char** argv) {
     cu_usage(argv[0]);
     return 1;
 }
+#endif  // CRAFTAX_CU_LIB
